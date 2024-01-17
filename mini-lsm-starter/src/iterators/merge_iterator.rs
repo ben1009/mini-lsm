@@ -1,8 +1,10 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::cmp::{self};
-use std::collections::BinaryHeap;
+use std::{
+    cmp::{self},
+    collections::BinaryHeap,
+};
 
 use anyhow::Result;
 
@@ -37,7 +39,7 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
 }
 
 /// Merge multiple iterators of the same type. If the same key occurs multiple times in some
-/// iterators, perfer the one with smaller index.
+/// iterators, prefer the one with smaller index.
 pub struct MergeIterator<I: StorageIterator> {
     iters: BinaryHeap<HeapWrapper<I>>,
     current: HeapWrapper<I>,

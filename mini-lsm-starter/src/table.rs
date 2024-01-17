@@ -4,16 +4,14 @@
 mod builder;
 mod iterator;
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 
-use crate::block::Block;
-use crate::lsm_storage::BlockCache;
+use crate::{block::Block, lsm_storage::BlockCache};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {

@@ -1,8 +1,10 @@
 use tempfile::tempdir;
 
 use super::MemTable;
-use crate::iterators::StorageIterator;
-use crate::table::{SsTableBuilder, SsTableIterator};
+use crate::{
+    iterators::StorageIterator,
+    table::{SsTableBuilder, SsTableIterator},
+};
 
 #[test]
 fn test_memtable_get() {

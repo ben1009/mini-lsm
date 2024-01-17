@@ -3,11 +3,13 @@ use std::ops::Bound;
 use anyhow::Result;
 use bytes::Bytes;
 
-use crate::iterators::merge_iterator::MergeIterator;
-use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::iterators::StorageIterator;
-use crate::mem_table::MemTableIterator;
-use crate::table::SsTableIterator;
+use crate::{
+    iterators::{
+        merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
+    },
+    mem_table::MemTableIterator,
+    table::SsTableIterator,
+};
 
 type LsmIteratorInner =
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;

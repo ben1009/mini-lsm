@@ -1,9 +1,9 @@
 [workspace]
 members = [
   "mini-lsm",
+  "mini-lsm-starter",
   "mini-lsm-week-1",
   "xtask",
-  "mini-lsm-starter",
 ]
 resolver = "2"
 

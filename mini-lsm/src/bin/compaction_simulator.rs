@@ -1,13 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use clap::Parser;
-use mini_lsm::compact::{
-    SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
-    TieredCompactionOptions,
+use mini_lsm::{
+    compact::{
+        SimpleLeveledCompactionController, SimpleLeveledCompactionOptions,
+        TieredCompactionController, TieredCompactionOptions,
+    },
+    lsm_storage::LsmStorageInner,
+    mem_table::MemTable,
 };
-use mini_lsm::lsm_storage::LsmStorageInner;
-use mini_lsm::mem_table::MemTable;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -125,6 +126,12 @@ impl MockStorage {
         for (level, files) in &self.snapshot.levels {
             println!("L{level} ({}): {:?}", files.len(), files);
         }
+    }
+}
+
+impl Default for MockStorage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

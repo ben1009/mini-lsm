@@ -1,12 +1,10 @@
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use bytes::BufMut;
 
 use super::{BlockMeta, FileObject, SsTable};
-use crate::block::BlockBuilder;
-use crate::lsm_storage::BlockCache;
+use crate::{block::BlockBuilder, lsm_storage::BlockCache};
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {

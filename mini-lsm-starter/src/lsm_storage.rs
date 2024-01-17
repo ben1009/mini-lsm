@@ -1,18 +1,18 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::ops::Bound;
-use std::path::Path;
-use std::sync::Arc;
+use std::{ops::Bound, path::Path, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
 use parking_lot::RwLock;
 
-use crate::block::Block;
-use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::mem_table::MemTable;
-use crate::table::SsTable;
+use crate::{
+    block::Block,
+    lsm_iterator::{FusedIterator, LsmIterator},
+    mem_table::MemTable,
+    table::SsTable,
+};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 

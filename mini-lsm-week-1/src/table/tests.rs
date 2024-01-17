@@ -4,8 +4,7 @@ use bytes::Bytes;
 use tempfile::{tempdir, TempDir};
 
 use super::*;
-use crate::iterators::StorageIterator;
-use crate::table::SsTableBuilder;
+use crate::{iterators::StorageIterator, table::SsTableBuilder};
 
 #[test]
 fn test_sst_build_single_key() {
