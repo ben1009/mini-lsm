@@ -1,0 +1,13 @@
+pull_request_rules:
+  - name: Automatic merge on approval
+    conditions:
+        - -conflict
+        - check-success=build
+        - check-success=macos-latest
+        - check-success=typos
+        - check-success=coverage
+        - check-success=ubuntu-latest
+
+    actions:
+      merge:
+        method: merge
