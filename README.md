@@ -1,8 +1,9 @@
-# LSM in a Week
+# LSM in 3 Week
 
-[![CI (main)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml)
+[![codecov](https://codecov.io/gh/ben1009/mini-lsm/branch/main/graph/badge.svg)](https://codecov.io/gh/ben1009/mini-lsm)
+[![CI (main)](https://github.com/ben1009/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/ben1009/mini-lsm/actions/workflows/main.yml)
 
-Build a simple key-value storage engine in a week!
+Build a simple key-value storage engine in 3 week!
 
 ## Tutorial
 

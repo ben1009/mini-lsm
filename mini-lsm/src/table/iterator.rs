@@ -3,8 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::SsTable;
-use crate::block::BlockIterator;
-use crate::iterators::StorageIterator;
+use crate::{block::BlockIterator, iterators::StorageIterator};
 
 /// An iterator over the contents of an SSTable.
 pub struct SsTableIterator {

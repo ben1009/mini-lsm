@@ -11,10 +11,11 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
-use crate::iterators::merge_iterator::MergeIterator;
-use crate::iterators::StorageIterator;
-use crate::lsm_storage::LsmStorage;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::{
+    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    lsm_storage::LsmStorage,
+    table::{SsTable, SsTableBuilder, SsTableIterator},
+};
 
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),

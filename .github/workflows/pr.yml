@@ -1,21 +1,44 @@
-name: CI (pull request)
+permissions:
+  contents: read
 
 on:
   pull_request:
-    branches:
-      - main
 
-env:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:    
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_TOOLCHAIN: nightly-2023-12-21
   CARGO_TERM_COLOR: always
 
+name: CI - Check
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: setup rust toolchain
-        run: rustup show
+      - uses: actions/checkout@v4
+      - name: Install ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@mdbook
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
       - name: check and build
         run: cargo x ci
+
+  typos:
+    runs-on: ubuntu-latest
+    name: typos
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check spelling
+        uses: crate-ci/typos@master      

@@ -1,14 +1,11 @@
-use std::ops::Bound;
-use std::sync::Arc;
+use std::{ops::Bound, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
-use crossbeam_skiplist::map::Entry;
-use crossbeam_skiplist::SkipMap;
+use crossbeam_skiplist::{map::Entry, SkipMap};
 use ouroboros::self_referencing;
 
-use crate::iterators::StorageIterator;
-use crate::table::SsTableBuilder;
+use crate::{iterators::StorageIterator, table::SsTableBuilder};
 
 /// A basic mem-table based on crossbeam-skiplist
 pub struct MemTable {

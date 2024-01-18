@@ -1,8 +1,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 
