@@ -2,3 +2,9 @@
 xtask = "run --package mini-lsm-xtask --"
 x = "run --package mini-lsm-xtask --"
 test = "nextest run"
+
+[net]
+git-fetch-with-cli = true
+
+[registries.crates-io]
+protocol = "sparse"

@@ -13,7 +13,7 @@ env:
   RUST_TOOLCHAIN: nightly-2023-12-21
   CARGO_TERM_COLOR: always
 
-name: CI - check (pull request)
+name: CI - Check
 jobs:
   build:
     runs-on: ubuntu-latest
