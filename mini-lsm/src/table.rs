@@ -16,6 +16,8 @@ pub struct BlockMeta {
     pub offset: usize,
     /// The first key of the data block.
     pub first_key: Bytes,
+    /// The last key of the data block.
+    pub last_key: Bytes,
 }
 
 impl BlockMeta {
@@ -29,6 +31,10 @@ impl BlockMeta {
             estimated_size += std::mem::size_of::<u16>();
             // The size of actual key
             estimated_size += meta.first_key.len();
+            // The size of key length
+            estimated_size += std::mem::size_of::<u16>();
+            // The size of actual key
+            estimated_size += meta.last_key.len();
         }
         // Reserve the space to improve performance, especially when the size of incoming data is
         // large
@@ -38,6 +44,8 @@ impl BlockMeta {
             buf.put_u32(meta.offset as u32);
             buf.put_u16(meta.first_key.len() as u16);
             buf.put_slice(&meta.first_key);
+            buf.put_u16(meta.last_key.len() as u16);
+            buf.put_slice(&meta.last_key);
         }
         assert_eq!(estimated_size, buf.len() - original_len);
     }
@@ -49,7 +57,13 @@ impl BlockMeta {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16() as usize;
             let first_key = buf.copy_to_bytes(first_key_len);
-            block_meta.push(BlockMeta { offset, first_key });
+            let last_key_len = buf.get_u16() as usize;
+            let last_key = buf.copy_to_bytes(last_key_len);
+            block_meta.push(BlockMeta {
+                offset,
+                first_key,
+                last_key,
+            });
         }
         block_meta
     }
@@ -58,34 +72,16 @@ impl BlockMeta {
 /// A file object.
 ///
 /// Before day 4, it should look like:
-///
-/// ```ignore
-/// pub struct FileObject(Bytes);
-///
-/// impl FileObject {
-///     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
-///         Ok(self.0[offset as usize..(offset + len) as usize].to_vec())
-///    }
-///     pub fn size(&self) -> u64 {
-///         self.0.len() as u64
-///     }
-///
-///     pub fn create(_path: &Path, data: Vec<u8>) -> Result<Self> {
-///         Ok(FileObject(data.into()))
-///     }
-///
-///     pub fn open(_path: &Path) -> Result<Self> {
-///         unimplemented!()
-///     }
-/// }
-/// ```
-pub struct FileObject(File, u64);
+pub struct FileObject(Option<File>, u64);
 
 impl FileObject {
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
         let mut data = vec![0; len as usize];
-        self.0.read_exact_at(&mut data[..], offset)?;
+        self.0
+            .as_ref()
+            .unwrap()
+            .read_exact_at(&mut data[..], offset)?;
         Ok(data)
     }
 
@@ -97,7 +93,7 @@ impl FileObject {
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
         std::fs::write(path, &data)?;
         Ok(FileObject(
-            File::options().read(true).write(false).open(path)?,
+            Some(File::options().read(true).write(false).open(path)?),
             data.len() as u64,
         ))
     }
@@ -113,6 +109,8 @@ pub struct SsTable {
     block_meta_offset: usize,
     id: usize,
     block_cache: Option<Arc<BlockCache>>,
+    first_key: Bytes,
+    last_key: Bytes,
 }
 
 impl SsTable {
@@ -127,13 +125,29 @@ impl SsTable {
         let raw_meta_offset = file.read(len - 4, 4)?;
         let block_meta_offset = (&raw_meta_offset[..]).get_u32() as u64;
         let raw_meta = file.read(block_meta_offset, len - 4 - block_meta_offset)?;
+        let block_metas = BlockMeta::decode_block_meta(&raw_meta[..]);
         Ok(Self {
             file,
-            block_metas: BlockMeta::decode_block_meta(&raw_meta[..]),
+            first_key: block_metas.first().unwrap().first_key.clone(),
+            last_key: block_metas.last().unwrap().last_key.clone(),
+            block_metas,
             block_meta_offset: block_meta_offset as usize,
             id,
             block_cache,
         })
+    }
+
+    /// Create a mock SST with only first key + last key metadata
+    pub fn create_meta_only(id: usize, file_size: u64, first_key: Bytes, last_key: Bytes) -> Self {
+        Self {
+            file: FileObject(None, file_size),
+            block_metas: vec![],
+            block_meta_offset: 0,
+            id,
+            block_cache: None,
+            first_key,
+            last_key,
+        }
     }
 
     /// Read a block from the disk.
@@ -171,6 +185,22 @@ impl SsTable {
     /// Get number of data blocks.
     pub fn num_of_blocks(&self) -> usize {
         self.block_metas.len()
+    }
+
+    pub fn first_key(&self) -> &Bytes {
+        &self.first_key
+    }
+
+    pub fn last_key(&self) -> &Bytes {
+        &self.last_key
+    }
+
+    pub fn table_size(&self) -> u64 {
+        self.file.1
+    }
+
+    pub fn sst_id(&self) -> usize {
+        self.id
     }
 }
 
