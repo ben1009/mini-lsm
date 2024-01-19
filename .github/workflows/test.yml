@@ -25,7 +25,7 @@ jobs:
         with:
           submodules: true
       - name: Install ${{ env.RUST_TOOLCHAIN }}
-        uses: dtolnay/rust-toolchain@e12eda571dc9a5ee5d58eecf4738ec291c66f295 # master
+        uses: dtolnay/rust-toolchain@be73d7920c329f220ce78e0234b8f96b7ae60248 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: cargo generate-lockfile
