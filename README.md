@@ -1,13 +1,12 @@
-# LSM in 3 Week
+# LSM in a Week
 
-[![codecov](https://codecov.io/gh/ben1009/mini-lsm/branch/main/graph/badge.svg)](https://codecov.io/gh/ben1009/mini-lsm)
-[![CI (main)](https://github.com/ben1009/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/ben1009/mini-lsm/actions/workflows/main.yml)
+[![CI (main)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml)
 
-Build a simple key-value storage engine in 3 week!
+Build a simple key-value storage engine in a week!
 
 ## Tutorial
 
-The tutorial is available at [https://ben1009.github.io/mini-lsm](https://ben1009.github.io/mini-lsm). You can use the provided starter
+The tutorial is available at [https://skyzh.github.io/mini-lsm](https://skyzh.github.io/mini-lsm). You can use the provided starter
 code to kick off your project, and follow the tutorial to implement the LSM tree.
 
 ## Community
@@ -18,7 +17,7 @@ You may join skyzh's Discord server and study with the mini-lsm community.
 
 ## Development
 
-``` rust
+```
 cargo x install-tools
 cargo x check
 cargo x book
@@ -49,8 +48,8 @@ We are working on a new version of the mini-lsm tutorial that is split into 3 we
 | 2.2            | Compaction Strategy - Simple                    | ✅        | 🚧            | 🚧       |
 | 2.3            | Compaction Strategy - Tiered                    | ✅        |              |         |
 | 2.4            | Compaction Strategy - Leveled                   | ✅        |              |         |
-| 2.5            | Manifest                                        |          |              |         |
-| 2.6            | Write-Ahead Log                                 |          |              |         |
+| 2.5            | Manifest                                        | 🚧        |              |         |
+| 2.6            | Write-Ahead Log                                 | 🚧        |              |         |
 | 2.7            | Batch Write (and preparations for MVCC)         |          |              |         |
 | 3.1            | Timestamp Encoding + Prefix Bloom Filter        |          |              |         |
 | 3.2            | Snapshot Read                                   |          |              |         |

@@ -1,15 +1,21 @@
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    path::Path,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::{map::Entry, SkipMap};
 use ouroboros::self_referencing;
 
-use crate::{iterators::StorageIterator, table::SsTableBuilder};
+use crate::{iterators::StorageIterator, table::SsTableBuilder, wal::Wal};
 
 /// A basic mem-table based on crossbeam-skiplist
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
+    wal: Option<Wal>,
+    id: usize,
 }
 
 pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
@@ -22,10 +28,25 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 
 impl MemTable {
     /// Create a new mem-table.
-    pub fn create() -> Self {
+    pub fn create(id: usize) -> Self {
         Self {
+            id,
             map: Arc::new(SkipMap::new()),
+            wal: None,
         }
+    }
+
+    /// Create a new mem-table with WAL
+    pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            id,
+            map: Arc::new(SkipMap::new()),
+            wal: Some(Wal::create(path.as_ref())?),
+        })
+    }
+
+    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        unimplemented!()
     }
 
     /// Get a value by key.
@@ -34,9 +55,20 @@ impl MemTable {
     }
 
     /// Put a key-value pair into the mem-table.
-    pub fn put(&self, key: &[u8], value: &[u8]) {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        if let Some(ref wal) = self.wal {
+            wal.put(key, value)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_wal(&self) -> Result<()> {
+        if let Some(ref wal) = self.wal {
+            wal.sync()?;
+        }
+        Ok(())
     }
 
     /// Get an iterator over a range of keys.
@@ -59,6 +91,10 @@ impl MemTable {
             builder.add(&entry.key()[..], &entry.value()[..]);
         }
         Ok(())
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
     }
 }
 

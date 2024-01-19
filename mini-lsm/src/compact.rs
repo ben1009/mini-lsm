@@ -6,6 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
+use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, SimpleLeveledCompactionTask,
 };
@@ -14,14 +15,15 @@ pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredComp
 use crate::{
     iterators::{merge_iterator::MergeIterator, StorageIterator},
     lsm_storage::{LsmStorageInner, LsmStorageState},
+    manifest::ManifestRecord,
     table::{SsTable, SsTableBuilder, SsTableIterator},
 };
 
+#[derive(Serialize, Deserialize)]
 pub(crate) enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
     Simple(SimpleLeveledCompactionTask),
-    #[allow(dead_code)]
     ForceFullCompaction(Vec<usize>),
 }
 
@@ -47,13 +49,13 @@ impl CompactionController {
     fn generate_compaction_task(&self, snapshot: &LsmStorageState) -> Option<CompactionTask> {
         match self {
             CompactionController::Leveled(ctrl) => ctrl
-                .generate_compaction_task(snapshot)
+                .generate_compaction_task(&snapshot)
                 .map(CompactionTask::Leveled),
             CompactionController::Simple(ctrl) => ctrl
-                .generate_compaction_task(snapshot)
+                .generate_compaction_task(&snapshot)
                 .map(CompactionTask::Simple),
             CompactionController::Tiered(ctrl) => ctrl
-                .generate_compaction_task(snapshot)
+                .generate_compaction_task(&snapshot)
                 .map(CompactionTask::Tiered),
             CompactionController::NoCompaction => unreachable!(),
         }
@@ -67,13 +69,13 @@ impl CompactionController {
     ) -> (LsmStorageState, Vec<usize>) {
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output)
+                ctrl.apply_compaction_result(&snapshot, task, output)
             }
             (CompactionController::Simple(ctrl), CompactionTask::Simple(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output)
+                ctrl.apply_compaction_result(&snapshot, task, output)
             }
             (CompactionController::Tiered(ctrl), CompactionTask::Tiered(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output)
+                ctrl.apply_compaction_result(&snapshot, task, output)
             }
             _ => unreachable!(),
         }
@@ -82,10 +84,11 @@ impl CompactionController {
 
 impl CompactionController {
     pub fn flush_to_l0(&self) -> bool {
-        matches!(
-            self,
-            Self::Leveled(_) | Self::Simple(_) | Self::NoCompaction
-        )
+        if let Self::Leveled(_) | Self::Simple(_) | Self::NoCompaction = self {
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -119,7 +122,8 @@ impl LsmStorageInner {
             CompactionTask::Tiered(task) => task
                 .tiers
                 .iter()
-                .flat_map(|(_, files)| files)
+                .map(|(_, files)| files)
+                .flatten()
                 .copied()
                 .collect::<Vec<_>>(),
             CompactionTask::ForceFullCompaction(l0_ssts) => l0_ssts.clone(),
@@ -132,7 +136,8 @@ impl LsmStorageInner {
                 .collect::<Vec<_>>()
         };
 
-        let mut iters = Vec::with_capacity(tables.len());
+        let mut iters = Vec::new();
+        iters.reserve(tables.len());
         for table in tables.iter() {
             iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
                 table.clone(),
@@ -182,7 +187,6 @@ impl LsmStorageInner {
         Ok(new_sst)
     }
 
-    #[allow(dead_code)]
     pub fn force_full_compaction(&self) -> Result<()> {
         let CompactionOptions::NoCompaction = self.options.compaction_options else {
             panic!("full compaction can only be called with compaction is not enabled")
@@ -232,7 +236,7 @@ impl LsmStorageInner {
         let sstables = self.compact(&task)?;
         let output = sstables.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
         let ssts_to_remove = {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let (mut snapshot, files_to_remove) = self
                 .compaction_controller
                 .apply_compaction_result(&self.state.read(), &task, &output);
@@ -248,6 +252,8 @@ impl LsmStorageInner {
             }
             let mut state = self.state.write();
             *state = Arc::new(snapshot);
+            self.manifest
+                .add_record(&state_lock, ManifestRecord::Compaction(task))?;
             ssts_to_remove
         };
         for sst in ssts_to_remove {
