@@ -10,6 +10,12 @@ Build a simple key-value storage engine in 3 week!
 The tutorial is available at [https://ben1009.github.io/mini-lsm](https://ben1009.github.io/mini-lsm). You can use the provided starter
 code to kick off your project, and follow the tutorial to implement the LSM tree.
 
+## Community
+
+You may join skyzh's Discord server and study with the mini-lsm community.
+
+[![Join skyzh's Discord Server](https://dcbadge.vercel.app/api/server/ZgXzxpua3H)](https://skyzh.dev/join/discord)
+
 ## Development
 
 ```
@@ -32,18 +38,20 @@ We are working on a new version of the mini-lsm tutorial that is split into 3 we
 
 | Week + Chapter | Topic                                           | Solution | Starter Code | Writeup |
 | -------------- | ----------------------------------------------- | -------- | ------------ | ------- |
-| 1.1            | Block Format                                    | ✅        | ✅            | ✅       |
-| 1.2            | Table Format                                    | ✅        | ✅            | ✅       |
-| 1.3            | Memtables                                       | ✅        | ✅            | ✅       |
+| 1.1            | Memtables                                       | ✅        | ✅            | ✅       |
+| 1.2            | Block Format                                    | ✅        | ✅            | ✅       |
+| 1.3            | Table Format                                    | ✅        | ✅            | ✅       |
 | 1.4            | Merge Iterators                                 | ✅        | ✅            | ✅       |
 | 1.5            | Storage Engine - Read Path                      | ✅        | ✅            | ✅       |
 | 1.6            | Storage Engine - Write Path                     | ✅        | ✅            | ✅       |
-| 2.1            | Compaction - Get Started                        | ✅        | 🚧            | 🚧       |
-| 2.2            | Compaction Strategy - Tiered                    | ✅        |              |         |
-| 2.3            | Compaction Strategy - Leveled                   | 🚧        |              |         |
-| 2.4            | Manifest                                        |          |              |         |
-| 2.5            | Write-Ahead Log                                 |          |              |         |
-| 2.6            | Bloom Filter and Key Compression                |          |              |         |
+| 1.7            | Bloom Filter and Key Compression                |          |              |         |
+| 2.1            | Compaction Implementation                       | ✅        | 🚧            | 🚧       |
+| 2.2            | Compaction Strategy - Simple                    | ✅        | 🚧            | 🚧       |
+| 2.3            | Compaction Strategy - Tiered                    | ✅        |              |         |
+| 2.4            | Compaction Strategy - Leveled                   | ✅        |              |         |
+| 2.5            | Manifest                                        |          |              |         |
+| 2.6            | Write-Ahead Log                                 |          |              |         |
+| 2.7            | Batch Write (and preparations for MVCC)         |          |              |         |
 | 3.1            | Timestamp Encoding + Prefix Bloom Filter        |          |              |         |
 | 3.2            | Snapshot Read                                   |          |              |         |
 | 3.3            | Watermark and Garbage Collection                |          |              |         |

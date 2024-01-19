@@ -1,7 +1,6 @@
-use std::collections::HashMap;
+use crate::lsm_storage::LsmStorageState;
 
-use crate::lsm_storage::LsmStorageInner;
-
+#[derive(Debug, Clone)]
 pub struct SimpleLeveledCompactionOptions {
     pub size_ratio_percent: usize,
     pub level0_file_num_compaction_trigger: usize,
@@ -14,6 +13,7 @@ pub struct SimpleLeveledCompactionTask {
     pub upper_level_sst_ids: Vec<usize>,
     pub lower_level: usize,
     pub lower_level_sst_ids: Vec<usize>,
+    pub is_lower_level_bottom_level: bool,
 }
 
 pub struct SimpleLeveledCompactionController {
@@ -27,7 +27,7 @@ impl SimpleLeveledCompactionController {
 
     pub fn generate_compaction_task(
         &self,
-        snapshot: &LsmStorageInner,
+        snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
         let mut level_sizes = Vec::new();
         level_sizes.push(snapshot.l0_sstables.len());
@@ -58,6 +58,7 @@ impl SimpleLeveledCompactionController {
                     },
                     lower_level,
                     lower_level_sst_ids: snapshot.levels[lower_level - 1].1.clone(),
+                    is_lower_level_bottom_level: lower_level == self.options.max_levels,
                 });
             }
         }
@@ -66,10 +67,10 @@ impl SimpleLeveledCompactionController {
 
     pub fn apply_compaction_result(
         &self,
-        snapshot: &LsmStorageInner,
+        snapshot: &LsmStorageState,
         task: &SimpleLeveledCompactionTask,
         output: &[usize],
-    ) -> (LsmStorageInner, Vec<usize>) {
+    ) -> (LsmStorageState, Vec<usize>) {
         let mut snapshot = snapshot.clone();
         let mut files_to_remove = Vec::new();
         if let Some(upper_level) = task.upper_level {
