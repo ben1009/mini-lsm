@@ -11,7 +11,7 @@ bytes = "1"
 # crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
 moka = "0.9"
-ouroboros = "0.15"
+ouroboros = "0.16"
 parking_lot = "0.12"
 
 [dev-dependencies]
