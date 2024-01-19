@@ -38,8 +38,7 @@ description = "Run full cargo clippy check"
 script = """
 #!/usr/bin/env bash
 
-cargo clippy --workspace --all-features --all-targets 
-# -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 """
 
 [tasks.check-fmt]

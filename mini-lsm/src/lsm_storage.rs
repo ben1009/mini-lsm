@@ -109,7 +109,7 @@ impl MiniLsm {
     pub fn close(&self) -> Result<()> {
         self.compaction_notifier.send(()).ok();
         let mut compaction_thread = self.compaction_thread.lock();
-        if let Some(mut compaction_thread) = compaction_thread.take() {
+        if let Some(compaction_thread) = compaction_thread.take() {
             compaction_thread
                 .join()
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -250,6 +250,7 @@ impl LsmStorageInner {
         self.path.join(format!("{:05}.sst", id))
     }
 
+    #[allow(dead_code)]
     /// Force freeze the current memetable to an immutable memtable
     pub fn force_freeze_memtable(&self) -> Result<()> {
         Ok(())

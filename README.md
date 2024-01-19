@@ -18,7 +18,7 @@ You may join skyzh's Discord server and study with the mini-lsm community.
 
 ## Development
 
-```
+``` rust
 cargo x install-tools
 cargo x check
 cargo x book
