@@ -71,7 +71,7 @@ pub struct MockStorage {
 impl MockStorage {
     pub fn new() -> Self {
         let snapshot = LsmStorageState {
-            memtable: Arc::new(MemTable::create()),
+            memtable: Arc::new(MemTable::create(0)),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels: Vec::new(),
@@ -79,7 +79,7 @@ impl MockStorage {
         };
         Self {
             snapshot,
-            next_sst_id: 0,
+            next_sst_id: 1,
             file_list: Default::default(),
             total_flushes: 0,
             total_writes: 0,
@@ -176,12 +176,6 @@ impl MockStorage {
     }
 }
 
-impl Default for MockStorage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn generate_random_key_range() -> (Bytes, Bytes) {
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -210,8 +204,8 @@ fn generate_random_split(
         let ne = begin + len * (i + 1) / split - 1;
         let mut begin_bytes = BytesMut::new();
         let mut end_bytes = BytesMut::new();
-        begin_bytes.put_u64(nb);
-        end_bytes.put_u64(ne);
+        begin_bytes.put_u64(nb as u64);
+        end_bytes.put_u64(ne as u64);
         result.push((begin_bytes.into(), end_bytes.into()));
     }
     result
