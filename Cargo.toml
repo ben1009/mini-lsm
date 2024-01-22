@@ -1,10 +1,5 @@
 [workspace]
-members = [
-  "mini-lsm",
-  "mini-lsm-starter",
-  "mini-lsm-week-1",
-  "xtask",
-]
+members = ["mini-lsm", "mini-lsm-starter", "xtask"]
 resolver = "2"
 
 [workspace.package]

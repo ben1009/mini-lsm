@@ -378,6 +378,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -387,23 +388,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "clap",
+ "crossbeam-channel",
  "crossbeam-skiplist",
  "moka",
  "ouroboros",
  "parking_lot",
- "tempfile",
-]
-
-[[package]]
-name = "mini-lsm-week-1"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "crossbeam-skiplist",
- "moka",
- "ouroboros",
- "parking_lot",
+ "serde",
  "tempfile",
 ]
 
@@ -545,9 +536,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.76"
+version = "1.0.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95fc56cda0b5c3325f5fbbd7ff9fda9e02bb00bb3dac51252d2f1bfa1cb8cc8c"
+checksum = "e2422ad645d89c99f8f3e6b88a9fdeca7fabeac836b1002371c4367c8f984aae"
 dependencies = [
  "unicode-ident",
 ]
@@ -755,9 +746,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.13.0"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b187f0231d56fe41bfb12034819dd2bf336422a5866de41bc3fec4b2e3883e8"
+checksum = "e6ecd384b10a64542d77071bd64bd7b231f4ed5940fba55e98c3de13824cf3d7"
 
 [[package]]
 name = "static_assertions"

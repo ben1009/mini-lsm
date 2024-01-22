@@ -3,10 +3,8 @@ use std::ops::Bound;
 use bytes::Bytes;
 use tempfile::tempdir;
 
-use crate::{
-    iterators::StorageIterator,
-    lsm_storage::{LsmStorageInner, LsmStorageOptions},
-};
+use crate::iterators::StorageIterator;
+use crate::lsm_storage::{LsmStorageInner, LsmStorageOptions};
 
 fn as_bytes(x: &[u8]) -> Bytes {
     Bytes::copy_from_slice(x)

@@ -1,15 +1,15 @@
-use std::{
-    ops::Bound,
-    path::Path,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::ops::Bound;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::{map::Entry, SkipMap};
 use ouroboros::self_referencing;
 
-use crate::{iterators::StorageIterator, table::SsTableBuilder, wal::Wal};
+use crate::iterators::StorageIterator;
+use crate::table::SsTableBuilder;
+use crate::wal::Wal;
 
 /// A basic mem-table based on crossbeam-skiplist
 pub struct MemTable {
@@ -45,8 +45,14 @@ impl MemTable {
         })
     }
 
+    /// Create a memtable from WAL
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+        let map = Arc::new(SkipMap::new());
+        Ok(Self {
+            id,
+            wal: Some(Wal::recover(path.as_ref(), &map)?),
+            map,
+        })
     }
 
     /// Get a value by key.

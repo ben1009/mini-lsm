@@ -60,9 +60,9 @@ fn test_sst_build_all() {
 #[test]
 fn test_sst_decode() {
     let (_dir, sst) = generate_sst();
-    let meta = sst.block_metas.clone();
+    let meta = sst.block_meta.clone();
     let new_sst = SsTable::open_for_test(sst.file).unwrap();
-    assert_eq!(new_sst.block_metas, meta);
+    assert_eq!(new_sst.block_meta, meta);
 }
 
 fn as_bytes(x: &[u8]) -> Bytes {

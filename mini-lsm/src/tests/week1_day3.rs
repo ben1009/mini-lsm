@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use super::{builder::BlockBuilder, iterator::BlockIterator, *};
+use bytes::Bytes;
+
+use crate::block::{Block, BlockBuilder, BlockIterator};
 
 #[test]
 fn test_block_build_single_key() {
@@ -15,6 +17,20 @@ fn test_block_build_full() {
     assert!(builder.add(b"11", b"11"));
     assert!(!builder.add(b"22", b"22"));
     builder.build();
+}
+
+#[test]
+fn test_block_build_large_1() {
+    let mut builder = BlockBuilder::new(16);
+    assert!(builder.add(b"11", &b"1".repeat(100)));
+    builder.build();
+}
+
+#[test]
+fn test_block_build_large_2() {
+    let mut builder = BlockBuilder::new(16);
+    assert!(builder.add(b"11", b"1"));
+    assert!(!builder.add(b"11", &b"1".repeat(100)));
 }
 
 fn key_of(idx: usize) -> Vec<u8> {

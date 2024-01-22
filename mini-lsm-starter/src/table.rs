@@ -1,24 +1,32 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
-use std::{path::Path, sync::Arc};
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 
-use crate::{block::Block, lsm_storage::BlockCache};
+use crate::block::Block;
+use crate::lsm_storage::BlockCache;
+
+use self::bloom::Bloom;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
     /// Offset of this data block.
     pub offset: usize,
-    /// The first key of the data block, mainly used for index purpose.
+    /// The first key of the data block.
     pub first_key: Bytes,
+    /// The last key of the data block.
+    pub last_key: Bytes,
 }
 
 impl BlockMeta {
@@ -40,39 +48,53 @@ impl BlockMeta {
 }
 
 /// A file object.
-pub struct FileObject(Bytes);
+pub struct FileObject(Option<File>, u64);
 
 impl FileObject {
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
-        Ok(self.0[offset as usize..(offset + len) as usize].to_vec())
+        use std::os::unix::fs::FileExt;
+        let mut data = vec![0; len as usize];
+        self.0
+            .as_ref()
+            .unwrap()
+            .read_exact_at(&mut data[..], offset)?;
+        Ok(data)
     }
 
     pub fn size(&self) -> u64 {
-        self.0.len() as u64
+        self.1
     }
 
     /// Create a new file object (day 2) and write the file to the disk (day 4).
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
-        unimplemented!()
+        std::fs::write(path, &data)?;
+        File::open(path)?.sync_all()?;
+        Ok(FileObject(
+            Some(File::options().read(true).write(false).open(path)?),
+            data.len() as u64,
+        ))
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        unimplemented!()
+        let file = File::options().read(true).write(false).open(path)?;
+        let size = file.metadata()?.len();
+        Ok(FileObject(Some(file), size))
     }
 }
 
-/// -------------------------------------------------------------------------------------------------------
-/// |              Data Block             |             Meta Block              |          Extra          |
-/// -------------------------------------------------------------------------------------------------------
-/// | Data Block #1 | ... | Data Block #N | Meta Block #1 | ... | Meta Block #N | Meta Block Offset (u32) |
-/// -------------------------------------------------------------------------------------------------------
+/// An SSTable.
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
-    file: FileObject,
+    pub(crate) file: FileObject,
     /// The meta blocks that hold info for data blocks.
-    block_metas: Vec<BlockMeta>,
+    pub(crate) block_meta: Vec<BlockMeta>,
     /// The offset that indicates the start point of meta blocks in `file`.
-    block_meta_offset: usize,
+    pub(crate) block_meta_offset: usize,
+    id: usize,
+    block_cache: Option<Arc<BlockCache>>,
+    first_key: Bytes,
+    last_key: Bytes,
+    pub(crate) bloom: Option<Bloom>,
 }
 
 impl SsTable {
@@ -84,6 +106,20 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         unimplemented!()
+    }
+
+    /// Create a mock SST with only first key + last key metadata
+    pub fn create_meta_only(id: usize, file_size: u64, first_key: Bytes, last_key: Bytes) -> Self {
+        Self {
+            file: FileObject(None, file_size),
+            block_meta: vec![],
+            block_meta_offset: 0,
+            id,
+            block_cache: None,
+            first_key,
+            last_key,
+            bloom: None,
+        }
     }
 
     /// Read a block from the disk.
@@ -105,9 +141,22 @@ impl SsTable {
 
     /// Get number of data blocks.
     pub fn num_of_blocks(&self) -> usize {
-        unimplemented!()
+        self.block_meta.len()
+    }
+
+    pub fn first_key(&self) -> &Bytes {
+        &self.first_key
+    }
+
+    pub fn last_key(&self) -> &Bytes {
+        &self.last_key
+    }
+
+    pub fn table_size(&self) -> u64 {
+        self.file.1
+    }
+
+    pub fn sst_id(&self) -> usize {
+        self.id
     }
 }
-
-#[cfg(test)]
-mod tests;
