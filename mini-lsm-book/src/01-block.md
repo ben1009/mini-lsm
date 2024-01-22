@@ -2,7 +2,7 @@
 
 <div class="warning">
 
-This is a legacy version of the Mini-LSM tutorial and we will not maintain it anymore. We are working on a new version of this tutorial and this chapter is now part of [Mini-LSM Week 1 Day 3: Blocks](./week1-03-block.md).
+This is a legacy version of the Mini-LSM tutorial and we will not maintain it anymore. We now have a better version of this tutorial and this chapter is now part of [Mini-LSM Week 1 Day 3: Blocks](./week1-03-block.md).
 
 </div>
 
@@ -112,3 +112,5 @@ Here is a list of extra tasks you can do to make the block encoding more robust 
 
 * Implement block checksum. Verify checksum when decoding the block.
 * Compress / Decompress block. Compress on `build` and decompress on decoding.
+
+{{#include copyright.md}}

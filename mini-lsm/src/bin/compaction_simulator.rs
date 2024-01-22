@@ -2,15 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::Parser;
-use mini_lsm::{
-    compact::{
-        LeveledCompactionController, LeveledCompactionOptions, SimpleLeveledCompactionController,
-        SimpleLeveledCompactionOptions, TieredCompactionController, TieredCompactionOptions,
-    },
-    lsm_storage::LsmStorageState,
-    mem_table::MemTable,
-    table::SsTable,
+use mini_lsm::compact::{
+    LeveledCompactionController, LeveledCompactionOptions, SimpleLeveledCompactionController,
+    SimpleLeveledCompactionOptions, TieredCompactionController, TieredCompactionOptions,
 };
+use mini_lsm::lsm_storage::LsmStorageState;
+use mini_lsm::mem_table::MemTable;
+use mini_lsm::table::SsTable;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,7 +29,7 @@ enum Args {
         #[clap(long)]
         dump_real_id: bool,
         #[clap(long, default_value = "3")]
-        level0_file_num_compaction_trigger: usize,
+        num_tiers: usize,
         #[clap(long, default_value = "200")]
         max_size_amplification_percent: usize,
         #[clap(long, default_value = "1")]
@@ -317,7 +315,7 @@ fn main() {
         }
         Args::Tiered {
             dump_real_id,
-            level0_file_num_compaction_trigger,
+            num_tiers: level0_file_num_compaction_trigger,
             max_size_amplification_percent,
             size_ratio,
             min_merge_width,

@@ -2,7 +2,7 @@
 
 <div class="warning">
 
-This is a legacy version of the Mini-LSM tutorial and we will not maintain it anymore. We are working on a new version of this tutorial and this chapter is now part of [Mini-LSM Week 1 Day 4: Sorted String Table (SST)](./week1-04-sst.md).
+This is a legacy version of the Mini-LSM tutorial and we will not maintain it anymore. We now have a better version of this tutorial and this chapter is now part of [Mini-LSM Week 1 Day 4: Sorted String Table (SST)](./week1-04-sst.md).
 
 </div>
 
@@ -97,3 +97,5 @@ Here is a list of extra tasks you can do to make the block encoding more robust 
 * Implement index checksum. Verify checksum when decoding.
 * Explore different SST encoding and layout. For example, in the [Lethe](https://disc-projects.bu.edu/lethe/) paper,
   the author adds secondary key support to SST.
+
+{{#include copyright.md}}
