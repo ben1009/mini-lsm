@@ -1,4 +1,5 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
+#![allow(clippy::useless_transmute)]
 
 use std::ops::Bound;
 use std::path::Path;
