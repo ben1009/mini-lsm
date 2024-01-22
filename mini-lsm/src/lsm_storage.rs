@@ -222,7 +222,7 @@ impl LsmStorageInner {
             for table_id in state
                 .l0_sstables
                 .iter()
-                .chain(state.levels.iter().map(|(_, files)| files).flatten())
+                .chain(state.levels.iter().flat_map(|(_, files)| files))
             {
                 let table_id = *table_id;
                 let sst = SsTable::open(
@@ -298,7 +298,7 @@ impl LsmStorageInner {
         for table in snapshot
             .l0_sstables
             .iter()
-            .chain(snapshot.levels.iter().map(|(_, files)| files).flatten())
+            .chain(snapshot.levels.iter().flat_map(|(_, files)| files))
         {
             iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
                 snapshot.sstables[table].clone(),
@@ -465,7 +465,7 @@ impl LsmStorageInner {
         for table_id in snapshot
             .l0_sstables
             .iter()
-            .chain(snapshot.levels.iter().map(|(_, files)| files).flatten())
+            .chain(snapshot.levels.iter().flat_map(|(_, files)| files))
         {
             let table = snapshot.sstables[table_id].clone();
             let iter = match lower {

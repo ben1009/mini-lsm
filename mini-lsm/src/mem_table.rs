@@ -1,3 +1,5 @@
+#![allow(clippy::useless_transmute)]
+
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
