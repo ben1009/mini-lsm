@@ -225,7 +225,7 @@ impl LsmStorageInner {
             return Ok(Some(v));
         }
 
-        for m in state.imm_memtables.iter().rev() {
+        for m in state.imm_memtables.iter() {
             if let Some(v) = m.get(key) {
                 if v.is_empty() {
                     return Ok(None);
@@ -246,10 +246,13 @@ impl LsmStorageInner {
         state.memtable.put(key, value)?;
 
         if state.memtable.approximate_size() >= self.options.target_sst_size {
+            drop(state);
             let lock = &self.state_lock.lock();
             // reset approximate_size when force_freeze_memtable is called
             // check again
+            let state = self.state.read();
             if state.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(state);
                 self.force_freeze_memtable(lock)?;
             }
         }
@@ -290,7 +293,8 @@ impl LsmStorageInner {
             &mut state.memtable,
             mem_table::MemTable::create(self.next_sst_id()).into(),
         );
-        state.imm_memtables.push(m);
+        // make test happy. but why? kind of wired design decision
+        state.imm_memtables.insert(0, m);
         *guard = Arc::new(state);
 
         Ok(())
