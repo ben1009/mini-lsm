@@ -68,7 +68,8 @@ impl MemTable {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
-        self.approximate_size.store(
+
+        self.approximate_size.fetch_add(
             std::mem::size_of_val(key) + std::mem::size_of_val(value),
             std::sync::atomic::Ordering::SeqCst,
         );
