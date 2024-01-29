@@ -125,18 +125,26 @@ pub struct MemTableIterator {
 
 impl StorageIterator for MemTableIterator {
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.borrow_item().1.as_ref()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.borrow_item().0.as_ref()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key().is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let entry = self.with_iter_mut(|iter| {
+            iter.next()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .unwrap_or_else(|| (Bytes::from_static(b""), Bytes::from_static(b"")))
+        });
+
+        self.with_mut(|v| *v.item = entry);
+
+        Ok(())
     }
 }
