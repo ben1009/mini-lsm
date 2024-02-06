@@ -104,13 +104,8 @@ impl MemTable {
     ///
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
     /// In week 2, day 6, also flush the data to WAL.
+    /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(wal) = &self.wal {
-            wal.put(key, value)?;
-            // TODO: change to write_batch sync instead
-            wal.sync()?;
-        }
-
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
 

@@ -423,7 +423,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read().clone();
+        let state = self.state.read();
         if let Some(v) = state.memtable.get(key) {
             if v.is_empty() {
                 return Ok(None);
@@ -440,84 +440,12 @@ impl LsmStorageInner {
             }
         }
 
-        // L0 SSTs, from latest to earliest.
-        let mut sstables_l0 = vec![];
-        state.l0_sstables.iter().for_each(|id| {
-            if let Some(s) = state.sstables.get(id) {
-                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    return;
-                }
-                if let Some(b) = &s.bloom {
-                    let key_hash = farmhash::hash32(key);
-                    if !b.may_contain(key_hash) {
-                        return;
-                    }
-                }
-
-                sstables_l0.push(s.clone());
-            }
-        });
-
-        for s in sstables_l0.iter() {
-            let s_it =
-                SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-            if s_it.is_valid() && s_it.key().raw_ref() == key {
-                if s_it.value().is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(Bytes::copy_from_slice(s_it.value())));
-            }
-        }
-
-        // L1-lmax SSTs, from latest to earliest.
-        for (_, sst_ids) in state.levels.iter() {
-            let mut sstables = vec![];
-            sst_ids.iter().for_each(|id| {
-                if let Some(s) = state.sstables.get(id) {
-                    if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                        return;
-                    }
-                    if let Some(b) = &s.bloom {
-                        let key_hash = farmhash::hash32(key);
-                        if !b.may_contain(key_hash) {
-                            return;
-                        }
-                    }
-
-                    sstables.push(s.clone());
-                }
-            });
-
-            let s_it =
-                SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(key))?;
-            if s_it.is_valid() && s_it.key().raw_ref() == key {
-                if s_it.value().is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(Bytes::copy_from_slice(s_it.value())));
-            }
-        }
-
         Ok(None)
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    /// TODO: sync wal after each batch, may need a write_batch api with wal for atomic write
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        for record in batch {
-            match record {
-                WriteBatchRecord::Del(key) => {
-                    self.delete(key.as_ref())?;
-                }
-                WriteBatchRecord::Put(key, value) => {
-                    self.put(key.as_ref(), value.as_ref())?;
-                }
-            }
-        }
-
-        Ok(())
+    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        unimplemented!()
     }
-
     /// Put a key-value pair into the storage by writing into the current memtable.
     /// As our memtable implementation only requires an immutable reference for put,
     /// you ONLY need to take the read lock on state in order to modify the memtable.
@@ -583,20 +511,17 @@ impl LsmStorageInner {
     /// Force freeze the current memtable to an immutable memtable,
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        let sst_id = self.next_sst_id();
-        let mem_table = if self.options.enable_wal {
-            mem_table::MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?
-        } else {
-            mem_table::MemTable::create(sst_id)
-        };
-        self.force_freeze_with_new_memtable(mem_table)?;
+        let mut guard = self.state.write();
+        let mut state = guard.as_ref().clone();
+        let m = std::mem::replace(
+            &mut state.memtable,
+            mem_table::MemTable::create(self.next_sst_id()).into(),
+        );
+        // make test happy. but why? kind of wired design decision
+        state.imm_memtables.insert(0, m);
+        *guard = Arc::new(state);
 
-        self.sync_dir()?;
-
-        self.manifest
-            .as_ref()
-            .unwrap()
-            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
