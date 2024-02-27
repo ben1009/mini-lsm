@@ -114,16 +114,17 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 
         while let Some(mut inner_iter) = self.iters.peek_mut() {
             if inner_iter.1.key() == current.1.key() {
-                // TODO: seems change peekmut will rebuild the heap?
+                // drop PeekMut will call self.heap.sift_down(0), make 0 reordered, https://doc.rust-lang.org/src/alloc/collections/binary_heap/mod.rs.html#321,
                 match inner_iter.1.next() {
-                    core::result::Result::Ok(_) => {
+                    anyhow::Result::Ok(_) => {
                         if !inner_iter.1.is_valid() {
                             PeekMut::pop(inner_iter);
                         }
                     }
-                    Err(e) => {
+                    // https://doc.rust-lang.org/reference/patterns.html#identifier-patterns
+                    e @ Err(_) => {
                         PeekMut::pop(inner_iter);
-                        return Err(e);
+                        return e;
                     }
                 }
             } else {
@@ -140,23 +141,11 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
             return Ok(());
         }
 
-        if let Some(n) = self.iters.peek() {
-            println!(
-                "n: idx: {}, key: {:?}",
-                n.0,
-                Bytes::copy_from_slice(n.1.key().for_testing_key_ref())
-            );
-            println!(
-                "current: idx: {}, key: {:?}",
-                current.0,
-                Bytes::copy_from_slice(current.1.key().for_testing_key_ref())
-            );
+        if let Some(mut n) = self.iters.peek_mut() {
             // in reverse order, so use > instead of <
             if *n > *current {
-                println!("swap !");
-                let mut t = self.iters.pop().unwrap();
-                std::mem::swap(current, &mut t);
-                self.iters.push(t);
+                // drop PeekMut will call self.heap.sift_down(0), make 0 reordered, https://doc.rust-lang.org/src/alloc/collections/binary_heap/mod.rs.html#321,
+                std::mem::swap(current, &mut n);
             }
         }
 
