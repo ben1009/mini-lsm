@@ -578,91 +578,17 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = self.state.read().clone();
+        let state = self.state.read();
 
-        // memtable
-        let mut m_merge_iterators = vec![Box::new(state.memtable.scan(lower, upper))];
+        let mut merge_iterators = vec![Box::new(state.memtable.scan(lower, upper))];
         for i in state.imm_memtables.iter() {
             let it = i.scan(lower, upper);
-            m_merge_iterators.push(Box::new(it));
+            merge_iterators.push(Box::new(it));
         }
-        let m_memo_iter = MergeIterator::create(m_merge_iterators);
 
-        // l0 sstables
-        let mut l0_iters = vec![];
-        for i in state.l0_sstables.iter() {
-            let t = state.sstables[i].clone();
-            if !t.range_overlap(lower, upper) {
-                continue;
-            }
-
-            let s = match lower {
-                Bound::Included(lower) => {
-                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(lower))?
-                }
-                Bound::Excluded(lower) => {
-                    // if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
-                    //     || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
-                    // {
-                    //     continue;
-                    // }
-                    let mut s = SsTableIterator::create_and_seek_to_key(
-                        t.clone(),
-                        KeySlice::from_slice(lower),
-                    )?;
-                    if s.is_valid() && s.key().raw_ref() == lower {
-                        s.next()?;
-                    }
-
-                    s
-                }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
-            };
-            l0_iters.push(Box::new(s));
-        }
-        let m_l0_iter = MergeIterator::create(l0_iters);
-        let two_l0_iter = TwoMergeIterator::create(m_memo_iter, m_l0_iter)?;
-
-        // l1-lmax sstables
-        let mut concat_iters = vec![];
-        for (_, sst_ids) in &state.levels {
-            let mut ss_tables = vec![];
-            for i in sst_ids {
-                let t = state.sstables[i].clone();
-                ss_tables.push(t);
-            }
-            let concat_iter = match lower {
-                Bound::Included(lower) => SstConcatIterator::create_and_seek_to_key(
-                    ss_tables,
-                    KeySlice::from_slice(lower),
-                )?,
-                Bound::Excluded(lower) => {
-                    let mut iter = SstConcatIterator::create_and_seek_to_key(
-                        ss_tables,
-                        KeySlice::from_slice(lower),
-                    )?;
-                    if iter.is_valid() && iter.key().raw_ref() == lower {
-                        iter.next()?;
-                    }
-
-                    iter
-                }
-                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
-            };
-            concat_iters.push(Box::new(concat_iter));
-        }
-        let m_iter = MergeIterator::create(concat_iters);
-        let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
-        let lit = LsmIterator::new(two_m, Self::into_vec(upper))?;
+        let mit = MergeIterator::create(merge_iterators);
+        let lit = LsmIterator::new(mit)?;
 
         Ok(FusedIterator::new(lit))
-    }
-
-    fn into_vec(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
-        match b {
-            Bound::Included(k) => Bound::Included(k.to_vec()),
-            Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        }
     }
 }
