@@ -16,9 +16,11 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
+use bytes::Bytes;
 
 use crate::key::KeySlice;
 
@@ -34,6 +36,7 @@ impl<I: StorageIterator> PartialEq for HeapWrapper<I> {
 
 impl<I: StorageIterator> Eq for HeapWrapper<I> {}
 
+// min heap, the smaller the key, the higher the priority, if keys are equal, the smaller the index is, the higher the priority
 impl<I: StorageIterator> PartialOrd for HeapWrapper<I> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
@@ -59,7 +62,18 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+
+        let current = heap.pop();
+        Self {
+            iters: heap,
+            current,
+        }
     }
 }
 
@@ -69,18 +83,68 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some() && self.current.as_ref().unwrap().1.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let current = self.current.as_mut().unwrap();
+
+        while let Some(mut inner_iter) = self.iters.peek_mut() {
+            if inner_iter.1.key() == current.1.key() {
+                // TODO: seems change peekmut will rebuild the heap?
+                match inner_iter.1.next() {
+                    core::result::Result::Ok(_) => {
+                        if !inner_iter.1.is_valid() {
+                            PeekMut::pop(inner_iter);
+                        }
+                    }
+                    Err(e) => {
+                        PeekMut::pop(inner_iter);
+                        return Err(e);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        current.1.next()?;
+
+        if !current.1.is_valid() {
+            if let Some(c) = self.iters.pop() {
+                *current = c;
+            }
+            return Ok(());
+        }
+
+        if let Some(n) = self.iters.peek() {
+            println!(
+                "n: idx: {}, key: {:?}",
+                n.0,
+                Bytes::copy_from_slice(n.1.key().for_testing_key_ref())
+            );
+            println!(
+                "current: idx: {}, key: {:?}",
+                current.0,
+                Bytes::copy_from_slice(current.1.key().for_testing_key_ref())
+            );
+            // in reverse order, so use > instead of <
+            if *n > *current {
+                println!("swap !");
+                let mut t = self.iters.pop().unwrap();
+                std::mem::swap(current, &mut t);
+                self.iters.push(t);
+            }
+        }
+
+        Ok(())
     }
 }
