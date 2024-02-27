@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::{
     collections::BTreeMap, ops::Bound, os::unix::fs::MetadataExt, path::Path, sync::Arc,
