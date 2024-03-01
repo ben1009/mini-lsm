@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use bytes::Buf;
-use nom::AsBytes;
 
 use crate::key::{Key, KeySlice, KeyVec};
 
@@ -37,8 +36,9 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        let first_key_len = (&block.data.as_bytes()[0..2]).get_u16() as usize;
-        let first_key = &block.data[2..2 + first_key_len];
+        let mut data = &block.data[0..];
+        let key_len = data.get_u16() as usize;
+        let first_key = &data[..key_len];
 
         Self {
             block: block.clone(),
@@ -55,8 +55,10 @@ impl BlockIterator {
 
         for (idx, i) in block.offsets.iter().enumerate() {
             let i = *i as usize;
-            let key_len = (&block.data.as_bytes()[i..i + 2]).get_u16() as usize;
-            let ret_key = &block.data[i + 2..i + 2 + key_len];
+            let mut data = &block.data[i..];
+            let key_len = data.get_u16() as usize;
+            let ret_key = &data[..key_len];
+
             if Key::from_slice(ret_key) >= key {
                 ret.key = KeyVec::from_vec(ret_key.to_vec());
                 ret.idx = idx;
@@ -75,8 +77,9 @@ impl BlockIterator {
         }
 
         let offset = self.block.offsets[self.idx] as usize;
-        let key_len = (&self.block.data.as_bytes()[offset..offset + 2]).get_u16() as usize;
-        let key = &self.block.data[offset + 2..offset + 2 + key_len];
+        let mut data = &self.block.data[offset..];
+        let key_len = data.get_u16() as usize;
+        let key = &data[..key_len];
 
         Key::from_slice(key)
     }
@@ -88,12 +91,12 @@ impl BlockIterator {
         }
 
         let offset = self.block.offsets[self.idx] as usize;
-        let key_len = (&self.block.data.as_bytes()[offset..offset + 2]).get_u16() as usize;
-        let value_len = (&self.block.data.as_bytes()
-            [offset + 2 + key_len..offset + 2 + key_len + 2])
-            .get_u16() as usize;
+        let mut data = &self.block.data[offset..];
+        let key_len = data.get_u16() as usize;
+        data.advance(key_len);
+        let value_len = data.get_u16() as usize;
 
-        &self.block.data[offset + 2 + key_len + 2..offset + 2 + key_len + 2 + value_len]
+        &data[..value_len]
     }
 
     /// Returns true if the iterator is valid.
