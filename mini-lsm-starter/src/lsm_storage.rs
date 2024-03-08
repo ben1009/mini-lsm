@@ -42,7 +42,8 @@ pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 /// Represents the state of the storage engine.
 #[derive(Clone)]
 pub struct LsmStorageState {
-    /// The current memtable.
+    /// The current memtable. the memtable here do not need lock portection, since it is a crossbeam_skiplist::SkipMap
+    /// if only operate the memtable, lock could be released as soon as possible
     pub memtable: Arc<MemTable>,
     /// Immutable memtables, from latest to earliest.
     pub imm_memtables: Vec<Arc<MemTable>>,
@@ -366,7 +367,8 @@ impl LsmStorageInner {
         unimplemented!()
     }
 
-    /// Force freeze the current memtable to an immutable memtable
+    /// Force freeze the current memtable to an immutable memtable,
+    /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let mut guard = self.state.write();
         let mut state = guard.as_ref().clone();
