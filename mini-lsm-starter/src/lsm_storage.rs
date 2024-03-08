@@ -509,6 +509,7 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable,
+    /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called,
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let mut guard = self.state.write();
