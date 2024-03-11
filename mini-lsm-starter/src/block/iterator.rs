@@ -67,19 +67,34 @@ impl BlockIterator {
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut ret = Self::new(block.clone());
 
-        for (idx, i) in block.offsets.iter().enumerate() {
-            let i = *i as usize;
+        let mut lo = 0;
+        let mut hi = block.offsets.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let i = block.offsets[mid] as usize;
+
             let mut data = &block.data[i..];
             let key_len = data.get_u16() as usize;
             let ret_key = &data[..key_len];
 
-            if Key::from_slice(ret_key) >= key {
-                ret.key = KeyVec::from_vec(ret_key.to_vec());
-                ret.idx = idx;
-                ret.first_key = KeyVec::from_vec(ret_key.to_vec());
-                break;
+            match Key::from_slice(ret_key).cmp(&key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    lo = mid;
+                    break;
+                }
             }
         }
+
+        let i = block.offsets[lo] as usize;
+        let mut data = &block.data[i..];
+        let key_len = data.get_u16() as usize;
+        let ret_key = &data[..key_len];
+
+        ret.key = KeyVec::from_vec(ret_key.to_vec());
+        ret.idx = lo;
+        ret.first_key = KeyVec::from_vec(ret_key.to_vec());
 
         ret
     }

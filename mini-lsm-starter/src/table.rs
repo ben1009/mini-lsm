@@ -49,11 +49,34 @@ pub struct BlockMeta {
 }
 
 impl BlockMeta {
+    fn estimated_size(block_meta: &[BlockMeta]) -> usize {
+        let mut estimated_size = std::mem::size_of::<u32>();
+        for meta in block_meta {
+            // The size of offset
+            estimated_size += std::mem::size_of::<u16>();
+
+            // The size of key length
+            estimated_size += std::mem::size_of::<u16>();
+            // The size of actual key
+            estimated_size += meta.first_key.len();
+            // The size of key length
+            estimated_size += std::mem::size_of::<u16>();
+            // The size of actual key
+            estimated_size += meta.last_key.len();
+        }
+        // offsets length
+        estimated_size += std::mem::size_of::<u16>();
+
+        estimated_size
+    }
+
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
         let mut offsets = vec![];
+        buf.reserve(BlockMeta::estimated_size(block_meta));
+
         for meta in block_meta {
             offsets.push(buf.len() as u16);
 
@@ -207,22 +230,13 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        let data = self.file.read(
-            self.block_meta
-                .get(block_idx)
-                .map_or(self.block_meta[self.block_meta.len() - 1].offset, |x| {
-                    x.offset
-                }) as u64,
-            self.block_meta
-                .get(block_idx + 1)
-                .map_or(self.block_meta_offset, |x| x.offset) as u64
-                - self
-                    .block_meta
-                    .get(block_idx)
-                    .map_or(self.block_meta[self.block_meta.len() - 1].offset, |x| {
-                        x.offset
-                    }) as u64,
-        )?;
+        let lo = self.block_meta[block_idx].offset as u64;
+        let hi = self
+            .block_meta
+            .get(block_idx + 1)
+            .map_or(self.block_meta_offset, |x| x.offset) as u64;
+
+        let data = self.file.read(lo, hi - lo)?;
         let ret = Block::decode(data.as_slice());
 
         Ok(Arc::new(ret))
@@ -245,11 +259,6 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        // return self
-        //     .block_meta
-        //     .partition_point(|meta| meta.first_key.as_key_slice() <= key)
-        //     .saturating_sub(1);
-
         let mut lo = 0;
         let mut hi = self.block_meta.len() - 1;
         while lo <= hi {
@@ -267,6 +276,10 @@ impl SsTable {
 
                 hi = mid - 1;
             } else {
+                if mid == self.block_meta.len() - 1 {
+                    return self.block_meta.len() - 1;
+                }
+
                 lo = mid + 1;
             }
         }
