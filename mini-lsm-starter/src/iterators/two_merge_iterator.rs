@@ -1,7 +1,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 
 use super::StorageIterator;
 
@@ -10,7 +10,7 @@ use super::StorageIterator;
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
-    // Add fields as need
+    from_a: bool,
 }
 
 impl<
@@ -19,7 +19,27 @@ impl<
     > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut ret = Self {
+            a,
+            b,
+            from_a: false,
+        };
+        ret.set_from_a();
+
+        Ok(ret)
+    }
+
+    fn set_from_a(&mut self) {
+        if !self.a.is_valid() {
+            self.from_a = false;
+            return;
+        }
+        if !self.b.is_valid() {
+            self.from_a = true;
+            return;
+        }
+
+        self.from_a = self.a.key() <= self.b.key();
     }
 }
 
@@ -31,18 +51,42 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.from_a {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.from_a {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if self.from_a {
+            self.a.is_valid()
+        } else {
+            self.b.is_valid()
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.from_a {
+            // since if a==b, always get from a, advance b when ==
+            if self.b.is_valid() && self.a.key() == self.b.key() {
+                self.b.next()?;
+            }
+            self.a.next()?;
+        } else {
+            self.b.next()?;
+        }
+
+        self.set_from_a();
+
+        Ok(())
     }
 }
