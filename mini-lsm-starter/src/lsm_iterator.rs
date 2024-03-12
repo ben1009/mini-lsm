@@ -59,29 +59,28 @@ impl StorageIterator for LsmIterator {
     }
 
     fn key(&self) -> &[u8] {
-        if !self.check_bound() {
-            return b"";
-        }
+        // if !self.check_bound() {
+        //     return b"";
+        // }
 
         self.inner.key().into_inner()
     }
 
     fn value(&self) -> &[u8] {
-        if !self.check_bound() {
-            return b"";
-        }
+        // if !self.check_bound() {
+        //     return b"";
+        // }
 
         self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
+        self.inner.next()?;
         if !self.is_valid() {
             return Ok(());
         }
 
-        self.inner.next()?;
-
-        while self.inner.is_valid() && self.inner.value().is_empty() {
+        while self.is_valid() && self.inner.value().is_empty() {
             self.inner.next()?;
         }
 
