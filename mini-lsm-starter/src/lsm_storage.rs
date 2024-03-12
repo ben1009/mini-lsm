@@ -415,9 +415,10 @@ impl LsmStorageInner {
         }
         let mit = MergeIterator::create(m_merge_iterators);
 
+        // L0 SSTs, from latest to earliest.
         let mut sstables = vec![];
-        state.sstables.iter().for_each(|(id, s)| {
-            if state.l0_sstables.contains(id) {
+        state.l0_sstables.iter().for_each(|id| {
+            if let Some(s) = state.sstables.get(id) {
                 sstables.push(s.clone());
             }
         });
