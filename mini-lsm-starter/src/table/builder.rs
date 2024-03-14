@@ -109,6 +109,7 @@ impl SsTableBuilder {
 
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
         buf.put_u32(meta_offset as u32);
+
         let file = FileObject::create(path.as_ref(), buf)?;
 
         Ok(SsTable {
