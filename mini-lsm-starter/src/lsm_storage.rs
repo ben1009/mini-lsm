@@ -450,14 +450,12 @@ impl LsmStorageInner {
         let state = self.state.read().clone();
 
         let mut m_merge_iterators = vec![Box::new(state.memtable.scan(lower, upper))];
-
         for i in state.imm_memtables.iter() {
             let it = i.scan(lower, upper);
             m_merge_iterators.push(Box::new(it));
         }
 
         let mit = MergeIterator::create(m_merge_iterators);
-
         let mut s_merge_iterators = vec![];
 
         for i in state.l0_sstables.iter() {
@@ -488,7 +486,6 @@ impl LsmStorageInner {
                 }
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
             };
-
             s_merge_iterators.push(Box::new(s));
         }
 

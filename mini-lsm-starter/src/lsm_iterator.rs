@@ -29,9 +29,6 @@ impl LsmIterator {
         while iter.is_valid() && iter.value().is_empty() {
             iter.next()?;
         }
-        // if !iter.is_valid() {
-        //     bail!("invalid iterator");
-        // }
 
         Ok(Self { inner: iter, upper })
     }
