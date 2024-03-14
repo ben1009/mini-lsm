@@ -423,7 +423,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
+        let state = self.state.read().clone();
         if let Some(v) = state.memtable.get(key) {
             if v.is_empty() {
                 return Ok(None);
@@ -598,31 +598,35 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = self.state.read();
+        let state = self.state.read().clone();
 
         let mut m_merge_iterators = vec![Box::new(state.memtable.scan(lower, upper))];
         for i in state.imm_memtables.iter() {
             let it = i.scan(lower, upper);
             m_merge_iterators.push(Box::new(it));
         }
-        let mit = MergeIterator::create(m_merge_iterators);
 
-        // L0 SSTs, from latest to earliest.
-        let mut sstables = vec![];
-        state.l0_sstables.iter().for_each(|id| {
-            if let Some(s) = state.sstables.get(id) {
-                sstables.push(s.clone());
-            }
-        });
+        let mit = MergeIterator::create(m_merge_iterators);
         let mut s_merge_iterators = vec![];
-        for i in sstables.iter() {
+
+        for i in state.l0_sstables.iter() {
+            let t = state.sstables[i].clone();
+            if !t.range_overlap(lower, upper) {
+                continue;
+            }
+
             let s = match lower {
                 Bound::Included(lower) => {
-                    SsTableIterator::create_and_seek_to_key(i.clone(), KeySlice::from_slice(lower))?
+                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(lower))?
                 }
                 Bound::Excluded(lower) => {
+                    if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
+                        || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
+                    {
+                        continue;
+                    }
                     let mut s = SsTableIterator::create_and_seek_to_key(
-                        i.clone(),
+                        t.clone(),
                         KeySlice::from_slice(lower),
                     )?;
                     if s.is_valid() && s.key().raw_ref() == lower {
@@ -631,9 +635,8 @@ impl LsmStorageInner {
 
                     s
                 }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(i.clone())?,
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
             };
-
             s_merge_iterators.push(Box::new(s));
         }
 
