@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -36,7 +36,7 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 }
 
 impl MemTable {
-    /// Create a new mem-table.
+    /// Create a new mem-table. id is the sst_id when flush this memtable to sst
     pub fn create(id: usize) -> Self {
         Self {
             map: Arc::new(SkipMap::new()),
@@ -119,8 +119,12 @@ impl MemTable {
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+    pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        for e in self.map.iter() {
+            builder.add(Key::from_bytes(e.key().clone()).as_key_slice(), e.value());
+        }
+
+        Ok(())
     }
 
     pub fn id(&self) -> usize {
@@ -135,6 +139,22 @@ impl MemTable {
     /// Only use this function when closing the database
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        if self.map.is_empty() {
+            return false;
+        }
+
+        let e = self.map.front().unwrap();
+        let lo = e.key();
+        let e = self.map.back().unwrap();
+        let hi = e.key();
+        match (lower, upper) {
+            (Bound::Included(x), Bound::Included(y)) => x >= lo && x <= hi || y >= lo && y <= hi,
+            (Bound::Excluded(x), Bound::Excluded(y)) => x > lo && x < hi || y > lo && y < hi,
+            _ => true,
+        }
     }
 }
 
