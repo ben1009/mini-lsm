@@ -12,6 +12,7 @@ use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
 use std::fs::File;
 use std::mem;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -296,5 +297,44 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    pub fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        let lo = self.first_key.as_key_slice();
+        let hi = self.last_key.as_key_slice();
+
+        match lower {
+            Bound::Included(x) => {
+                let x = KeySlice::from_slice(x);
+                if x > hi {
+                    return false;
+                }
+            }
+            Bound::Excluded(x) => {
+                let x = KeySlice::from_slice(x);
+                if x >= hi {
+                    return false;
+                }
+            }
+            _ => {}
+        };
+
+        match upper {
+            Bound::Included(y) => {
+                let y = KeySlice::from_slice(y);
+                if y < lo {
+                    return false;
+                }
+            }
+            Bound::Excluded(y) => {
+                let y = KeySlice::from_slice(y);
+                if y <= lo {
+                    return false;
+                }
+            }
+            _ => {}
+        };
+
+        true
     }
 }
