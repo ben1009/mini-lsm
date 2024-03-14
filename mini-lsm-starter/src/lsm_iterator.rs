@@ -29,20 +29,20 @@ impl LsmIterator {
         while iter.is_valid() && iter.value().is_empty() {
             iter.next()?;
         }
-        if !iter.is_valid() {
-            bail!("invalid iterator");
-        }
+        // if !iter.is_valid() {
+        //     bail!("invalid iterator");
+        // }
 
         Ok(Self { inner: iter, upper })
     }
 
     fn check_bound(&self) -> bool {
-        let ret = match self.upper {
+        let ret = match self.upper.as_ref() {
             Bound::Unbounded => true,
-            Bound::Included(ref key) => {
+            Bound::Included(key) => {
                 self.inner.is_valid() && self.inner.key().into_inner() <= key.as_slice()
             }
-            Bound::Excluded(ref key) => {
+            Bound::Excluded(key) => {
                 self.inner.is_valid() && self.inner.key().into_inner() < key.as_slice()
             }
         };
@@ -85,6 +85,10 @@ impl StorageIterator for LsmIterator {
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
     }
 }
 
@@ -140,5 +144,9 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }

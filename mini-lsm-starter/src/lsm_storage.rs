@@ -1,14 +1,15 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
+use anyhow::anyhow;
+use anyhow::{Ok, Result};
+use bytes::Bytes;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::HashMap;
+use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-
-use anyhow::Result;
-use bytes::Bytes;
-use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
 use crate::compact::{
@@ -23,7 +24,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -125,6 +126,8 @@ pub enum CompactionFilter {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    /// the state behind Arc is read only, modify is done by replace with a new one,
+    /// so read will get a snapshot, only the memtable in the snapshot will see the latest change with skipmap support
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
@@ -159,7 +162,12 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(()).ok();
+        if let Some(f) = self.flush_thread.lock().take() {
+            f.join().map_err(|e| anyhow!("{:?}", e))?;
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -242,6 +250,10 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        if !path.exists() {
+            fs::create_dir_all(path)?;
+        }
+
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -284,7 +296,7 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
+        let state = self.state.read().clone();
         if let Some(v) = state.memtable.get(key) {
             if v.is_empty() {
                 return Ok(None);
@@ -392,7 +404,36 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+        // since update state is just create a new one and replace it with the old one,
+        // so this is a snapshot, no need to hold the lock for the whole process
+        let memtable_to_flush = {
+            let guard = self.state.read();
+            guard.imm_memtables.last().unwrap().clone()
+        };
+
+        let mut ss_table_builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut ss_table_builder)?;
+        let sst_id = memtable_to_flush.id();
+        let sst = ss_table_builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?;
+
+        {
+            let mut guard = self.state.write();
+            let mut state = guard.as_ref().clone();
+
+            state.imm_memtables.pop();
+            state.l0_sstables.insert(0, sst.sst_id());
+            state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            *guard = Arc::new(state);
+        };
+
+        // self.sync_dir()?;
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -406,31 +447,37 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = self.state.read();
+        let state = self.state.read().clone();
 
         let mut m_merge_iterators = vec![Box::new(state.memtable.scan(lower, upper))];
+
         for i in state.imm_memtables.iter() {
             let it = i.scan(lower, upper);
             m_merge_iterators.push(Box::new(it));
         }
+
         let mit = MergeIterator::create(m_merge_iterators);
 
-        // L0 SSTs, from latest to earliest.
-        let mut sstables = vec![];
-        state.l0_sstables.iter().for_each(|id| {
-            if let Some(s) = state.sstables.get(id) {
-                sstables.push(s.clone());
-            }
-        });
         let mut s_merge_iterators = vec![];
-        for i in sstables.iter() {
+
+        for i in state.l0_sstables.iter() {
+            let t = state.sstables[i].clone();
+            if !t.range_overlap(lower, upper) {
+                continue;
+            }
+
             let s = match lower {
                 Bound::Included(lower) => {
-                    SsTableIterator::create_and_seek_to_key(i.clone(), KeySlice::from_slice(lower))?
+                    SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(lower))?
                 }
                 Bound::Excluded(lower) => {
+                    if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
+                        || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
+                    {
+                        continue;
+                    }
                     let mut s = SsTableIterator::create_and_seek_to_key(
-                        i.clone(),
+                        t.clone(),
                         KeySlice::from_slice(lower),
                     )?;
                     if s.is_valid() && s.key().raw_ref() == lower {
@@ -439,7 +486,7 @@ impl LsmStorageInner {
 
                     s
                 }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(i.clone())?,
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
             };
 
             s_merge_iterators.push(Box::new(s));
