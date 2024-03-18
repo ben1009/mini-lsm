@@ -78,10 +78,13 @@ impl BlockIterator {
             let i = block.offsets[mid] as usize;
 
             let mut data = &block.data[i..];
-            let key_len = data.get_u16() as usize;
-            let ret_key = &data[..key_len];
-
-            match Key::from_slice(ret_key).cmp(&key) {
+            let overlap_len = data.get_u16() as usize;
+            let ret_key_len = data.get_u16() as usize;
+            let ret_key = &data[..ret_key_len];
+            ret.key.clear();
+            ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
+            ret.key.append(ret_key);
+            match Key::from_slice(ret.key.raw_ref()).cmp(&key) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
@@ -93,12 +96,14 @@ impl BlockIterator {
 
         let i = block.offsets[lo] as usize;
         let mut data = &block.data[i..];
-        let key_len = data.get_u16() as usize;
-        let ret_key = &data[..key_len];
+        let overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        let ret_key = &data[..ret_key_len];
+        ret.key.clear();
+        ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
+        ret.key.append(ret_key);
 
-        ret.key = KeyVec::from_vec(ret_key.to_vec());
         ret.idx = lo;
-        ret.first_key = KeyVec::from_vec(ret_key.to_vec());
 
         ret
     }
