@@ -100,7 +100,7 @@ impl Bloom {
         }
     }
 
-    /// Check if a bloom filter may contain some data
+    /// Check if a bloom filter may contain the key, h is the hash of the key
     pub fn may_contain(&self, mut h: u32) -> bool {
         if self.k > 30 {
             // potential new encoding for short bloom filters
