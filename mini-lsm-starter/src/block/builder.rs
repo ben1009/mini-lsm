@@ -49,6 +49,19 @@ impl BlockBuilder {
         /*offsets*/
     }
 
+    /// overlap_len returns the number of bytes that overlap with `first_key` in the block.
+    fn overlap_len(&self, key: &[u8]) -> usize {
+        let mut ret = 0;
+        while ret < self.first_key.len()
+            && ret < key.len()
+            && self.first_key.raw_ref()[ret] == key[ret]
+        {
+            ret += 1;
+        }
+
+        ret
+    }
+
     /// Adds a key-value pair to the block. Returns false when the block is full.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
@@ -61,8 +74,10 @@ impl BlockBuilder {
 
         self.offsets.push(self.data.len() as u16);
 
-        self.data.put_u16(key.len() as u16);
-        self.data.put(key.raw_ref());
+        let overlap = self.overlap_len(key.raw_ref());
+        self.data.put_u16(overlap as u16);
+        self.data.put_u16((key.len() - overlap) as u16);
+        self.data.put(&key.raw_ref()[overlap..]);
 
         self.data.put_u16(value.len() as u16);
         self.data.put(value);

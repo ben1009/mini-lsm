@@ -332,6 +332,16 @@ impl LsmStorageInner {
         let mut sstables = vec![];
         state.l0_sstables.iter().for_each(|id| {
             if let Some(s) = state.sstables.get(id) {
+                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
+                    return;
+                }
+                if let Some(b) = &s.bloom {
+                    let key_hash = farmhash::hash32(key);
+                    if !b.may_contain(key_hash) {
+                        return;
+                    }
+                }
+
                 sstables.push(s.clone());
             }
         });

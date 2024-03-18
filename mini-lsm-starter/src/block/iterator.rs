@@ -39,28 +39,28 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
+        let first_key = Self::get_first_key(block.clone());
+
         Self {
             block,
-            key: KeyVec::new(),
+            key: first_key.clone(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
+            first_key,
         }
+    }
+
+    fn get_first_key(block: Arc<Block>) -> KeyVec {
+        let mut data = &block.data[0..];
+        data.get_u16(); // skip the first key overlap_len
+        let key_len = data.get_u16() as usize;
+
+        KeyVec::from_vec(data[..key_len].to_vec())
     }
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        let mut data = &block.data[0..];
-        let key_len = data.get_u16() as usize;
-        let first_key = &data[..key_len];
-
-        Self {
-            block: block.clone(),
-            key: KeyVec::from_vec(first_key.to_vec()),
-            value_range: (0, 0),
-            idx: 0,
-            first_key: KeyVec::from_vec(first_key.to_vec()),
-        }
+        BlockIterator::new(block.clone())
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
@@ -74,10 +74,13 @@ impl BlockIterator {
             let i = block.offsets[mid] as usize;
 
             let mut data = &block.data[i..];
-            let key_len = data.get_u16() as usize;
-            let ret_key = &data[..key_len];
-
-            match Key::from_slice(ret_key).cmp(&key) {
+            let overlap_len = data.get_u16() as usize;
+            let ret_key_len = data.get_u16() as usize;
+            let ret_key = &data[..ret_key_len];
+            ret.key.clear();
+            ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
+            ret.key.append(ret_key);
+            match Key::from_slice(ret.key.raw_ref()).cmp(&key) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
@@ -89,12 +92,14 @@ impl BlockIterator {
 
         let i = block.offsets[lo] as usize;
         let mut data = &block.data[i..];
-        let key_len = data.get_u16() as usize;
-        let ret_key = &data[..key_len];
+        let overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        let ret_key = &data[..ret_key_len];
+        ret.key.clear();
+        ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
+        ret.key.append(ret_key);
 
-        ret.key = KeyVec::from_vec(ret_key.to_vec());
         ret.idx = lo;
-        ret.first_key = KeyVec::from_vec(ret_key.to_vec());
 
         ret
     }
@@ -105,12 +110,7 @@ impl BlockIterator {
             return Key::from_slice(&[]);
         }
 
-        let offset = self.block.offsets[self.idx] as usize;
-        let mut data = &self.block.data[offset..];
-        let key_len = data.get_u16() as usize;
-        let key = &data[..key_len];
-
-        Key::from_slice(key)
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
@@ -121,6 +121,7 @@ impl BlockIterator {
 
         let offset = self.block.offsets[self.idx] as usize;
         let mut data = &self.block.data[offset..];
+        data.get_u16(); // skip the first key overlap_len
         let key_len = data.get_u16() as usize;
         data.advance(key_len);
         let value_len = data.get_u16() as usize;
@@ -143,6 +144,18 @@ impl BlockIterator {
     /// Move to the next key in the block.
     pub fn next(&mut self) {
         self.idx += 1;
+        if !self.is_valid() {
+            return;
+        }
+
+        let offset = self.block.offsets[self.idx] as usize;
+        let mut data = &self.block.data[offset..];
+        let overlap_len = data.get_u16() as usize;
+        let ret_key_len = data.get_u16() as usize;
+        let ret_key = &data[..ret_key_len];
+        self.key.clear();
+        self.key.append(&self.first_key.raw_ref()[..overlap_len]);
+        self.key.append(ret_key);
     }
 
     /// Seek to the first key that >= `key`.
