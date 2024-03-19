@@ -1,13 +1,10 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::sync::Arc;
 
 use bytes::Buf;
 
 use crate::key::{Key, KeySlice, KeyVec};
 
-use super::Block;
+use super::{Block, SIZE_OF_U16};
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -46,73 +43,28 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        BlockIterator::new(block.clone())
+        let mut ret = BlockIterator::new(block.clone());
+        ret.seek_to_first();
+
+        ret
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut ret = Self::new(block.clone());
-
-        let mut lo = 0;
-        let mut hi = block.offsets.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let i = block.offsets[mid] as usize;
-
-            let mut data = &block.data[i..];
-            let overlap_len = data.get_u16() as usize;
-            let ret_key_len = data.get_u16() as usize;
-            let ret_key = &data[..ret_key_len];
-            ret.key.clear();
-            ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
-            ret.key.append(ret_key);
-            match Key::from_slice(ret.key.raw_ref()).cmp(&key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    lo = mid;
-                    break;
-                }
-            }
-        }
-
-        let i = block.offsets[lo] as usize;
-        let mut data = &block.data[i..];
-        let overlap_len = data.get_u16() as usize;
-        let ret_key_len = data.get_u16() as usize;
-        let ret_key = &data[..ret_key_len];
-        ret.key.clear();
-        ret.key.append(&ret.first_key.raw_ref()[..overlap_len]);
-        ret.key.append(ret_key);
-
-        ret.idx = lo;
+        ret.seek_to_key(key);
 
         ret
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice {
-        if self.idx >= self.block.offsets.len() {
-            return Key::from_slice(&[]);
-        }
-
         self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        if self.idx >= self.block.offsets.len() {
-            return &[];
-        }
-
-        let offset = self.block.offsets[self.idx] as usize;
-        let mut data = &self.block.data[offset..];
-        data.get_u16(); // skip the first key overlap_len
-        let key_len = data.get_u16() as usize;
-        data.advance(key_len);
-        let value_len = data.get_u16() as usize;
-
-        &data[..value_len]
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
@@ -123,14 +75,16 @@ impl BlockIterator {
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        self.idx = 0;
-        self.key = self.first_key.clone();
+        self.seek_to_idx(0);
     }
 
-    /// Move to the next key in the block.
-    pub fn next(&mut self) {
-        self.idx += 1;
-        if !self.is_valid() {
+    /// idx is the index of block.offsets
+    fn seek_to_idx(&mut self, idx: usize) {
+        self.idx = idx;
+        // if invalid, set is_valid state by reset values
+        if self.idx >= self.block.offsets.len() {
+            self.key.clear();
+            self.value_range = (0, 0);
             return;
         }
 
@@ -142,15 +96,39 @@ impl BlockIterator {
         self.key.clear();
         self.key.append(&self.first_key.raw_ref()[..overlap_len]);
         self.key.append(ret_key);
+        data.advance(ret_key_len);
+        let value_len = data.get_u16() as usize;
+        self.value_range = (
+            offset + SIZE_OF_U16 * 2 + ret_key_len + SIZE_OF_U16,
+            offset + SIZE_OF_U16 * 2 + ret_key_len + SIZE_OF_U16 + value_len,
+        );
+    }
+
+    /// Move to the next key in the block.
+    pub fn next(&mut self) {
+        self.idx += 1;
+        self.seek_to_idx(self.idx);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        let ret = Self::create_and_seek_to_key(self.block.clone(), key);
+        let mut lo = 0;
+        let mut hi = self.block.offsets.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            self.seek_to_idx(mid);
+            match Key::from_slice(self.key.raw_ref()).cmp(&key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    lo = mid;
+                    break;
+                }
+            }
+        }
 
-        self.idx = ret.idx;
-        self.key = ret.key;
+        self.seek_to_idx(lo);
     }
 }
