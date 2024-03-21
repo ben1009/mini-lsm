@@ -161,7 +161,7 @@ impl LsmStorageInner {
             }
         }
         if let Some(builder) = builder {
-            let sst_id = self.next_sst_id(); // lock dropped here
+            let sst_id = self.next_sst_id();
             let sst = Arc::new(builder.build(
                 sst_id,
                 Some(self.block_cache.clone()),

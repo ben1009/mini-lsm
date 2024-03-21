@@ -29,7 +29,7 @@ pub struct BlockIterator {
     block: Arc<Block>,
     /// the current key at the iterator position
     key: KeyVec,
-    /// the current value range in the block.data, corresponds to the current key
+    /// the current value range in the block.data, coresponds to the current key
     value_range: (usize, usize),
     /// the current index at the iterator position
     idx: usize,
@@ -129,7 +129,6 @@ impl BlockIterator {
         let value_offset_begin = offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
         let value_offset_end = value_offset_begin + value_len;
         self.value_range = (value_offset_begin, value_offset_end);
-        entry.advance(value_len);
     }
 
     /// Seek to the first key that is >= `key`.
