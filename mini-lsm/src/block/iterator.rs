@@ -115,7 +115,6 @@ impl BlockIterator {
         let value_offset_begin = offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
         let value_offset_end = value_offset_begin + value_len;
         self.value_range = (value_offset_begin, value_offset_end);
-        entry.advance(value_len);
     }
 
     /// Seek to the first key that is >= `key`.
