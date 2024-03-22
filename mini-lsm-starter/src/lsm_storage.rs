@@ -421,7 +421,6 @@ impl LsmStorageInner {
             let it = i.scan(lower, upper);
             m_merge_iterators.push(Box::new(it));
         }
-
         let mit = MergeIterator::create(m_merge_iterators);
 
         // l0 sstables
