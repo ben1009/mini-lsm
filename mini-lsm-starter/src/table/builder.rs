@@ -54,6 +54,10 @@ impl SsTableBuilder {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.first_key.is_empty()
+    }
+
     /// Adds a key-value pair to SSTable.
     ///
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
