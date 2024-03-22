@@ -28,6 +28,7 @@ pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
     Simple(SimpleLeveledCompactionTask),
+    /// only used when only have l0, l1 levels, so when used, always compact_to_bottom_level = true by default
     ForceFullCompaction {
         l0_sstables: Vec<usize>,
         l1_sstables: Vec<usize>,
