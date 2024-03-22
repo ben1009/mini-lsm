@@ -4,10 +4,12 @@ mod leveled;
 mod simple_leveled;
 mod tiered;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
+
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -15,14 +17,20 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::concat_iterator::SstConcatIterator;
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
     Simple(SimpleLeveledCompactionTask),
+    /// only used when only have l0, l1 levels, so when used, always compact_to_bottom_level = true by default
     ForceFullCompaction {
         l0_sstables: Vec<usize>,
         l1_sstables: Vec<usize>,
@@ -107,16 +115,109 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+    fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        let mut ret = vec![];
+
+        if let CompactionTask::ForceFullCompaction {
+            l0_sstables,
+            l1_sstables,
+        } = task
+        {
+            let mut m_it = vec![];
+            let state = self.state.read().clone();
+            for i in l0_sstables.iter() {
+                let t = state.sstables[i].clone();
+                let s = SsTableIterator::create_and_seek_to_first(t.clone())?;
+                m_it.push(Box::new(s));
+            }
+            let s_0_it = MergeIterator::create(m_it);
+
+            let mut s_1 = vec![];
+            for i in l1_sstables.iter() {
+                let t = state.sstables[i].clone();
+                s_1.push(t);
+            }
+            let c_it = SstConcatIterator::create_and_seek_to_first(s_1)?;
+
+            let mut s_it = TwoMergeIterator::create(s_0_it, c_it)?;
+            let mut builder = SsTableBuilder::new(self.options.block_size);
+
+            while s_it.is_valid() {
+                if builder.estimated_size() >= self.options.target_sst_size {
+                    let sst_id = self.next_sst_id();
+                    let sst = builder.build(
+                        sst_id,
+                        Some(self.block_cache.clone()),
+                        self.path_of_sst(sst_id),
+                    )?;
+                    ret.push(Arc::new(sst));
+                    builder = SsTableBuilder::new(self.options.block_size);
+                }
+                // since compact_to_bottom_level always true in ForceFullCompaction, so like in a full tree compaction,
+                // just rm the delete tombstone directly
+                if !s_it.value().is_empty() {
+                    builder.add(s_it.key(), s_it.value());
+                }
+                s_it.next()?;
+            }
+
+            if !builder.is_empty() {
+                let sst_id = self.next_sst_id();
+                let sst = builder.build(
+                    sst_id,
+                    Some(self.block_cache.clone()),
+                    self.path_of_sst(sst_id),
+                )?;
+                ret.push(Arc::new(sst));
+            }
+        }
+
+        Ok(ret)
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let state = self.state.read().clone();
+        let ssts_to_compact = (&state.l0_sstables, &state.levels[0].1);
+        let task = CompactionTask::ForceFullCompaction {
+            l0_sstables: ssts_to_compact.0.clone(),
+            l1_sstables: ssts_to_compact.1.clone(),
+        };
+
+        let new_ssts = self.compact(&task)?;
+
+        {
+            let _state_lock = self.state_lock.lock();
+            let mut guard = self.state.write();
+            let mut snashot = guard.as_ref().clone();
+
+            ssts_to_compact
+                .0
+                .iter()
+                .chain(ssts_to_compact.1)
+                .for_each(|id| {
+                    snashot.sstables.remove(id);
+                });
+            snashot.levels[0].1 = new_ssts.iter().map(|t| t.sst_id()).collect();
+            new_ssts.iter().for_each(|id| {
+                snashot.sstables.insert(id.sst_id(), id.clone());
+            });
+            let l0_rm = ssts_to_compact.0.iter().collect::<HashSet<_>>();
+            // might have new l0 insert into snashot.l0_sstables during compact
+            snashot.l0_sstables.retain(|id| !l0_rm.contains(id));
+
+            *guard = Arc::new(snashot);
+        }
+
+        for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
+            std::fs::remove_file(self.path_of_sst(*id))?;
+        }
+
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        // self.force_full_compaction()
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(
