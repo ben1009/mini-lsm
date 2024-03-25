@@ -388,6 +388,7 @@ impl LsmStorageInner {
         Ok(None)
     }
 
+    /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
         unimplemented!()
     }
