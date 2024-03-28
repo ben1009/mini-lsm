@@ -441,7 +441,7 @@ impl LsmStorageInner {
         }
 
         // L0 SSTs, from latest to earliest.
-        let mut sstables = vec![];
+        let mut sstables_l0 = vec![];
         state.l0_sstables.iter().for_each(|id| {
             if let Some(s) = state.sstables.get(id) {
                 if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
@@ -454,11 +454,11 @@ impl LsmStorageInner {
                     }
                 }
 
-                sstables.push(s.clone());
+                sstables_l0.push(s.clone());
             }
         });
 
-        for s in sstables.iter() {
+        for s in sstables_l0.iter() {
             let s_it =
                 SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
             if s_it.is_valid() && s_it.key().raw_ref() == key {
@@ -469,31 +469,33 @@ impl LsmStorageInner {
             }
         }
 
-        // L1 SSTs, from latest to earliest.
-        let mut sstables_1 = vec![];
-        state.levels[0].1.iter().for_each(|id| {
-            if let Some(s) = state.sstables.get(id) {
-                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    return;
-                }
-                if let Some(b) = &s.bloom {
-                    let key_hash = farmhash::hash32(key);
-                    if !b.may_contain(key_hash) {
+        // L1-lmax SSTs, from latest to earliest.
+        for (_, sst_ids) in state.levels.iter() {
+            let mut sstables = vec![];
+            sst_ids.iter().for_each(|id| {
+                if let Some(s) = state.sstables.get(id) {
+                    if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
                         return;
                     }
+                    if let Some(b) = &s.bloom {
+                        let key_hash = farmhash::hash32(key);
+                        if !b.may_contain(key_hash) {
+                            return;
+                        }
+                    }
+
+                    sstables.push(s.clone());
                 }
+            });
 
-                sstables_1.push(s.clone());
+            let s_it =
+                SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(key))?;
+            if s_it.is_valid() && s_it.key().raw_ref() == key {
+                if s_it.value().is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(Bytes::copy_from_slice(s_it.value())));
             }
-        });
-
-        let s_it =
-            SstConcatIterator::create_and_seek_to_key(sstables_1, KeySlice::from_slice(key))?;
-        if s_it.is_valid() && s_it.key().raw_ref() == key {
-            if s_it.value().is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(Bytes::copy_from_slice(s_it.value())));
         }
 
         Ok(None)
@@ -644,10 +646,10 @@ impl LsmStorageInner {
             let it = i.scan(lower, upper);
             m_merge_iterators.push(Box::new(it));
         }
-        let mit = MergeIterator::create(m_merge_iterators);
+        let m_memo_iter = MergeIterator::create(m_merge_iterators);
 
         // l0 sstables
-        let mut s_merge_iterators = vec![];
+        let mut l0_iters = vec![];
         for i in state.l0_sstables.iter() {
             let t = state.sstables[i].clone();
             if !t.range_overlap(lower, upper) {
@@ -676,34 +678,41 @@ impl LsmStorageInner {
                 }
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(t.clone())?,
             };
-            s_merge_iterators.push(Box::new(s));
+            l0_iters.push(Box::new(s));
         }
-        let sit_0 = MergeIterator::create(s_merge_iterators);
-        let two_m_s0 = TwoMergeIterator::create(mit, sit_0)?;
+        let m_l0_iter = MergeIterator::create(l0_iters);
+        let two_l0_iter = TwoMergeIterator::create(m_memo_iter, m_l0_iter)?;
 
-        // l1 sstables
-        let mut s_1 = vec![];
-        for i in &state.levels[0].1 {
-            let t = state.sstables[i].clone();
-            s_1.push(t);
-        }
-        let s1 = match lower {
-            Bound::Included(lower) => {
-                SstConcatIterator::create_and_seek_to_key(s_1, KeySlice::from_slice(lower))?
+        // l1-lmax sstables
+        let mut concat_iters = vec![];
+        for (_, sst_ids) in &state.levels {
+            let mut ss_tables = vec![];
+            for i in sst_ids {
+                let t = state.sstables[i].clone();
+                ss_tables.push(t);
             }
-            Bound::Excluded(lower) => {
-                let mut s =
-                    SstConcatIterator::create_and_seek_to_key(s_1, KeySlice::from_slice(lower))?;
-                if s.is_valid() && s.key().raw_ref() == lower {
-                    s.next()?;
+            let concat_iter = match lower {
+                Bound::Included(lower) => SstConcatIterator::create_and_seek_to_key(
+                    ss_tables,
+                    KeySlice::from_slice(lower),
+                )?,
+                Bound::Excluded(lower) => {
+                    let mut iter = SstConcatIterator::create_and_seek_to_key(
+                        ss_tables,
+                        KeySlice::from_slice(lower),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == lower {
+                        iter.next()?;
+                    }
+
+                    iter
                 }
-
-                s
-            }
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(s_1)?,
-        };
-
-        let two_m = TwoMergeIterator::create(two_m_s0, s1)?;
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ss_tables)?,
+            };
+            concat_iters.push(Box::new(concat_iter));
+        }
+        let m_iter = MergeIterator::create(concat_iters);
+        let two_m = TwoMergeIterator::create(two_l0_iter, m_iter)?;
         let lit = LsmIterator::new(two_m, Self::into_vec(upper))?;
 
         Ok(FusedIterator::new(lit))
