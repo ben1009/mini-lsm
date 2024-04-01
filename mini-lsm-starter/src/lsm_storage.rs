@@ -145,6 +145,11 @@ pub(crate) struct LsmStorageInner {
     /// the state behind Arc is read only, modify is done by replace with a new one,
     /// so read will get a snapshot, only the memtable in the snapshot will see the latest change with skipmap support
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    // with the separete state_lock instead of rwlock only, the state can still be accessed while the state_lock is locked,
+    // but with rwlock, that is impossible.
+    // so the state_lock is only used in backgroud tasks, for example, like compaction, flush to imm_memtables, flush to l0,
+    // so the foreground tasks are not blocked
+    // kind of similar to https://twitter.com/MarkCallaghanDB/status/1574425353564475394
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
@@ -526,11 +531,11 @@ impl LsmStorageInner {
                     SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(lower))?
                 }
                 Bound::Excluded(lower) => {
-                    if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
-                        || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
-                    {
-                        continue;
-                    }
+                    // if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
+                    //     || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
+                    // {
+                    //     continue;
+                    // }
                     let mut s = SsTableIterator::create_and_seek_to_key(
                         t.clone(),
                         KeySlice::from_slice(lower),
