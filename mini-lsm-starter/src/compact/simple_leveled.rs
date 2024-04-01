@@ -85,6 +85,7 @@ impl SimpleLeveledCompactionController {
         let mut snapshot = snapshot.clone();
 
         match task.upper_level {
+            // might have new l0 insert into snashot.l0_sstables during compaction
             None => snapshot
                 .l0_sstables
                 .retain(|x| !task.upper_level_sst_ids.contains(x)),
