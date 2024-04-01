@@ -661,11 +661,11 @@ impl LsmStorageInner {
                     SsTableIterator::create_and_seek_to_key(t.clone(), KeySlice::from_slice(lower))?
                 }
                 Bound::Excluded(lower) => {
-                    if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
-                        || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
-                    {
-                        continue;
-                    }
+                    // if t.first_key().as_key_slice() >= KeySlice::from_slice(lower)
+                    //     || t.last_key().as_key_slice() <= KeySlice::from_slice(lower)
+                    // {
+                    //     continue;
+                    // }
                     let mut s = SsTableIterator::create_and_seek_to_key(
                         t.clone(),
                         KeySlice::from_slice(lower),
