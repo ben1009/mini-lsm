@@ -116,17 +116,15 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn compact_from_iters(
+    fn compact_from_iter(
         &self,
-        upper_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
-        lower_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
+        mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
         compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut ret = vec![];
-        let mut s_it = TwoMergeIterator::create(upper_level_iter, lower_level_iter)?;
         let mut builder = SsTableBuilder::new(self.options.block_size);
 
-        while s_it.is_valid() {
+        while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
                 let sst_id = self.next_sst_id();
                 let sst = builder.build(
@@ -138,10 +136,10 @@ impl LsmStorageInner {
                 builder = SsTableBuilder::new(self.options.block_size);
             }
 
-            if !s_it.value().is_empty() || !compact_to_bottom_level {
-                builder.add(s_it.key(), s_it.value());
+            if !iter.value().is_empty() || !compact_to_bottom_level {
+                builder.add(iter.key(), iter.value());
             }
-            s_it.next()?;
+            iter.next()?;
         }
 
         if !builder.is_empty() {
@@ -155,6 +153,17 @@ impl LsmStorageInner {
         }
 
         Ok(ret)
+    }
+
+    fn compact_from_iters(
+        &self,
+        upper_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
+        lower_level_iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>> + 'static,
+        compact_to_bottom_level: bool,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        let s_it = TwoMergeIterator::create(upper_level_iter, lower_level_iter)?;
+
+        self.compact_from_iter(s_it, compact_to_bottom_level)
     }
 
     fn compact_from_l0_l1(
@@ -223,7 +232,21 @@ impl LsmStorageInner {
                 task.compact_to_bottom_level(),
             ),
             CompactionTask::Leveled(_) => todo!(),
-            CompactionTask::Tiered(_) => todo!(),
+            CompactionTask::Tiered(t) => {
+                let mut s_iters = vec![];
+                for tier in &t.tiers {
+                    let mut sstables = vec![];
+                    for i in tier.1.iter() {
+                        let t = state.sstables[i].clone();
+                        sstables.push(t);
+                    }
+                    s_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                        sstables,
+                    )?));
+                }
+                let m_iter = MergeIterator::create(s_iters);
+                self.compact_from_iter(m_iter, task.compact_to_bottom_level())
+            }
         }
     }
 
