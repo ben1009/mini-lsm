@@ -472,7 +472,13 @@ impl LsmStorageInner {
             let mut state = guard.as_ref().clone();
 
             state.imm_memtables.pop();
-            state.l0_sstables.insert(0, sst.sst_id());
+            if self.compaction_controller.flush_to_l0() {
+                state.l0_sstables.insert(0, sst.sst_id());
+            } else {
+                // in tiered compaction, Every time flush L0 SSTs,
+                // should flush the SST into a tier placed at the front of the vector
+                state.levels.insert(0, (sst.sst_id(), vec![sst.sst_id()]));
+            }
             state.sstables.insert(sst.sst_id(), Arc::new(sst));
             *guard = Arc::new(state);
         }
