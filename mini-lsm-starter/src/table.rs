@@ -299,6 +299,7 @@ impl SsTable {
         &self.last_key
     }
 
+    /// Get table size in bytes
     pub fn table_size(&self) -> u64 {
         self.file.1
     }
