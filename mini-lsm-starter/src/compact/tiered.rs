@@ -108,19 +108,21 @@ impl TieredCompactionController {
         let mut levels = Vec::new();
         let mut new_tier_added = false;
         let mut files_to_remove = Vec::new();
-        for (tier_id, files) in &snapshot.levels {
+
+        for (tier_id, sstids) in &snapshot.levels {
             // might have new files added to sstables.levels when flush_immtables, so rm by id
-            if let Some(ffiles) = tier_to_remove.remove(tier_id) {
+            if let Some(f) = tier_to_remove.remove(tier_id) {
                 // the tier should be removed
-                assert_eq!(ffiles, files, "file changed after issuing compaction task");
-                files_to_remove.extend(ffiles.iter().copied());
+                assert_eq!(f, sstids, "file changed after issuing compaction task");
+                files_to_remove.extend(f.iter());
             } else {
                 // retain the tier
-                levels.push((*tier_id, files.clone()));
+                levels.push((*tier_id, sstids.clone()));
             }
             if tier_to_remove.is_empty() && !new_tier_added {
                 // tricky one, insert the new generated tier to the LSM tree, this may be in the middle of the LSM tree
                 new_tier_added = true;
+                // use the first output SST id as the level/tier id for new sorted run
                 levels.push((output[0], output.to_vec()));
             }
         }

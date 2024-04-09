@@ -210,23 +210,36 @@ impl LsmStorageInner {
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
         let state = self.state.read().clone();
         match task {
-            CompactionTask::Simple(t) => {
-                if t.upper_level.is_none() {
+            CompactionTask::Simple(SimpleLeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
+            })
+            | CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
+            }) => {
+                if upper_level.is_none() {
                     self.compact_from_l0_l1(
-                        t.upper_level_sst_ids.clone(),
-                        t.lower_level_sst_ids.clone(),
+                        upper_level_sst_ids.clone(),
+                        lower_level_sst_ids.clone(),
                         task.compact_to_bottom_level(),
                     )
                 } else {
                     let mut s_upper = vec![];
-                    for i in t.upper_level_sst_ids.iter() {
+                    for i in upper_level_sst_ids.iter() {
                         let t = state.sstables[i].clone();
                         s_upper.push(t);
                     }
                     let upper_level_iter = SstConcatIterator::create_and_seek_to_first(s_upper)?;
 
                     let mut s_lower = vec![];
-                    for i in t.lower_level_sst_ids.iter() {
+                    for i in lower_level_sst_ids.iter() {
                         let t = state.sstables[i].clone();
                         s_lower.push(t);
                     }
@@ -247,7 +260,6 @@ impl LsmStorageInner {
                 l1_sstables.clone(),
                 task.compact_to_bottom_level(),
             ),
-            CompactionTask::Leveled(_) => todo!(),
             CompactionTask::Tiered(t) => {
                 let mut s_iters = vec![];
                 for tier in &t.tiers {
@@ -320,15 +332,17 @@ impl LsmStorageInner {
 
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
+            let mut snapshot = self.state.read().as_ref().clone();
+            for s in &new_ssts {
+                snapshot.sstables.insert(s.sst_id(), s.clone());
+            }
             let (snapshot_partial, rm_sst_ids) = self
                 .compaction_controller
-                .apply_compaction_result(&self.state.read().clone(), task, output.as_slice());
+                .apply_compaction_result(&snapshot, task, output.as_slice());
 
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
-            for s in new_ssts {
-                snapshot.sstables.insert(s.sst_id(), s);
-            }
+            snapshot.sstables = snapshot_partial.sstables;
             for s in &rm_sst_ids {
                 snapshot.sstables.remove(s);
             }
