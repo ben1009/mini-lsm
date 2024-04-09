@@ -61,6 +61,7 @@ impl LeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<LeveledCompactionTask> {
+        // build target level size
         let mut target_sizes = vec![0; snapshot.levels.len()];
         let mut bottom_size = 0;
         snapshot.levels[snapshot.levels.len() - 1]
@@ -94,6 +95,7 @@ impl LeveledCompactionController {
             });
         }
 
+        // find max ratio
         let mut ratio_max = (0.0, 0_usize);
         for (i, &t) in target_sizes.iter().enumerate() {
             let mut size = 0;
@@ -109,11 +111,10 @@ impl LeveledCompactionController {
         if ratio_max.0 <= 1.0 {
             return None;
         }
+
         let upper_level = ratio_max.1;
-        let mut upper_sstid = snapshot.levels[upper_level].1[0];
-        for i in &snapshot.levels[upper_level].1 {
-            upper_sstid = std::cmp::min(upper_sstid, *i);
-        }
+        // oldest sst in upper level
+        let upper_sstid = *snapshot.levels[upper_level].1.iter().min().unwrap();
 
         Some(LeveledCompactionTask {
             upper_level: Some(upper_level + 1),
@@ -149,11 +150,9 @@ impl LeveledCompactionController {
             .1
             .retain(|x| !task.lower_level_sst_ids.contains(x));
         snapshot.levels[task.lower_level - 1].1.extend(output);
-        snapshot.levels[task.lower_level - 1].1.sort_by(|x, y| {
-            snapshot.sstables[x]
-                .first_key()
-                .cmp(snapshot.sstables[y].first_key())
-        });
+        snapshot.levels[task.lower_level - 1]
+            .1
+            .sort_by_key(|x| snapshot.sstables[x].first_key());
 
         let mut rm_ids = task.upper_level_sst_ids.clone();
         rm_ids.extend(task.lower_level_sst_ids.clone());
