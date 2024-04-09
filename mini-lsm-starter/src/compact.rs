@@ -317,6 +317,7 @@ impl LsmStorageInner {
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
+            // specific for leveled compaction, need the sstables in the snapshot
             for s in &new_ssts {
                 snapshot.sstables.insert(s.sst_id(), s.clone());
             }
@@ -326,6 +327,7 @@ impl LsmStorageInner {
 
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
+            // specific for leveled compaction
             snapshot.sstables = snapshot_partial.sstables;
             for s in &rm_sst_ids {
                 snapshot.sstables.remove(s);
