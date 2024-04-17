@@ -20,6 +20,7 @@ mod simple_leveled;
 mod tiered;
 
 use std::collections::HashSet;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ use crate::iterators::StorageIterator;
 
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,7 +302,8 @@ impl LsmStorageInner {
                 .for_each(|id| {
                     snashot.sstables.remove(id);
                 });
-            snashot.levels[0].1 = new_ssts.iter().map(|t| t.sst_id()).collect();
+            let new_sst_ids: Vec<_> = new_ssts.iter().map(|t| t.sst_id()).collect();
+            snashot.levels[0].1 = new_sst_ids.clone();
             new_ssts.iter().for_each(|id| {
                 snashot.sstables.insert(id.sst_id(), id.clone());
             });
@@ -309,6 +312,13 @@ impl LsmStorageInner {
             snashot.l0_sstables.retain(|id| !l0_rm.contains(id));
 
             *guard = Arc::new(snashot);
+            drop(guard);
+
+            self.sync_dir()?;
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&_state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
         }
 
         for id in ssts_to_compact.0.iter().chain(ssts_to_compact.1) {
@@ -326,8 +336,8 @@ impl LsmStorageInner {
             return Ok(());
         }
 
-        let task = task.as_ref().unwrap();
-        let new_ssts = self.compact(task)?;
+        let t = task.as_ref().unwrap();
+        let new_ssts = self.compact(t)?;
         let output = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
 
         let rm_sst_ids = {
@@ -339,7 +349,7 @@ impl LsmStorageInner {
             }
             let (snapshot_partial, rm_sst_ids) = self
                 .compaction_controller
-                .apply_compaction_result(&snapshot, task, output.as_slice());
+                .apply_compaction_result(&snapshot, t, output.as_slice());
 
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
@@ -351,6 +361,13 @@ impl LsmStorageInner {
             snapshot.l0_sstables = snapshot_partial.l0_sstables;
             snapshot.levels = snapshot_partial.levels;
             *guard = Arc::new(snapshot);
+            drop(guard);
+
+            self.sync_dir()?;
+            self.manifest.as_ref().unwrap().add_record(
+                &_state_lock,
+                ManifestRecord::Compaction(task.unwrap(), output),
+            )?;
 
             rm_sst_ids
         };
