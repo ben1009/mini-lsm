@@ -1,10 +1,12 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
-use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use std::{fs::File, io::Write};
 
-use anyhow::Result;
+use anyhow::{Context, Ok, Result};
+
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -22,12 +24,35 @@ pub enum ManifestRecord {
 }
 
 impl Manifest {
-    pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let f = File::create_new(path.as_ref()).context("failed to create manifest")?;
+
+        Ok(Self {
+            file: Arc::new(Mutex::new(f)),
+        })
     }
 
-    pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        unimplemented!()
+    pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
+        let mut f = File::options()
+            .read(true)
+            .append(true)
+            .open(path.as_ref())
+            .context("failed to open recover manifest")?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+
+        let mut ret = vec![];
+        let records = serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
+        for record in records {
+            ret.push(record?);
+        }
+
+        Ok((
+            Self {
+                file: Arc::new(Mutex::new(f)),
+            },
+            ret,
+        ))
     }
 
     pub fn add_record(
@@ -38,7 +63,12 @@ impl Manifest {
         self.add_record_when_init(record)
     }
 
-    pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        unimplemented!()
+    pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        let mut file = self.file.lock();
+        let buf = serde_json::to_vec(&record)?;
+        file.write_all(buf.as_slice())?;
+        file.sync_all()?;
+
+        Ok(())
     }
 }
