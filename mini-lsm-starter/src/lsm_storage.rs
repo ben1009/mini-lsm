@@ -23,8 +23,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use crate::block::Block;
 use crate::compact::{
@@ -350,6 +350,7 @@ impl LsmStorageInner {
                             &state,
                             &task,
                             ids.as_slice(),
+                            false,
                         );
                         state = new_state;
                         max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
@@ -568,19 +569,30 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable,
-    /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called,
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let mut guard = self.state.write();
         let mut state = guard.as_ref().clone();
-        let m = std::mem::replace(
-            &mut state.memtable,
-            mem_table::MemTable::create(self.next_sst_id()).into(),
-        );
+        let m = std::mem::replace(&mut state.memtable, new_memtable.into());
         // make test happy. but why? kind of wired design decision
-        state.imm_memtables.insert(0, m);
+        state.imm_memtables.insert(0, m.clone());
         *guard = Arc::new(state);
 
+        Ok(())
+    }
+
+    /// Force freeze the current memtable to an immutable memtable,
+    /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
+    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        let sst_id = self.next_sst_id();
+        let mem_table = mem_table::MemTable::create(sst_id);
+        self.force_freeze_with_new_memtable(mem_table)?;
+
+        self.sync_dir()?;
+        self.manifest
+            .as_ref()
+            .unwrap()
+            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
         Ok(())
     }
 
