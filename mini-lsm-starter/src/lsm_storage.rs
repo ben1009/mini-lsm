@@ -503,9 +503,21 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        for record in batch {
+            match record {
+                WriteBatchRecord::Del(key) => {
+                    self.delete(key.as_ref())?;
+                }
+                WriteBatchRecord::Put(key, value) => {
+                    self.put(key.as_ref(), value.as_ref())?;
+                }
+            }
+        }
+
+        Ok(())
     }
+
     /// Put a key-value pair into the storage by writing into the current memtable.
     /// As our memtable implementation only requires an immutable reference for put,
     /// you ONLY need to take the read lock on state in order to modify the memtable.
