@@ -38,6 +38,8 @@ pub enum ManifestRecord {
     Compaction(CompactionTask, Vec<usize>),
 }
 
+// TODO: base on size or interval take snapshot of manifest in MANIFEST_SNAPSHOT file. after that, write to a new manifest file,
+// and gc old MANIFEST/MANIFEST_SNAPSHOT files in background, recove change to ManiFEST_SNAPSHOT + redo MNIFEST file
 impl Manifest {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let f = File::create_new(path.as_ref()).context("failed to create manifest")?;
@@ -82,8 +84,7 @@ impl Manifest {
         let mut file = self.file.lock();
         let buf = serde_json::to_vec(&record)?;
         file.write_all(buf.as_slice())?;
-        file.sync_all()?;
 
-        Ok(())
+        file.sync_all().context("failed to sync manifest")
     }
 }

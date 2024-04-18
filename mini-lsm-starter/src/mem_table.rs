@@ -62,13 +62,21 @@ impl MemTable {
     }
 
     /// Create a new mem-table with WAL
-    pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let mut ret = Self::create(id);
+        let wal = Wal::create(path)?;
+        ret.wal = Some(wal);
+
+        Ok(ret)
     }
 
     /// Create a memtable from WAL
-    pub fn recover_from_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let mut ret = Self::create(id);
+        let wal = Wal::recover(path, &ret.map)?;
+        ret.wal = Some(wal);
+
+        Ok(ret)
     }
 
     pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -97,6 +105,11 @@ impl MemTable {
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
     /// In week 2, day 6, also flush the data to WAL.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.put(key, value)?;
+            wal.sync()?;
+        }
+
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
 

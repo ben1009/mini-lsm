@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context};
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,7 @@ use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
+// TODO: try this one https://github.com/cloudflare/pingora/tree/main/tinyufo with bech later
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
 /// Represents the state of the storage engine.
@@ -192,7 +193,9 @@ impl MiniLsm {
             f.join().map_err(|e| anyhow!("{:?}", e))?;
         }
         if self.inner.options.enable_wal {
-            // TODO: handle wal
+            self.inner.sync()?;
+            self.inner.sync_dir()?;
+
             return Ok(());
         }
 
@@ -310,16 +313,25 @@ impl LsmStorageInner {
         let mut max_id = state.memtable.id();
         let manifest_path = path.join("MANIFEST");
         let manifest = if !manifest_path.exists() {
+            if options.enable_wal {
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    state.memtable.id(),
+                    Self::path_of_wal_static(path, state.memtable.id()),
+                )?)
+            }
             let m = Manifest::create(manifest_path).context("failed to create manifest")?;
             m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
 
             m
         } else {
             let ret = Manifest::recover(manifest_path).context("failed to recover manifest")?;
+            // need order by sst_id when recover
+            let mut im_memtables = BTreeSet::new();
             // redo manifest log
             for record in ret.1 {
                 match record {
                     ManifestRecord::NewMemtable(id) => {
+                        im_memtables.insert(id);
                         max_id = std::cmp::max(max_id, id);
                     }
                     ManifestRecord::Flush(id) => {
@@ -330,6 +342,7 @@ impl LsmStorageInner {
                             // should flush the SST into a tier placed at the front of the vector
                             state.levels.insert(0, (id, vec![id]));
                         }
+                        im_memtables.remove(&id);
                         max_id = std::cmp::max(max_id, id);
                     }
                     ManifestRecord::Compaction(task, ids) => {
@@ -343,10 +356,23 @@ impl LsmStorageInner {
                     }
                 }
             }
-
-            // build memtable
             max_id += 1;
-            state.memtable = Arc::new(MemTable::create(max_id));
+            // build imm_memtables and memtable
+            if options.enable_wal {
+                // just recover all to imm_memtables, then create a new memtable
+                for id in im_memtables {
+                    let m = MemTable::recover_from_wal(id, Self::path_of_wal_static(path, id))?;
+                    if !m.is_empty() {
+                        state.imm_memtables.insert(0, Arc::new(m));
+                    }
+                }
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    max_id,
+                    Self::path_of_wal_static(path, max_id),
+                )?);
+            } else {
+                state.memtable = Arc::new(MemTable::create(max_id));
+            }
             ret.0
                 .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
 
@@ -381,12 +407,13 @@ impl LsmStorageInner {
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
+        storage.sync_dir()?;
 
         Ok(storage)
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -522,10 +549,11 @@ impl LsmStorageInner {
         Self::path_of_wal_static(&self.path, id)
     }
 
+    // only needed when have files created or deleted
     pub(super) fn sync_dir(&self) -> Result<()> {
-        File::open(&self.path)?.sync_all()?;
-
-        Ok(())
+        File::open(&self.path)?
+            .sync_all()
+            .context("failed to sync dir")
     }
 
     fn force_freeze_with_new_memtable(&self, new_memtable: mem_table::MemTable) -> Result<()> {
@@ -543,15 +571,19 @@ impl LsmStorageInner {
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let sst_id = self.next_sst_id();
-        let mem_table = mem_table::MemTable::create(sst_id);
+        let mem_table = if self.options.enable_wal {
+            mem_table::MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?
+        } else {
+            mem_table::MemTable::create(sst_id)
+        };
         self.force_freeze_with_new_memtable(mem_table)?;
 
         self.sync_dir()?;
+
         self.manifest
             .as_ref()
             .unwrap()
-            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
-        Ok(())
+            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -590,12 +622,11 @@ impl LsmStorageInner {
         }
 
         self.sync_dir()?;
+
         self.manifest
             .as_ref()
             .unwrap()
-            .add_record(&state_lock, ManifestRecord::Flush(sst_id))?;
-
-        Ok(())
+            .add_record(&state_lock, ManifestRecord::Flush(sst_id))
     }
 
     pub fn new_txn(&self) -> Result<()> {
