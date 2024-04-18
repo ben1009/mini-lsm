@@ -106,6 +106,11 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.put(key, value)?;
+            wal.sync()?;
+        }
+
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
 

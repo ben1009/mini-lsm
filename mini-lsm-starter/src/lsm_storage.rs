@@ -585,15 +585,19 @@ impl LsmStorageInner {
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let sst_id = self.next_sst_id();
-        let mem_table = mem_table::MemTable::create(sst_id);
+        let mem_table = if self.options.enable_wal {
+            mem_table::MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?
+        } else {
+            mem_table::MemTable::create(sst_id)
+        };
         self.force_freeze_with_new_memtable(mem_table)?;
 
         self.sync_dir()?;
+
         self.manifest
             .as_ref()
             .unwrap()
-            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
-        Ok(())
+            .add_record(_state_lock_observer, ManifestRecord::NewMemtable(sst_id))
     }
 
     /// Force flush the earliest-created immutable memtable to disk
