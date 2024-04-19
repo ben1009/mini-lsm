@@ -487,6 +487,7 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
+    /// TODO: sync wal after each batch, may need a write_batch api with wal for atomic write
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         for record in batch {
             match record {
