@@ -108,6 +108,7 @@ impl MemTable {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         if let Some(wal) = &self.wal {
             wal.put(key, value)?;
+            // TODO: change to write_batch sync instead
             wal.sync()?;
         }
 
