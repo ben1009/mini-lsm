@@ -287,7 +287,7 @@ impl LsmStorageInner {
                     snashot.sstables.remove(id);
                 });
             let new_sst_ids: Vec<_> = new_ssts.iter().map(|t| t.sst_id()).collect();
-            snashot.levels[0].1 = new_sst_ids.clone();
+            snashot.levels[0].1.clone_from(&new_sst_ids);
             new_ssts.iter().for_each(|id| {
                 snashot.sstables.insert(id.sst_id(), id.clone());
             });
