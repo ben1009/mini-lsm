@@ -335,6 +335,7 @@ impl LsmStorageInner {
                             &state,
                             &task,
                             ids.as_slice(),
+                            false,
                         );
                         state = new_state;
                         max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
