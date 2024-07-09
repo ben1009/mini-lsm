@@ -94,11 +94,11 @@ impl CompactionController {
         snapshot: &LsmStorageState,
         task: &CompactionTask,
         output: &[usize],
-        in_recovery: bool,
+        _in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output, in_recovery)
+                ctrl.apply_compaction_result(snapshot, task, output, _in_recovery)
             }
             (CompactionController::Simple(ctrl), CompactionTask::Simple(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, output)
@@ -349,7 +349,7 @@ impl LsmStorageInner {
             }
             let (snapshot_partial, rm_sst_ids) = self
                 .compaction_controller
-                .apply_compaction_result(&snapshot, t, output.as_slice());
+                .apply_compaction_result(&snapshot, t, output.as_slice(), false);
 
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
