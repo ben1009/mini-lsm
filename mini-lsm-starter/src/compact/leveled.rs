@@ -133,7 +133,7 @@ impl LeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
         task: &LeveledCompactionTask,
-        output: &[usize],
+        new_sst_ids: &[usize],
         _in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut snapshot = snapshot.clone();
@@ -150,7 +150,7 @@ impl LeveledCompactionController {
         snapshot.levels[task.lower_level - 1]
             .1
             .retain(|x| !task.lower_level_sst_ids.contains(x));
-        snapshot.levels[task.lower_level - 1].1.extend(output);
+        snapshot.levels[task.lower_level - 1].1.extend(new_sst_ids);
         snapshot.levels[task.lower_level - 1]
             .1
             .sort_by_key(|x| snapshot.sstables[x].first_key());

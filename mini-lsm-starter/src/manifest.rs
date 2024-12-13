@@ -18,6 +18,7 @@ pub struct Manifest {
 pub enum ManifestRecord {
     Flush(usize),
     NewMemtable(usize),
+    /// (task, new_sst_ids)
     Compaction(CompactionTask, Vec<usize>),
 }
 
@@ -55,6 +56,7 @@ impl Manifest {
         ))
     }
 
+    /// take a record of the changes in the LsmStorageState
     pub fn add_record(
         &self,
         _state_lock_observer: &MutexGuard<()>,
