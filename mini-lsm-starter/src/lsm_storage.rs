@@ -368,6 +368,7 @@ impl LsmStorageInner {
                 .flat_map(|(_, ids)| ids)
                 .chain(state.l0_sstables.iter());
             for id in ids {
+                // so the block_cache is shared by all sstables
                 let sst = SsTable::open(
                     *id,
                     Some(block_cache.clone()),

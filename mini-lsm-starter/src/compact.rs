@@ -78,17 +78,17 @@ impl CompactionController {
         &self,
         snapshot: &LsmStorageState,
         task: &CompactionTask,
-        output: &[usize],
+        new_sst_ids: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output, false)
+                ctrl.apply_compaction_result(snapshot, task, new_sst_ids, false)
             }
             (CompactionController::Simple(ctrl), CompactionTask::Simple(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output)
+                ctrl.apply_compaction_result(snapshot, task, new_sst_ids)
             }
             (CompactionController::Tiered(ctrl), CompactionTask::Tiered(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output)
+                ctrl.apply_compaction_result(snapshot, task, new_sst_ids)
             }
             _ => unreachable!(),
         }
@@ -322,7 +322,7 @@ impl LsmStorageInner {
 
         let t = task.as_ref().unwrap();
         let new_ssts = self.compact(t)?;
-        let output = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
+        let new_sst_ids = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
 
         let rm_sst_ids = {
             let _state_lock = self.state_lock.lock();
@@ -333,7 +333,7 @@ impl LsmStorageInner {
             }
             let (snapshot_partial, rm_sst_ids) = self
                 .compaction_controller
-                .apply_compaction_result(&snapshot, t, output.as_slice());
+                .apply_compaction_result(&snapshot, t, new_sst_ids.as_slice());
 
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
@@ -350,7 +350,7 @@ impl LsmStorageInner {
             self.sync_dir()?;
             self.manifest.as_ref().unwrap().add_record(
                 &_state_lock,
-                ManifestRecord::Compaction(task.unwrap(), output),
+                ManifestRecord::Compaction(task.unwrap(), new_sst_ids),
             )?;
 
             rm_sst_ids
