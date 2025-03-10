@@ -20,11 +20,9 @@ mod iterator;
 
 use std::mem;
 
-use std::mem;
-
 pub use builder::BlockBuilder;
 use bytes::{Buf, BufMut, Bytes};
-use bytes::{Buf, BufMut, Bytes};
+
 pub use iterator::BlockIterator;
 use nom::AsBytes;
 
@@ -48,31 +46,10 @@ impl Block {
         ret.put_u16(self.offsets.len() as u16);
 
         Bytes::from(ret)
-        let mut ret = vec![];
-        ret.put(self.data.as_bytes());
-        for o in &self.offsets {
-            ret.put_u16(*o);
-        }
-        ret.put_u16(self.offsets.len() as u16);
-
-        Bytes::from(ret)
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
-        let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
-        let offset = data.len() - SIZE_OF_U16 - num_of_elements * SIZE_OF_U16;
-
-        let datas = data[0..offset].to_vec();
-        let offsets = data[offset..data.len() - SIZE_OF_U16]
-            .chunks(SIZE_OF_U16)
-            .map(|mut x| x.get_u16())
-            .collect();
-
-        Self {
-            data: datas,
-            offsets,
-        }
         let num_of_elements = (&data[data.len() - SIZE_OF_U16..]).get_u16() as usize;
         let offset = data.len() - SIZE_OF_U16 - num_of_elements * SIZE_OF_U16;
 

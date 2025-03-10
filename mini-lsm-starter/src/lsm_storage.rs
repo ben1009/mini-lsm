@@ -1,21 +1,6 @@
-// Copyright (c) 2022-2025 Alex Chi Z
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -23,18 +8,18 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crate::block::Block;
 use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
@@ -352,7 +337,6 @@ impl LsmStorageInner {
                             &state,
                             &task,
                             ids.as_slice(),
-                            false,
                         );
                         state = new_state;
                         max_id = std::cmp::max(max_id, *ids.last().unwrap_or(&max_id));
@@ -574,19 +558,6 @@ impl LsmStorageInner {
     }
 
     fn force_freeze_with_new_memtable(&self, new_memtable: mem_table::MemTable) -> Result<()> {
-        let mut guard = self.state.write();
-        let mut state = guard.as_ref().clone();
-        let m = std::mem::replace(&mut state.memtable, new_memtable.into());
-        // make test happy. but why? kind of wired design decision
-        state.imm_memtables.insert(0, m.clone());
-        *guard = Arc::new(state);
-
-        Ok(())
-    }
-
-    /// Force freeze the current memtable to an immutable memtable,
-    /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let mut guard = self.state.write();
         let mut state = guard.as_ref().clone();
         let m = std::mem::replace(&mut state.memtable, new_memtable.into());

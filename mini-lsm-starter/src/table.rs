@@ -19,13 +19,8 @@ pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
-use anyhow::anyhow;
 use anyhow::Result;
-pub use builder::SsTableBuilder;
-use bytes::{Buf, BufMut};
-pub use iterator::SsTableIterator;
 use anyhow::anyhow;
-use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -38,13 +33,9 @@ use std::sync::Arc;
 use crate::block::Block;
 use crate::block::SIZE_OF_U16;
 use crate::key::{Key, KeyBytes, KeySlice};
-use crate::block::SIZE_OF_U16;
-use crate::key::{Key, KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
-
-const SIZE_OF_U32: usize = mem::size_of::<u32>();
 
 const SIZE_OF_U32: usize = mem::size_of::<u32>();
 

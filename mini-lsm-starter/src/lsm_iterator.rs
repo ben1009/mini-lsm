@@ -17,12 +17,12 @@
 
 use std::ops::Bound;
 
-use anyhow::{bail, Ok, Result};
+use anyhow::{Ok, Result, bail};
 
 use crate::{
     iterators::{
-        concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
-        two_merge_iterator::TwoMergeIterator, StorageIterator,
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
     },
     mem_table::MemTableIterator,
     table::SsTableIterator,

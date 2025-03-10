@@ -33,10 +33,10 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::iterators::StorageIterator;
 
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
@@ -93,12 +93,11 @@ impl CompactionController {
         &self,
         snapshot: &LsmStorageState,
         task: &CompactionTask,
-        output: &[usize],
-        _in_recovery: bool,
+        new_sst_ids: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
-                ctrl.apply_compaction_result(snapshot, task, output, _in_recovery)
+                ctrl.apply_compaction_result(snapshot, task, new_sst_ids, false)
             }
             (CompactionController::Simple(ctrl), CompactionTask::Simple(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, new_sst_ids)
@@ -350,7 +349,7 @@ impl LsmStorageInner {
             }
             let (snapshot_partial, rm_sst_ids) = self
                 .compaction_controller
-                .apply_compaction_result(&snapshot, t, output.as_slice(), false);
+                .apply_compaction_result(&snapshot, t, new_sst_ids.as_slice());
 
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
