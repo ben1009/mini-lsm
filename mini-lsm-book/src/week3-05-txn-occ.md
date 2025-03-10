@@ -1,3 +1,7 @@
+<!--
+  mini-lsm-book © 2022-2025 by Alex Chi Z is licensed under CC BY-NC-SA 4.0
+-->
+
 # Transaction and Optimistic Concurrency Control
 
 In this chapter, you will implement all interfaces of `Transaction`. Your implementation will maintain a private workspace for modifications inside a transaction, and commit them in batch, so that all modifications within the transaction will only be visible to the transaction itself until commit. We only check for conflicts (i.e., serializable conflicts) when commit, and this is optimistic concurrency control.
@@ -75,6 +79,7 @@ A batch should be handled in the same mem table and the same WAL, even if it exc
 * What if the user wants to batch import data (i.e., 1TB?) If they use the transaction API to do that, will you give them some advice? Is there any opportunity to optimize for this case?
 * What is optimistic concurrency control? What would the system be like if we implement pessimistic concurrency control instead in Mini-LSM?
 * What happens if your system crashes and leave a corrupted WAL on the disk? How do you handle this situation?
+* When you commit the txn, is it necessary to put everything into the memtable in batch, or you can simply put it key by key? Why?
 
 ## Bonus Tasks
 

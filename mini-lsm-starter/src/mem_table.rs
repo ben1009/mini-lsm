@@ -1,9 +1,24 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
+#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Ok, Result};
 use bytes::Bytes;
@@ -89,6 +104,7 @@ impl MemTable {
     ///
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
     /// In week 2, day 6, also flush the data to WAL.
+    /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         if let Some(wal) = &self.wal {
             wal.put(key, value)?;
@@ -105,6 +121,11 @@ impl MemTable {
         );
 
         Ok(())
+    }
+
+    /// Implement this in week 3, day 5.
+    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
+        unimplemented!()
     }
 
     pub fn sync_wal(&self) -> Result<()> {

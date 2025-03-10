@@ -1,9 +1,23 @@
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -14,16 +28,16 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::iterators::StorageIterator;
 use crate::key::{self, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{map_bound, map_key_bound_plus_ts, MemTable};
-use crate::mvcc::txn::{Transaction, TxnIterator};
+use crate::mem_table::{MemTable, map_bound, map_key_bound_plus_ts};
 use crate::mvcc::LsmMvccInner;
+use crate::mvcc::txn::{Transaction, TxnIterator};
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -559,34 +573,31 @@ impl LsmStorageInner {
     pub fn write_batch_inner<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<u64> {
         let _lck = self.mvcc().write_lock.lock();
         let ts = self.mvcc().latest_commit_ts() + 1;
+        let mut batch_datas: Vec<(key::Key<&[u8]>, &[u8])> = vec![];
+        let size;
         for record in batch {
             match record {
                 WriteBatchRecord::Del(key) => {
                     let key = key.as_ref();
                     assert!(!key.is_empty(), "key cannot be empty");
-                    let size;
-                    {
-                        let guard = self.state.read();
-                        guard.memtable.put(KeySlice::from_slice(key, ts), b"")?;
-                        size = guard.memtable.approximate_size();
-                    }
-                    self.try_freeze(size)?;
+                    batch_datas.push((KeySlice::from_slice(key, ts), b""));
                 }
                 WriteBatchRecord::Put(key, value) => {
                     let key = key.as_ref();
                     let value = value.as_ref();
                     assert!(!key.is_empty(), "key cannot be empty");
                     assert!(!value.is_empty(), "value cannot be empty");
-                    let size;
-                    {
-                        let guard = self.state.read();
-                        guard.memtable.put(KeySlice::from_slice(key, ts), value)?;
-                        size = guard.memtable.approximate_size();
-                    }
-                    self.try_freeze(size)?;
+                    batch_datas.push((KeySlice::from_slice(key, ts), value));
                 }
             }
         }
+        {
+            let guard = self.state.read();
+            guard.memtable.put_batch(&batch_datas)?;
+            size = guard.memtable.approximate_size();
+        }
+        self.try_freeze(size)?;
+
         self.mvcc().update_commit_ts(ts);
         Ok(ts)
     }

@@ -1,3 +1,7 @@
+<!--
+  mini-lsm-book © 2022-2025 by Alex Chi Z is licensed under CC BY-NC-SA 4.0
+-->
+
 # Leveled Compaction Strategy
 
 ![Chapter Overview](./lsm-tutorial/week2-04-leveled.svg)
@@ -172,12 +176,12 @@ The implementation should be similar to simple leveled compaction. Remember to c
 * Finding a good key split point for compaction may potentially reduce the write amplification, or it does not matter at all? (Consider that case that the user write keys beginning with some prefixes, `00` and `01`. The number of keys under these two prefixes are different and their write patterns are different. If we can always split `00` and `01` into different SSTs...)
 * Imagine that a user was using tiered (universal) compaction before and wants to migrate to leveled compaction. What might be the challenges of this migration? And how to do the migration?
 * And if we do it reversely, what if the user wants to migrate from leveled compaction to tiered compaction?
-* What happens if compaction speed cannot keep up with the SST flushes?
+* What happens if compaction speed cannot keep up with the SST flushes for leveled compaction?
 * What might needs to be considered if the system schedules multiple compaction tasks in parallel?
 * What is the peak storage usage for leveled compaction? Compared with universal compaction?
 * Is it true that with a lower `level_size_multiplier`, you can always get a lower write amplification?
 * What needs to be done if a user not using compaction at all decides to migrate to leveled compaction?
-* Some people propose to do intra-L0 compaction (compact L0 tables and still put them in L0) before pushing them to lower layers. What might be the benefits of doing so? (Might be related: [PebblesDB SOSP'17](https://www.cs.utexas.edu/~rak/papers/sosp17-pebblesdb.pdf))
+* Some people propose to do intra-L0 compaction (compact L0 tables and still put them in L0) before pushing them to lower layers. What might be the benefits of doing so? (Might be related: [PebblesDB SOSP'17](https://www.cs.utexas.edu/~vijay/papers/sosp17-pebblesdb.pdf))
 * Consider the case that the upper level has two tables of `[100, 200], [201, 300]` and the lower level has `[50, 150], [151, 250], [251, 350]`. In this case, do you still want to compact one file in the upper level at a time? Why?
 
 We do not provide reference answers to the questions, and feel free to discuss about them in the Discord community.
