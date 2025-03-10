@@ -129,6 +129,7 @@ impl LsmStorageInner {
         while iter.is_valid() {
             if builder.estimated_size() >= self.options.target_sst_size {
                 let sst_id = self.next_sst_id();
+                // TODO: refill the cache base on the previous id/key with new block ids that overlap with the previous sst
                 let sst = builder.build(
                     sst_id,
                     Some(self.block_cache.clone()),
