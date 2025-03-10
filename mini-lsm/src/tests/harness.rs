@@ -1,9 +1,25 @@
+#![allow(dead_code)] // REMOVE THIS LINE once all modules are complete
+
+// Copyright (c) 2022-2025 Alex Chi Z
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::{
     collections::BTreeMap, ops::Bound, os::unix::fs::MetadataExt, path::Path, sync::Arc,
     time::Duration,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 
 use crate::{
@@ -11,7 +27,7 @@ use crate::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    iterators::{StorageIterator, merge_iterator::MergeIterator},
     key::{KeySlice, TS_ENABLED},
     lsm_storage::{BlockCache, LsmStorageInner, LsmStorageState, MiniLsm},
     table::{SsTable, SsTableBuilder, SsTableIterator},
@@ -114,7 +130,6 @@ where
     assert!(!iter.is_valid());
 }
 
-#[allow(dead_code)]
 pub fn check_iter_result_by_key_and_ts<I>(iter: &mut I, expected: Vec<((Bytes, u64), Bytes)>)
 where
     I: for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
@@ -193,7 +208,6 @@ pub fn generate_sst(
     builder.build(id, block_cache, path.as_ref()).unwrap()
 }
 
-#[allow(dead_code)]
 pub fn generate_sst_with_ts(
     id: usize,
     path: impl AsRef<Path>,
@@ -276,7 +290,9 @@ pub fn compaction_bench(storage: Arc<MiniLsm>) {
 
     storage.dump_structure();
 
-    println!("This test case does not guarantee your compaction algorithm produces a LSM state as expected. It only does minimal checks on the size of the levels. Please use the compaction simulator to check if the compaction is correctly going on.");
+    println!(
+        "This test case does not guarantee your compaction algorithm produces a LSM state as expected. It only does minimal checks on the size of the levels. Please use the compaction simulator to check if the compaction is correctly going on."
+    );
 }
 
 pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
@@ -368,6 +384,7 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
             max_size_amplification_percent,
             size_ratio,
             min_merge_width,
+            ..
         }) => {
             let size_ratio_trigger = (100.0 + size_ratio as f64) / 100.0;
             assert_eq!(l0_sst_num, 0);
