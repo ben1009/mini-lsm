@@ -276,6 +276,8 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let mut state = LsmStorageState::create(&options);
+        // seems the cache is not cleaned forever ? just let lru do the gc job.
+        // better refill the cache somehow after compaction
         let block_cache = Arc::new(BlockCache::new(1024));
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
