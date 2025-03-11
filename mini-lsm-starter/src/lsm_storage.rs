@@ -490,30 +490,29 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    /// TODO: sync wal after each batch, may need a write_batch api with wal for atomic write
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let mut data = vec![];
         for record in batch {
             match record {
                 WriteBatchRecord::Del(key) => {
-                    self.delete(key.as_ref())?;
+                    data.push((KeySlice::from_slice(key.as_ref()), b"".as_slice()));
                 }
                 WriteBatchRecord::Put(key, value) => {
-                    self.put(key.as_ref(), value.as_ref())?;
+                    data.push((KeySlice::from_slice(key.as_ref()), value.as_ref()));
                 }
             }
         }
 
-        Ok(())
+        {
+            let state = self.state.read();
+            state.memtable.put_batch(data.as_slice())?;
+        }
+
+        self.try_freeze_memtable()
     }
 
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    /// As our memtable implementation only requires an immutable reference for put,
-    /// you ONLY need to take the read lock on state in order to modify the memtable.
-    /// This allows concurrent access to the memtable from multiple threads.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn try_freeze_memtable(&self) -> Result<()> {
         let state = self.state.read();
-        state.memtable.put(key, value)?;
-
         if state.memtable.approximate_size() >= self.options.target_sst_size {
             drop(state);
             let lock = &self.state_lock.lock();
@@ -527,6 +526,19 @@ impl LsmStorageInner {
         }
 
         Ok(())
+    }
+
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    /// As our memtable implementation only requires an immutable reference for put,
+    /// you ONLY need to take the read lock on state in order to modify the memtable.
+    /// This allows concurrent access to the memtable from multiple threads.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        {
+            let state = self.state.read();
+            state.memtable.put(key, value)?;
+        }
+
+        self.try_freeze_memtable()
     }
 
     /// Remove a key from the storage by writing an empty value.
