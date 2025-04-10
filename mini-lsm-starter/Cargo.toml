@@ -9,7 +9,7 @@ anyhow = "1"
 arc-swap = "1"
 bytes = "1"
 clap = { version = "4.4.17", features = ["derive"] }
-crossbeam-channel = "0.5.11"
+crossbeam-channel = "0.5.15"
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1.3"
 farmhash = "1"
