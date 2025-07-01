@@ -110,7 +110,7 @@ impl LeveledCompactionController {
 
         // Flush L0 SST is the top priority
         if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
-            println!("flush L0 SST to base level {}", base_level);
+            println!("flush L0 SST to base level {base_level}");
             return Some(LeveledCompactionTask {
                 upper_level: None,
                 upper_level_sst_ids: snapshot.l0_sstables.clone(),
@@ -151,8 +151,7 @@ impl LeveledCompactionController {
             let level = *level;
             let selected_sst = snapshot.levels[level - 1].1.iter().min().copied().unwrap(); // select the oldest sst to compact
             println!(
-                "compaction triggered by priority: {level} out of {:?}, select {selected_sst} for compaction",
-                priorities
+                "compaction triggered by priority: {level} out of {priorities:?}, select {selected_sst} for compaction"
             );
             return Some(LeveledCompactionTask {
                 upper_level: Some(level),

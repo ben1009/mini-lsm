@@ -164,7 +164,7 @@ impl MockStorage {
     pub fn remove(&mut self, files_to_remove: &[usize]) {
         for file_id in files_to_remove {
             let ret = self.file_list.remove(file_id);
-            assert!(ret.is_some(), "failed to remove file {}", file_id);
+            assert!(ret.is_some(), "failed to remove file {file_id}");
         }
     }
 
@@ -338,7 +338,7 @@ fn main() {
                         "Lower L{} {:?} ",
                         task.lower_level, task.lower_level_sst_ids
                     );
-                    println!("-> {:?}", sst_ids);
+                    println!("-> {sst_ids:?}");
                     max_space = max_space.max(storage.file_list.len());
                     let (snapshot, del) =
                         controller.apply_compaction_result(&storage.snapshot, &task, &sst_ids);
@@ -437,9 +437,9 @@ fn main() {
                             storage.file_list.insert(new_sst_id, *file);
                             storage.total_writes += 1;
                         }
-                        print!("L{} {:?} ", tier_id, files);
+                        print!("L{tier_id} {files:?} ");
                     }
-                    println!("-> {:?}", sst_ids);
+                    println!("-> {sst_ids:?}");
                     max_space = max_space.max(storage.file_list.len());
                     let (snapshot, del) =
                         controller.apply_compaction_result(&storage.snapshot, &task, &sst_ids);

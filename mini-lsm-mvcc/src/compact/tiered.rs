@@ -62,8 +62,7 @@ impl TieredCompactionController {
             (size as f64) / (snapshot.levels.last().unwrap().1.len() as f64) * 100.0;
         if space_amp_ratio >= self.options.max_size_amplification_percent as f64 {
             println!(
-                "compaction triggered by space amplification ratio: {}",
-                space_amp_ratio
+                "compaction triggered by space amplification ratio: {space_amp_ratio}"
             );
             return Some(TieredCompactionTask {
                 tiers: snapshot.levels.clone(),

@@ -122,8 +122,7 @@ impl Transaction {
             let guard = guard.lock();
             let (write_set, read_set) = &*guard;
             println!(
-                "commit txn: write_set: {:?}, read_set: {:?}",
-                write_set, read_set
+                "commit txn: write_set: {write_set:?}, read_set: {read_set:?}"
             );
             if !write_set.is_empty() {
                 let committed_txns = self.inner.mvcc().committed_txns.lock();

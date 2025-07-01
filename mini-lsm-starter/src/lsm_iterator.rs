@@ -51,7 +51,7 @@ impl LsmIterator {
     }
 
     fn check_bound(&self) -> bool {
-        let ret = match self.upper.as_ref() {
+        match self.upper.as_ref() {
             Bound::Unbounded => true,
             Bound::Included(key) => {
                 self.inner.is_valid() && self.inner.key().into_inner() <= key.as_slice()
@@ -59,9 +59,7 @@ impl LsmIterator {
             Bound::Excluded(key) => {
                 self.inner.is_valid() && self.inner.key().into_inner() < key.as_slice()
             }
-        };
-
-        ret
+        }
     }
 }
 
