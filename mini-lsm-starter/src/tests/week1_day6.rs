@@ -147,7 +147,7 @@ fn test_task3_sst_filter() {
             sync(&storage);
         }
         storage
-            .put(format!("{:05}", i).as_bytes(), b"2333333")
+            .put(format!("{i:05}").as_bytes(), b"2333333")
             .unwrap();
     }
 

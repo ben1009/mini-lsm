@@ -400,12 +400,12 @@ impl LsmStorageInner {
                     table_id,
                     Some(block_cache.clone()),
                     FileObject::open(&Self::path_of_sst_static(path, table_id))
-                        .with_context(|| format!("failed to open SST: {}", table_id))?,
+                        .with_context(|| format!("failed to open SST: {table_id}"))?,
                 )?;
                 state.sstables.insert(table_id, Arc::new(sst));
                 sst_cnt += 1;
             }
-            println!("{} SSTs opened", sst_cnt);
+            println!("{sst_cnt} SSTs opened");
 
             next_sst_id += 1;
 
@@ -434,7 +434,7 @@ impl LsmStorageInner {
                         wal_cnt += 1;
                     }
                 }
-                println!("{} WALs recovered", wal_cnt);
+                println!("{wal_cnt} WALs recovered");
                 state.memtable = Arc::new(MemTable::create_with_wal(
                     next_sst_id,
                     Self::path_of_wal_static(path, next_sst_id),
@@ -607,7 +607,7 @@ impl LsmStorageInner {
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
-        path.as_ref().join(format!("{:05}.sst", id))
+        path.as_ref().join(format!("{id:05}.sst"))
     }
 
     pub(crate) fn path_of_sst(&self, id: usize) -> PathBuf {
@@ -615,7 +615,7 @@ impl LsmStorageInner {
     }
 
     pub(crate) fn path_of_wal_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
-        path.as_ref().join(format!("{:05}.wal", id))
+        path.as_ref().join(format!("{id:05}.wal"))
     }
 
     pub(crate) fn path_of_wal(&self, id: usize) -> PathBuf {

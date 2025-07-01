@@ -410,7 +410,7 @@ impl LsmStorageInner {
                 state.sstables.insert(table_id, Arc::new(sst));
                 sst_cnt += 1;
             }
-            println!("{} SSTs opened", sst_cnt);
+            println!("{sst_cnt} SSTs opened");
 
             next_sst_id += 1;
 
@@ -446,7 +446,7 @@ impl LsmStorageInner {
                         wal_cnt += 1;
                     }
                 }
-                println!("{} WALs recovered", wal_cnt);
+                println!("{wal_cnt} WALs recovered");
                 state.memtable = Arc::new(MemTable::create_with_wal(
                     next_sst_id,
                     Self::path_of_wal_static(path, next_sst_id),
@@ -663,7 +663,7 @@ impl LsmStorageInner {
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
-        path.as_ref().join(format!("{:05}.sst", id))
+        path.as_ref().join(format!("{id:05}.sst"))
     }
 
     pub(crate) fn path_of_sst(&self, id: usize) -> PathBuf {
@@ -671,7 +671,7 @@ impl LsmStorageInner {
     }
 
     pub(crate) fn path_of_wal_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
-        path.as_ref().join(format!("{:05}.wal", id))
+        path.as_ref().join(format!("{id:05}.wal"))
     }
 
     pub(crate) fn path_of_wal(&self, id: usize) -> PathBuf {
@@ -784,11 +784,7 @@ impl LsmStorageInner {
     }
 
     /// Create an iterator over a range of keys.
-    pub fn scan<'a>(
-        self: &'a Arc<Self>,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<TxnIterator> {
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
         txn.scan(lower, upper)
     }

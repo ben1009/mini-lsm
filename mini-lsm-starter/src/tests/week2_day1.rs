@@ -143,7 +143,7 @@ fn generate_concat_sst(
 ) -> SsTable {
     let mut builder = SsTableBuilder::new(128);
     for idx in start_key..end_key {
-        let key = format!("{:05}", idx);
+        let key = format!("{idx:05}");
         builder.add(
             KeySlice::for_testing_from_slice_no_ts(key.as_bytes()),
             b"test",
@@ -168,7 +168,7 @@ fn test_task2_concat_iterator() {
     for key in 0..120 {
         let iter = SstConcatIterator::create_and_seek_to_key(
             sstables.clone(),
-            KeySlice::for_testing_from_slice_no_ts(format!("{:05}", key).as_bytes()),
+            KeySlice::for_testing_from_slice_no_ts(format!("{key:05}").as_bytes()),
         )
         .unwrap();
         if key < 10 {
@@ -180,7 +180,7 @@ fn test_task2_concat_iterator() {
             assert!(iter.is_valid());
             assert_eq!(
                 iter.key().for_testing_key_ref(),
-                format!("{:05}", key).as_bytes()
+                format!("{key:05}").as_bytes()
             );
         }
     }

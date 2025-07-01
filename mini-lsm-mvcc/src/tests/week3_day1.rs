@@ -42,7 +42,7 @@ fn generate_test_data() -> Vec<((Bytes, u64), Bytes)> {
         .map(|id| {
             (
                 (Bytes::from(format!("key{:05}", id / 5)), 5 - (id % 5)),
-                Bytes::from(format!("value{:05}", id)),
+                Bytes::from(format!("value{id:05}")),
             )
         })
         .collect()

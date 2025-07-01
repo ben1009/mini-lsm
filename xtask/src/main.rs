@@ -155,12 +155,12 @@ fn copy_test_case(test: CopyTestAction) -> Result<()> {
         std::fs::create_dir(target_dir)?;
     }
     let test_filename = format!("week{}_day{}.rs", test.week, test.day);
-    let src = format!("{}/{}", src_dir, test_filename);
-    let target = format!("{}/{}", target_dir, test_filename);
+    let src = format!("{src_dir}/{test_filename}");
+    let target = format!("{target_dir}/{test_filename}");
     cmd!("cp", src, target).run()?;
     let test_filename = "harness.rs";
-    let src = format!("{}/{}", src_dir, test_filename);
-    let target = format!("{}/{}", target_dir, test_filename);
+    let src = format!("{src_dir}/{test_filename}");
+    let target = format!("{target_dir}/{test_filename}");
     cmd!("cp", src, target).run()?;
     let mut test_file = Vec::new();
     for file in Path::new(&target_dir).read_dir()? {
@@ -182,9 +182,9 @@ fn copy_test_case(test: CopyTestAction) -> Result<()> {
     )?;
     writeln!(tests_mod)?;
     for tf in test_file {
-        writeln!(tests_mod, "mod {};", tf)?;
+        writeln!(tests_mod, "mod {tf};")?;
     }
-    println!("{}", tests_mod);
+    println!("{tests_mod}");
     std::fs::write("mini-lsm-starter/src/tests.rs", tests_mod)?;
     Ok(())
 }

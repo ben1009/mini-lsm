@@ -327,7 +327,7 @@ impl LsmStorageInner {
             l1_sstables: l1_sstables.clone(),
         };
 
-        println!("force full compaction: {:?}", compaction_task);
+        println!("force full compaction: {compaction_task:?}");
 
         let sstables = self.compact(&compaction_task)?;
         let mut ids = Vec::with_capacity(sstables.len());
@@ -365,7 +365,7 @@ impl LsmStorageInner {
             std::fs::remove_file(self.path_of_sst(*sst))?;
         }
 
-        println!("force full compaction done, new SSTs: {:?}", ids);
+        println!("force full compaction done, new SSTs: {ids:?}");
 
         Ok(())
     }
@@ -382,7 +382,7 @@ impl LsmStorageInner {
             return Ok(());
         };
         self.dump_structure();
-        println!("running compaction task: {:?}", task);
+        println!("running compaction task: {task:?}");
         let sstables = self.compact(&task)?;
         let output = sstables.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
         let ssts_to_remove = {
@@ -401,7 +401,7 @@ impl LsmStorageInner {
             let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
             for file_to_remove in &files_to_remove {
                 let result = snapshot.sstables.remove(file_to_remove);
-                assert!(result.is_some(), "cannot remove {}.sst", file_to_remove);
+                assert!(result.is_some(), "cannot remove {file_to_remove}.sst");
                 ssts_to_remove.push(result.unwrap());
             }
             let mut state = self.state.write();
@@ -440,7 +440,7 @@ impl LsmStorageInner {
                 loop {
                     crossbeam_channel::select! {
                         recv(ticker) -> _ => if let Err(e) = this.trigger_compaction() {
-                            eprintln!("compaction failed: {}", e);
+                            eprintln!("compaction failed: {e}");
                         },
                         recv(rx) -> _ => return
                     }
@@ -473,7 +473,7 @@ impl LsmStorageInner {
             loop {
                 crossbeam_channel::select! {
                     recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
-                        eprintln!("flush failed: {}", e);
+                        eprintln!("flush failed: {e}");
                     },
                     recv(rx) -> _ => return
                 }

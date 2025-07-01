@@ -30,9 +30,7 @@ fn test_task3_compaction_integration() {
     let storage = MiniLsm::open(&dir, options.clone()).unwrap();
     let _txn = storage.new_txn().unwrap();
     for i in 0..=20000 {
-        storage
-            .put(b"0", format!("{:02000}", i).as_bytes())
-            .unwrap();
+        storage.put(b"0", format!("{i:02000}").as_bytes()).unwrap();
     }
     std::thread::sleep(Duration::from_secs(1)); // wait until all memtables flush
     while {
@@ -50,9 +48,7 @@ fn test_task3_compaction_integration() {
     // same key in the same SST
     assert_eq!(storage.inner.state.read().levels[0].1.len(), 1);
     for i in 0..=100 {
-        storage
-            .put(b"1", format!("{:02000}", i).as_bytes())
-            .unwrap();
+        storage.put(b"1", format!("{i:02000}").as_bytes()).unwrap();
     }
     storage
         .inner

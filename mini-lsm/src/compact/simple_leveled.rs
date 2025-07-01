@@ -83,8 +83,7 @@ impl SimpleLeveledCompactionController {
             let size_ratio = level_sizes[lower_level] as f64 / level_sizes[i] as f64;
             if size_ratio < self.options.size_ratio_percent as f64 / 100.0 {
                 println!(
-                    "compaction triggered at level {} and {} with size ratio {}",
-                    i, lower_level, size_ratio
+                    "compaction triggered at level {i} and {lower_level} with size ratio {size_ratio}"
                 );
                 return Some(SimpleLeveledCompactionTask {
                     upper_level: Some(i),
