@@ -135,8 +135,8 @@ impl ValuePointer {
 │                                                                     │
 │  Header Format:                                                     │
 │  ┌─────────────┬───────────────┬─────────────┬──────────────┐      │
-│  │ crc32       │ key_length    │ value_length│ meta_flags   │      │
-│  │ (4 bytes)   │ (2 bytes)     │ (4 bytes)   │ (6 bytes)    │      │
+│  │ crc32       │ key_length    │ value_length│ flags        │ padding  │      │
+│  │ (4 bytes)   │ (2 bytes)     │ (4 bytes)   │ (2 bytes)    │ (4 bytes)│      │
 │  └─────────────┴───────────────┴─────────────┴──────────────┘      │
 │                                                                     │
 │  Trailer: CRC32 checksum of the entire entry (for validation)       │
@@ -153,18 +153,20 @@ const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
 /// Value log file header (first 16 bytes of each vLog file)
 #[derive(Clone, Debug)]
 pub struct VlogFileHeader {
-    pub magic: u32,
-    pub version: u16,
-    pub reserved: u10,
+    pub magic: u32,           // 4 bytes
+    pub version: u16,         // 2 bytes
+    pub reserved: [u8; 10],   // 10 bytes padding to align to 16 bytes total
 }
 
 /// Entry header (precedes each key-value pair)
-#[repr(C, packed)]
+/// Total size: 16 bytes for 8-byte alignment
+#[repr(C)]
 pub struct VlogEntryHeader {
-    pub crc32: u32,           // CRC32 of key + value
-    pub key_len: u16,         // Key length (max 64KB)
-    pub value_len: u32,       // Value length (max 4GB)
-    pub flags: u16,           // Flags (tombstone, etc.)
+    pub crc32: u32,           // CRC32 of key + value (4 bytes)
+    pub key_len: u16,         // Key length (max 64KB) (2 bytes)
+    pub value_len: u32,       // Value length (max 4GB) (4 bytes)
+    pub flags: u16,           // Flags (tombstone, etc.) (2 bytes)
+    pub _padding: [u8; 4],    // Padding to 16 bytes for alignment
 }
 
 const HEADER_SIZE: usize = std::mem::size_of::<VlogEntryHeader>();
@@ -208,8 +210,8 @@ pub struct ValueSeparationOptions {
 impl Default for ValueSeparationOptions {
     fn default() -> Self {
         Self {
-            enabled: true,
-            min_value_size: 1024,        // 1KB threshold
+            enabled: false,               // Disabled by default for backward compatibility
+            min_value_size: 1024,         // 1KB threshold
             max_vlog_file_size: 64 << 20, // 64MB per vLog file
             gc_threshold_ratio: 0.5,      // GC when 50% stale
             max_open_vlog_files: 64,
@@ -238,6 +240,11 @@ pub struct SsTableBuilder {
 }
 
 impl SsTableBuilder {
+    /// Tracks which vLog files are referenced by the SST being built.
+    /// Populated during add() when values are separated to vLog.
+    /// This is used to register the SST -> vLog mapping when the SST is finalized.
+    referenced_vlogs: HashSet<u32>,
+
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
@@ -249,6 +256,8 @@ impl SsTableBuilder {
         let value_to_store = if self.should_separate_value(value) {
             let vptr = self.write_to_vlog(key, value);
             // Store the encoded pointer instead of the value
+            // Clear buffer first to avoid accumulating encoded pointers
+            self.vlog_buffer.clear();
             vptr.encode(&mut self.vlog_buffer);
             &self.vlog_buffer[..ValuePointer::encoded_size()]
         } else {
@@ -296,6 +305,8 @@ pub struct ValueLog {
     
     /// Tracks which SSTs reference which vLog entries
     /// Used for garbage collection
+    /// Populated during SST build: when an SST is finalized, the vLog file IDs
+    /// it references are registered via register_sst_references()
     sst_to_vlogs: RwLock<HashMap<usize, HashSet<u32>>>,
 }
 
@@ -311,6 +322,35 @@ impl ValueLog {
         }
         
         writer.append(key, value)
+    }
+
+    /// Register SST -> vLog references when an SST is finalized.
+    /// This populates the sst_to_vlogs mapping for GC tracking.
+    pub fn register_sst_references(&self, sst_id: usize, vlog_ids: HashSet<u32>) {
+        let mut mapping = self.sst_to_vlogs.write();
+        mapping.insert(sst_id, vlog_ids);
+    }
+
+    /// Get all vLog files referenced by a given SST.
+    pub fn get_sst_references(&self, sst_id: usize) -> Option<HashSet<u32>> {
+        let mapping = self.sst_to_vlogs.read();
+        mapping.get(&sst_id).cloned()
+    }
+
+    /// Get all SSTs that reference a given vLog file.
+    /// Used during GC to find which SSTs need pointer updates.
+    pub fn get_ssts_referencing(&self, vlog_id: u32) -> Vec<usize> {
+        let mapping = self.sst_to_vlogs.read();
+        mapping
+            .iter()
+            .filter_map(|(sst_id, vlogs)| {
+                if vlogs.contains(&vlog_id) {
+                    Some(*sst_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Read a value using a ValuePointer.
@@ -336,10 +376,16 @@ Garbage collection is triggered during compaction when the ratio of stale data e
 /// Garbage collector for reclaiming space in value logs.
 pub struct GarbageCollector {
     vlog: Arc<ValueLog>,
+    lsm: Arc<MiniLsm>,  // Reference to LSM tree for liveness checks
     threshold: f64,
 }
 
 impl GarbageCollector {
+    /// Create a new garbage collector.
+    pub fn new(vlog: Arc<ValueLog>, lsm: Arc<MiniLsm>, threshold: f64) -> Self {
+        Self { vlog, lsm, threshold }
+    }
+
     /// Analyze a vLog file and determine which entries are still live.
     /// Returns the ratio of live data.
     pub fn analyze_file(&self, file_id: u32) -> Result<GcAnalysis> {
@@ -369,11 +415,10 @@ impl GarbageCollector {
     }
 
     /// Rewrite live entries to a new vLog file and update pointers in SSTs.
+    /// Note: This function assumes the caller has already checked that
+    /// analysis.live_ratio < threshold. The threshold check is done once
+    /// in the caller (post_compaction_gc) to avoid inconsistency.
     pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<()> {
-        if analysis.live_ratio > self.threshold {
-            return Ok(()); // No need to compact
-        }
-
         // Create new vLog file with live entries
         let new_file_id = self.vlog.next_file_id();
         let mut writer = ValueLogWriter::create(self.vlog.path_of_file(new_file_id))?;
@@ -381,20 +426,52 @@ impl GarbageCollector {
         // Map: old_ptr -> new_ptr
         let mut pointer_map: HashMap<ValuePointer, ValuePointer> = HashMap::new();
 
-        for old_ptr in &analysis.live_entries {
-            let value = self.vlog.read(old_ptr)?;
-            let new_ptr = writer.append_raw(&value)?;
-            pointer_map.insert(*old_ptr, new_ptr);
+        // Rewrite live entries preserving both key and value
+        for entry in &analysis.live_entries {
+            // Must include the key for future GC liveness checks
+            let new_ptr = writer.append(&entry.key, &entry.value)?;
+            pointer_map.insert(entry.ptr, new_ptr);
         }
 
         writer.close()?;
 
         // Update SSTs that reference this vLog file
+        // This rewrites affected SSTs to update value pointers, which adds
+        // write amplification. The GC threshold should account for this cost.
         self.update_sst_pointers(analysis.file_id, &pointer_map)?;
 
         // Remove old vLog file
         self.vlog.remove_file(analysis.file_id)?;
 
+        Ok(())
+    }
+
+    /// Update value pointers in SSTs that reference the old vLog file.
+    /// This is expensive as it requires rewriting SSTs, but is necessary
+    /// because SSTs are immutable. The strategy:
+    /// 1. Find all SSTs referencing the old vLog file (using sst_to_vlogs)
+    /// 2. For each SST, read entries and rewrite with updated pointers
+    /// 3. Atomically replace old SSTs with new ones
+    /// 4. Update manifest to reflect new SST IDs
+    /// 
+    /// Performance note: To minimize write amplification, we batch SST updates
+    /// and only trigger this when the space savings justify the rewrite cost.
+    fn update_sst_pointers(
+        &self,
+        old_file_id: u32,
+        pointer_map: &HashMap<ValuePointer, ValuePointer>,
+    ) -> Result<()> {
+        // Get all SSTs referencing this vLog file
+        let affected_ssts = self.vlog.get_ssts_referencing(old_file_id);
+        
+        for sst_id in affected_ssts {
+            // Rewrite SST with updated pointers
+            let new_sst_id = self.rewrite_sst_with_new_pointers(sst_id, pointer_map)?;
+            
+            // Update manifest atomically
+            self.vlog.update_sst_reference(sst_id, new_sst_id, old_file_id)?;
+        }
+        
         Ok(())
     }
 
@@ -486,7 +563,8 @@ impl CompactionController {
 1. **Modified SSTableBuilder**
    - Add `ValueLogBuilder` integration
    - Threshold-based value separation
-   - Track which vLog files are referenced
+   - Track which vLog files are referenced via `referenced_vlogs: HashSet<u32>`
+   - Register SST -> vLog mapping via `register_sst_references()` when SST is finalized
 
 2. **Modified SsTable and SsTableIterator**
    - Detect and decode `ValuePointer` values
