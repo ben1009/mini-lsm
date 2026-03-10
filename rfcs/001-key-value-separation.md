@@ -133,11 +133,11 @@ impl ValuePointer {
 │  │ (16 bytes)│ (var)   │ (var)     │ (4 bytes) │ (0-7 bytes)│       │
 │  └───────────┴─────────┴───────────┴───────────┴───────────┘       │
 │                                                                     │
-│  Header Format:                                                     │
-│  ┌─────────────┬───────────────┬─────────────┬──────────────┐      │
-│  │ crc32       │ key_length    │ value_length│ flags        │ padding  │      │
-│  │ (4 bytes)   │ (2 bytes)     │ (4 bytes)   │ (2 bytes)    │ (4 bytes)│      │
-│  └─────────────┴───────────────┴─────────────┴──────────────┘      │
+│  Header Format (16 bytes total):                                    │
+│  ┌─────────────┬───────────────┬─────────────┬─────────────┬──────────┐
+│  │ crc32       │ key_length    │ value_length│ flags       │ padding  │
+│  │ (4 bytes)   │ (2 bytes)     │ (4 bytes)   │ (2 bytes)   │ (4 bytes)│
+│  └─────────────┴───────────────┴─────────────┴─────────────┴──────────┘
 │                                                                     │
 │  Trailer: CRC32 checksum of the entire entry (for validation)       │
 │                                                                     │
@@ -516,7 +516,7 @@ impl CompactionController {
         }
 
         // Run GC analysis on affected files
-        let gc = GarbageCollector::new(vlog.clone());
+        let gc = GarbageCollector::new(vlog.clone(), self.lsm.clone(), vlog.options().gc_threshold_ratio);
         for file_id in affected_vlogs {
             let analysis = gc.analyze_file(file_id)?;
             if analysis.live_ratio < vlog.options().gc_threshold_ratio {
@@ -525,8 +525,11 @@ impl CompactionController {
         }
 
         // Update references for output SSTs
+        // Output SSTs register their vLog references during SST construction
+        // The SST builder calls register_sst_references() when finalizing each SST
         for sst_id in output_ssts {
-            vlog.update_sst_references(*sst_id)?;
+            // SSTs created during compaction will register themselves
+            // via their builder's referenced_vlogs set
         }
 
         Ok(())
@@ -686,7 +689,7 @@ fn test_key_value_separation_workflow() {
     let dir = tempfile::tempdir().unwrap();
     let options = LsmStorageOptions {
         value_separation: ValueSeparationOptions {
-            enabled: true,
+            enabled: true,                // Enable for this test
             min_value_size: 100,
             ..Default::default()
         },
