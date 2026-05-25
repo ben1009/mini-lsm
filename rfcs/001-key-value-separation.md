@@ -277,6 +277,12 @@ impl ValueLogBuilder {
 
         debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
 
+        assert!(
+            padded <= u32::MAX as usize,
+            "vLog entry size {} exceeds u32 capacity — increase max_value_size or reduce key/value size",
+            padded
+        );
+
         ValuePointer {
             file_id: self.file_id,
             offset,
@@ -507,6 +513,13 @@ impl ValueLog {
     /// Delegates to ValueLogWriter::append which applies the same 8-byte
     /// alignment padding as ValueLogBuilder::add.
     pub fn write(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+        // VlogEntryHeader.key_len is u16 — reject keys that would overflow.
+        anyhow::ensure!(
+            key.len() <= u16::MAX as usize,
+            "key length {} exceeds vLog header u16 capacity",
+            key.len()
+        );
+
         let mut writer = self.active_writer.lock();
 
         // Rotate to new file if current is full
@@ -729,20 +742,19 @@ impl GarbageCollector {
     /// Analyze a vLog file and determine which entries are still live.
     /// Returns the ratio of stale (dead) data.
     ///
-    /// Performance note: This performs an LSM `get()` for every entry in the vLog file.
-    /// For large vLog files this can be expensive. Consider scheduling GC during
-    /// low-traffic periods or processing files incrementally.
+    /// Uses a header-only iterator that reads only the header + key (skipping
+    /// the value payload) to avoid unnecessary I/O for large dead values.
+    /// The value is only read during compact_file for entries confirmed live.
     pub fn analyze_file(&self, file_id: u32) -> Result<GcAnalysis> {
         let reader = self.vlog.get_reader(file_id)?;
         let mut live_entries = Vec::new();
         let mut dead_bytes = 0;
         let mut live_bytes = 0;
 
-        for entry in reader.iter() {
-            let entry_size = entry.size;
-            if self.is_entry_live(&entry)? {
-                // Store only key + pointer, not the (potentially large) value.
-                live_entries.push(LiveEntryRef { ptr: entry.ptr, key: entry.key });
+        for meta in reader.iter_headers() {
+            let entry_size = meta.size;
+            if self.check_liveness(&meta.key, &meta.ptr)? {
+                live_entries.push(LiveEntryRef { ptr: meta.ptr, key: meta.key });
                 live_bytes += entry_size;
             } else {
                 dead_bytes += entry_size;
@@ -825,10 +837,16 @@ impl GarbageCollector {
     /// Uses KvKind (authoritative SST block metadata) to classify the current
     /// value, avoiding ambiguous payload-based pointer detection.
     fn is_entry_live(&self, entry: &VlogEntry) -> Result<bool> {
-        match self.lsm.get_with_kind(&entry.key)? {
+        self.check_liveness(&entry.key, &entry.ptr)
+    }
+
+    /// Liveness check using only key + pointer (no value needed).
+    /// Used by analyze_file's header-only iterator to avoid reading values.
+    fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<bool> {
+        match self.lsm.get_with_kind(key)? {
             Some((value, KvKind::ValuePointer)) => {
-                let ptr = ValuePointer::decode(&value)?;
-                Ok(ptr.file_id == entry.ptr.file_id && ptr.offset == entry.ptr.offset)
+                let current_ptr = ValuePointer::decode(&value)?;
+                Ok(current_ptr.file_id == ptr.file_id && current_ptr.offset == ptr.offset)
             }
             _ => Ok(false), // Key deleted, or value is now inline — entry is stale
         }
@@ -862,6 +880,12 @@ Production systems use one of the following approaches to safely reclaim old vLo
 ### 8. Integration with Compaction
 
 ```rust
+pub struct CompactionController {
+    /// Bounded thread pool for background GC work.
+    /// Prevents unbounded thread creation under sustained write load.
+    gc_pool: rayon::ThreadPool,
+}
+
 impl CompactionController {
     /// After compaction, schedule garbage collection for affected vLog files.
     /// GC runs asynchronously on a background thread to avoid blocking the
@@ -882,13 +906,12 @@ impl CompactionController {
             }
         }
 
-        // Schedule GC analysis on a background thread to avoid blocking compaction.
-        // The GC thread scans affected vLog files and rewrites live entries;
-        // doing this synchronously would add significant latency to the compaction
-        // pipeline, especially for large vLog files with many LSM lookups.
+        // Schedule GC on a bounded background worker to avoid blocking compaction.
+        // A single GC executor (or small thread pool) prevents unbounded thread
+        // creation under sustained write load where compactions outpace GC scans.
         let vlog = vlog.clone();
         let lsm = lsm.clone();
-        std::thread::spawn(move || {
+        self.gc_pool.spawn(move || {
             let gc = GarbageCollector::new(vlog.clone(), lsm, vlog.options().gc_threshold_ratio);
             for file_id in affected_vlogs {
                 if let Ok(analysis) = gc.analyze_file(file_id) {
