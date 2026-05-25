@@ -93,7 +93,9 @@ pub struct ValuePointer {
     pub file_id: u32,
     /// Offset within the file where the value starts
     pub offset: u64,
-    /// Size of the encoded value entry (for validation)
+    /// Total size of the encoded entry on disk (header + key + value + padding).
+    /// u32 limits individual entries to ~4GB. In practice, max_value_size should
+    /// be set well below this (e.g., 128MB) to keep GC scan times reasonable.
     pub size: u32,
 }
 
@@ -302,17 +304,21 @@ src/
 pub struct ValueSeparationOptions {
     /// Enable key-value separation
     pub enabled: bool,
-    
+
     /// Minimum value size to trigger separation (bytes)
     /// Values smaller than this are stored inline
     pub min_value_size: usize,
-    
+
+    /// Maximum size of a single value (bytes). Must fit in u32 after
+    /// header + key + padding are added. Recommended: 128MB or less.
+    pub max_value_size: usize,
+
     /// Maximum size of a single vLog file
     pub max_vlog_file_size: usize,
-    
+
     /// Ratio of stale data to trigger garbage collection
     pub gc_threshold_ratio: f64,
-    
+
     /// Maximum number of vLog files to keep open
     pub max_open_vlog_files: usize,
 }
@@ -322,6 +328,7 @@ impl Default for ValueSeparationOptions {
         Self {
             enabled: false,               // Disabled by default for backward compatibility
             min_value_size: 1024,         // 1KB threshold
+            max_value_size: 128 << 20,    // 128MB max per value (well under u32 overflow)
             max_vlog_file_size: 64 << 20, // 64MB per vLog file
             gc_threshold_ratio: 0.5,      // GC when 50% stale
             max_open_vlog_files: 64,
@@ -497,14 +504,16 @@ pub struct ValueLog {
 impl ValueLog {
     /// Write a key-value pair to the active vLog file.
     /// Returns a ValuePointer that can be stored in the LSM tree.
+    /// Delegates to ValueLogWriter::append which applies the same 8-byte
+    /// alignment padding as ValueLogBuilder::add.
     pub fn write(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
         let mut writer = self.active_writer.lock();
-        
+
         // Rotate to new file if current is full
         if writer.size() >= self.options.max_vlog_file_size {
             self.rotate_vlog_file(&mut writer)?;
         }
-        
+
         writer.append(key, value)
     }
 
@@ -854,7 +863,9 @@ Production systems use one of the following approaches to safely reclaim old vLo
 
 ```rust
 impl CompactionController {
-    /// After compaction, trigger garbage collection for affected vLog files.
+    /// After compaction, schedule garbage collection for affected vLog files.
+    /// GC runs asynchronously on a background thread to avoid blocking the
+    /// compaction pipeline with vLog scanning and LSM lookups.
     pub fn post_compaction_gc(
         &self,
         input_ssts: &[usize],
@@ -871,21 +882,30 @@ impl CompactionController {
             }
         }
 
-        // Run GC analysis on affected files
-        let gc = GarbageCollector::new(vlog.clone(), lsm.clone(), vlog.options().gc_threshold_ratio);
-        for file_id in affected_vlogs {
-            let analysis = gc.analyze_file(file_id)?;
-            if analysis.stale_ratio >= vlog.options().gc_threshold_ratio {
-                gc.compact_file(&analysis)?;
+        // Schedule GC analysis on a background thread to avoid blocking compaction.
+        // The GC thread scans affected vLog files and rewrites live entries;
+        // doing this synchronously would add significant latency to the compaction
+        // pipeline, especially for large vLog files with many LSM lookups.
+        let vlog = vlog.clone();
+        let lsm = lsm.clone();
+        std::thread::spawn(move || {
+            let gc = GarbageCollector::new(vlog.clone(), lsm, vlog.options().gc_threshold_ratio);
+            for file_id in affected_vlogs {
+                if let Ok(analysis) = gc.analyze_file(file_id) {
+                    if analysis.stale_ratio >= vlog.options().gc_threshold_ratio {
+                        let _ = gc.compact_file(&analysis);
+                    }
+                }
             }
-        }
+        });
 
         // Register vLog references for output SSTs.
-        // In practice, each output SST is built by an SsTableBuilder which already
-        // populates referenced_vlogs. When the SST is finalized, the builder's
-        // referenced_vlogs set is passed to vlog.register_sst_references().
+        // SsTableBuilder is a low-level component without access to ValueLog.
+        // Registration is handled by the storage engine (LsmStorageInner) when
+        // it receives the finalized SST: the builder exposes its referenced_vlogs
+        // set via a getter, and the engine calls vlog.register_sst_references().
         for sst_id in output_ssts {
-            // SST builders register references automatically during finalization.
+            // Engine registers: builder.get_referenced_vlogs() → vlog.register_sst_references(sst_id, vlogs)
         }
 
         // Clean up vLog references for input SSTs that are being replaced.
