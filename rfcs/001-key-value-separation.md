@@ -97,17 +97,33 @@ pub struct ValuePointer {
     pub size: u32,
 }
 
+/// Magic tag byte that prefixes every encoded `ValuePointer`.
+///
+/// Without an explicit tag, any 16-byte inline value (UUID, hash, small blob,
+/// etc.) would be indistinguishable from an encoded pointer. The tag makes the
+/// encoding self-describing so `try_decode` can safely classify a value during
+/// compaction or GC analysis. `0xFF` is chosen because it is an extremely
+/// uncommon prefix for legitimate user payloads; a stronger guarantee can be
+/// obtained by also tracking the type via a per-entry meta flag in the SST
+/// (see `KvKind` in section 5).
+const VALUE_POINTER_TAG: u8 = 0xFF;
+
 impl ValuePointer {
-    /// Encode to bytes for storage in LSM tree
+    /// Encode to bytes for storage in LSM tree.
+    ///
+    /// Layout (17 bytes): `[tag:1][file_id:4][offset:8][size:4]`
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.put_u8(VALUE_POINTER_TAG);
         buf.put_u32(self.file_id);
         buf.put_u64(self.offset);
         buf.put_u32(self.size);
     }
 
-    /// Decode from bytes. Panics if the buffer is shorter than 16 bytes.
+    /// Decode from bytes. Panics if the buffer is malformed.
     pub fn decode(mut buf: &[u8]) -> Self {
         assert!(buf.len() >= Self::encoded_size(), "ValuePointer buffer too short");
+        let tag = buf.get_u8();
+        assert_eq!(tag, VALUE_POINTER_TAG, "ValuePointer tag mismatch");
         Self {
             file_id: buf.get_u32(),
             offset: buf.get_u64(),
@@ -115,20 +131,20 @@ impl ValuePointer {
         }
     }
 
-    /// Try to decode from bytes. Returns None if the buffer is too short.
-    /// 
-    /// Note: In production, a type tag or prefix byte should be used to
-    /// unambiguously distinguish ValuePointer from inline 16-byte values.
+    /// Try to decode from bytes. Returns `None` if the buffer is too short or
+    /// does not start with the `VALUE_POINTER_TAG` byte. This makes the
+    /// classification of "inline value" vs. "value pointer" unambiguous, so an
+    /// inline 16-byte UUID can never be mistaken for a pointer.
     pub fn try_decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::encoded_size() {
+        if buf.len() < Self::encoded_size() || buf[0] != VALUE_POINTER_TAG {
             return None;
         }
         Some(Self::decode(buf))
     }
 
-    /// Total encoded size: 16 bytes
+    /// Total encoded size: 17 bytes (1-byte tag + 4 + 8 + 4)
     pub const fn encoded_size() -> usize {
-        4 + 8 + 4 // 16 bytes
+        1 + 4 + 8 + 4 // 17 bytes
     }
 }
 ```
@@ -146,14 +162,18 @@ impl ValuePointer {
 │  └───────────┴─────────┴───────────┴───────────┘                   │
 │                                                                     │
 │  Header Format (16 bytes total):                                    │
-│  ┌─────────────┬───────────────┬─────────────┬─────────────┬──────────┐
-│  │ crc32       │ key_length    │ value_length│ flags       │ padding  │
-│  │ (4 bytes)   │ (2 bytes)     │ (4 bytes)   │ (2 bytes)   │ (4 bytes)│
-│  └─────────────┴───────────────┴─────────────┴─────────────┴──────────┘
+│  ┌─────────────┬─────────────┬─────────────┬───────────────┬──────────┐
+│  │ crc32       │ value_length│ key_length  │ flags         │ padding  │
+│  │ (4 bytes)   │ (4 bytes)   │ (2 bytes)   │ (2 bytes)     │ (4 bytes)│
+│  └─────────────┴─────────────┴─────────────┴───────────────┴──────────┘
 │                                                                     │
-│  CRC32: Covers key + value payload for integrity validation         │
+│  CRC32: Covers (header_without_crc) + key + value to detect         │
+│         corruption of length fields as well as the payload          │
 │                                                                     │
-│  Alignment: Entries are 8-byte aligned for efficient disk access    │
+│  Alignment: Each entry (header + key + value) is padded to an       │
+│             8-byte boundary on disk; the trailing pad bytes are     │
+│             included in the entry's `size` so readers can skip      │
+│             cleanly to the next entry.                              │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -170,18 +190,22 @@ pub struct VlogFileHeader {
     pub reserved: [u8; 10],   // 10 bytes padding to align to 16 bytes total
 }
 
-/// Entry header (precedes each key-value pair)
-/// Total size: 16 bytes for 8-byte alignment
+/// Entry header (precedes each key-value pair).
+///
+/// Field order is chosen so that all u32 fields come before u16 fields, which
+/// keeps the C struct layout naturally 4-byte-aligned with no implicit padding
+/// between the declared fields. The trailing `_padding` brings the total to a
+/// flat 16 bytes and preserves the file's 8-byte alignment guarantee.
 #[repr(C)]
 pub struct VlogEntryHeader {
-    pub crc32: u32,           // CRC32 of key + value (4 bytes)
-    pub key_len: u16,         // Key length (max 64KB). Large keys must be stored inline. (2 bytes)
+    pub crc32: u32,           // CRC32 of the rest of the header + key + value (4 bytes)
     pub value_len: u32,       // Value length (max 4GB) (4 bytes)
+    pub key_len: u16,         // Key length (max 64KB). Large keys must be stored inline. (2 bytes)
     pub flags: u16,           // Flags (tombstone, etc.) (2 bytes)
-    pub _padding: [u8; 4],    // Padding to 16 bytes for alignment
+    pub _padding: [u8; 4],    // Reserved / padding to a 16-byte total
 }
 
-const HEADER_SIZE: usize = std::mem::size_of::<VlogEntryHeader>();
+const HEADER_SIZE: usize = std::mem::size_of::<VlogEntryHeader>(); // 16
 const ALIGNMENT: usize = 8;
 ```
 
@@ -197,14 +221,26 @@ pub struct ValueLogBuilder {
 }
 
 impl ValueLogBuilder {
-    /// Add a key-value pair to the vLog. Returns a ValuePointer.
+    /// Add a key-value pair to the vLog. Returns a `ValuePointer`.
+    ///
+    /// The on-disk footprint of an entry is `header + key + value`, padded up
+    /// to the next `ALIGNMENT` (8-byte) boundary. The pad bytes are written to
+    /// disk *and* counted in `ValuePointer::size`, so a reader can validate
+    /// the entry and advance to the next one without re-reading the header.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> ValuePointer {
         let offset = self.writer.offset();
-        self.writer.append(key, value);
+        let payload = HEADER_SIZE + key.len() + value.len();
+        let padded = (payload + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+        let pad = padded - payload;
+
+        self.writer.append_with_pad(key, value, pad);
+
+        debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
+
         ValuePointer {
             file_id: self.file_id,
             offset,
-            size: (key.len() + value.len() + HEADER_SIZE) as u32,
+            size: padded as u32,
         }
     }
 }
@@ -433,12 +469,46 @@ impl ValueLog {
         Ok(())
     }
 
-    /// Schedule a vLog file for deletion once all readers are quiesced.
-    /// In production, this uses watermark-based epoch reclamation or reference counting.
+    /// Mark a vLog file as obsolete and queue it for deletion. The file is
+    /// **not** unlinked here — that would race with active snapshots,
+    /// iterators, and any in-flight reads through stale pointers in older
+    /// SSTs. Instead the file is parked on a pending-deletion queue and a
+    /// background task reclaims it once it is safe.
+    ///
+    /// Safety condition (any one is sufficient):
+    /// - the file's reader/iterator refcount has dropped to zero, **and**
+    /// - the MVCC watermark has advanced past the timestamp at which the file
+    ///   was retired (so no snapshot can still hold a pointer into it), **and**
+    /// - all SSTs that referenced this `file_id` have been compacted away
+    ///   (so no `get()` can produce a stale pointer to it).
+    ///
+    /// `obsolete_at_ts` is the engine's current commit timestamp / epoch at
+    /// the moment GC retired the file, used by the watermark check.
     pub fn schedule_deletion(&self, file_id: u32) -> Result<()> {
-        // TODO: integrate with snapshot watermark / epoch-based reclamation
-        // For now, defer to a background cleanup task that checks active snapshots.
-        self.remove_file(file_id)
+        let obsolete_at_ts = self.lsm_clock.now();
+        self.pending_deletions
+            .lock()
+            .push(PendingDeletion { file_id, obsolete_at_ts });
+        Ok(())
+    }
+
+    /// Background reclamation pass. Walks the pending queue and unlinks any
+    /// file that has cleared all of the deferred-deletion conditions above.
+    /// Run on a timer or at the tail of every successful compaction.
+    pub fn reclaim_pending_deletions(&self, watermark_ts: u64) -> Result<()> {
+        let mut pending = self.pending_deletions.lock();
+        pending.retain(|p| {
+            let safe = p.obsolete_at_ts <= watermark_ts
+                && self.reader_refcount(p.file_id) == 0
+                && self.get_ssts_referencing(p.file_id).is_empty();
+            if safe {
+                let _ = self.remove_file(p.file_id);
+                false // drop from queue
+            } else {
+                true // keep, retry later
+            }
+        });
+        Ok(())
     }
 }
 ```
@@ -519,6 +589,15 @@ impl GarbageCollector {
 
     /// Rewrite live entries to a new vLog file and update the LSM index.
     /// Old SSTs are NOT rewritten; stale pointers are shadowed by new LSM writes.
+    ///
+    /// **Race avoidance**: a user `put`/`delete` can land on a key between
+    /// the `is_entry_live` check and the GC re-insert. To make sure GC never
+    /// shadows fresher user writes, we re-validate the pointer atomically
+    /// (under a per-key guard or via the LSM's MVCC sequence number) right
+    /// before insertion, and only insert when the LSM still observes the
+    /// *exact* old pointer for that key. If the key has been overwritten or
+    /// deleted in the meantime, the new pointer is discarded — the new vLog
+    /// entry is simply unreferenced and will be reclaimed by the next GC pass.
     pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<()> {
         if analysis.stale_ratio < self.threshold {
             return Ok(());
@@ -531,22 +610,31 @@ impl GarbageCollector {
         // Rewrite live entries and update LSM index
         for entry in &analysis.live_entries {
             let new_ptr = writer.append(&entry.key, &entry.value)?;
-            // Re-insert key with new pointer into LSM tree. Old SSTs still contain
-            // stale pointers, but LSM levels above them (memtable, newer SSTs)
-            // shadow those old entries with the updated pointer.
             let mut buf = Vec::with_capacity(ValuePointer::encoded_size());
             new_ptr.encode(&mut buf);
-            self.lsm.put(&entry.key, &buf)?;
+
+            // Atomic rebind: only swap the pointer if the key still resolves
+            // to `entry.ptr`. `compare_and_set` performs the get + put under
+            // the same MVCC sequence so a concurrent user write cannot be
+            // overwritten. Implementations without explicit CAS can serialize
+            // GC writes with the write batch lock and re-check `is_entry_live`
+            // inside the critical section.
+            self.lsm.compare_and_set(
+                &entry.key,
+                /* expected = */ &entry.ptr,
+                /* new      = */ &buf,
+            )?;
         }
 
         writer.close()?;
 
-        // Ensure new vLog entries and LSM writes are durable before removing old file
+        // Ensure new vLog entries and LSM writes are durable before scheduling
+        // the old file for reclamation.
         self.lsm.sync()?;
 
-        // Defer deletion until all active snapshots/iterators referencing the old
-        // file have been released. In a production system, this uses reference
-        // counting or watermark-based epoch reclamation (see Stale Pointer Handling).
+        // Defer deletion until all active snapshots/iterators referencing the
+        // old file have been released. See `ValueLog::schedule_deletion` and
+        // section 7.1 for the watermark/refcount-based reclamation contract.
         self.vlog.schedule_deletion(analysis.file_id)?;
 
         Ok(())
@@ -559,7 +647,7 @@ impl GarbageCollector {
                 if let Some(ptr) = ValuePointer::try_decode(&value) {
                     Ok(ptr.file_id == entry.ptr.file_id && ptr.offset == entry.ptr.offset)
                 } else {
-                    Ok(false) // Value is now inline (or ambiguous 16-byte value)
+                    Ok(false) // Value is now inline (untagged) — not a pointer
                 }
             }
             None => Ok(false), // Key was deleted
@@ -835,17 +923,36 @@ pub struct SsTableFooter {
 
 ### Manifest Changes
 
+Manifest records are extended to carry the SST → vLog reference set so that
+recovery can rebuild `sst_to_vlogs` directly from the manifest log instead of
+re-opening every SST footer. This keeps startup O(manifest size) rather than
+O(total SST count) once vLog adoption grows.
+
 ```rust
 #[derive(Serialize, Deserialize)]
 pub enum ManifestRecord {
-    Flush(usize),
+    /// Flush of a memtable to L0. Carries the vLog files this new SST
+    /// references (empty if the SST has no separated values).
+    Flush(usize, Vec<u32>),
+
     NewMemtable(usize),
-    Compaction(CompactionTask, Vec<usize>),
-    // NEW: Track vLog file lifecycle
+
+    /// Compaction output. For each output SST, record the set of vLog files
+    /// it references so the SST → vLog map is reconstructable from the
+    /// manifest alone.
+    Compaction(CompactionTask, Vec<(usize, Vec<u32>)>),
+
+    /// vLog file lifecycle.
     NewVlogFile(u32),
     DeleteVlogFile(u32),
 }
 ```
+
+Recovery walks the manifest as before; for every `Flush` / `Compaction` record
+it inserts the carried `(sst_id, vlog_ids)` pairs into `sst_to_vlogs`. SSTable
+footers still embed the vLog reference list as a redundant copy, used by
+`fsck`-style consistency checks and by older snapshots whose manifest record
+predates this format.
 
 ## Crash Recovery
 
