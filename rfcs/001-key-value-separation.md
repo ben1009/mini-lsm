@@ -169,7 +169,14 @@ impl ValuePointer {
         if buf.len() < Self::encoded_size() || buf[0] != VALUE_POINTER_TAG {
             return None;
         }
-        Self::decode(buf).ok()
+        // Inline field decoding to avoid redundant length/tag checks
+        // and anyhow error construction in the hot path.
+        let mut b = &buf[1..];
+        Some(Self {
+            file_id: b.get_u32(),
+            offset: b.get_u64(),
+            size: b.get_u32(),
+        })
     }
 
     /// Total encoded size: 17 bytes (1-byte tag + 4 + 8 + 4)
@@ -419,6 +426,15 @@ pub struct PendingDeletion {
     obsolete_at_ts: u64,
 }
 
+/// Bidirectional SST ↔ vLog reference tracking.
+/// Both maps under a single lock to prevent deadlocks.
+pub struct VlogReferences {
+    /// SST ID → set of vLog files it references
+    sst_to_vlogs: HashMap<usize, HashSet<u32>>,
+    /// vLog file ID → set of SSTs referencing it (reverse index)
+    vlog_to_ssts: HashMap<u32, HashSet<usize>>,
+}
+
 /// RAII guard for a cached vLog reader. Automatically decrements the
 /// ValueLog's reader_refcount when dropped, preventing retired vLog files
 /// from being unlinked while an iterator or snapshot still reads them.
@@ -456,14 +472,10 @@ pub struct ValueLog {
     /// Configuration options
     options: ValueSeparationOptions,
 
-    /// Tracks which SSTs reference which vLog entries.
-    /// Populated during SST build: when an SST is finalized, the vLog file IDs
-    /// it references are registered via register_sst_references().
-    sst_to_vlogs: RwLock<HashMap<usize, HashSet<u32>>>,
-
-    /// Reverse index: vLog file ID → set of SSTs referencing it.
-    /// Kept in sync with sst_to_vlogs for O(1) lookups during GC.
-    vlog_to_ssts: RwLock<HashMap<u32, HashSet<usize>>>,
+    /// SST ↔ vLog bidirectional reference tracking.
+    /// Both maps live under a single lock to prevent deadlocks from
+    /// inconsistent acquisition order.
+    vlog_refs: RwLock<VlogReferences>,
 
     /// Monotonic clock / timestamp provider (shared with the LSM engine).
     /// Used by `schedule_deletion` to stamp each retired file with the
@@ -497,40 +509,41 @@ impl ValueLog {
     }
 
     /// Register SST -> vLog references when an SST is finalized.
-    /// Updates both forward (sst_to_vlogs) and reverse (vlog_to_ssts) indexes.
+    /// Updates both forward and reverse indexes atomically under one lock.
     pub fn register_sst_references(&self, sst_id: usize, vlog_ids: HashSet<u32>) {
+        let mut refs = self.vlog_refs.write();
         for vlog_id in &vlog_ids {
-            self.vlog_to_ssts.write().entry(*vlog_id).or_default().insert(sst_id);
+            refs.vlog_to_ssts.entry(*vlog_id).or_default().insert(sst_id);
         }
-        self.sst_to_vlogs.write().insert(sst_id, vlog_ids);
+        refs.sst_to_vlogs.insert(sst_id, vlog_ids);
     }
 
     /// Get all vLog files referenced by a given SST.
     pub fn get_sst_references(&self, sst_id: usize) -> Option<HashSet<u32>> {
-        let mapping = self.sst_to_vlogs.read();
-        mapping.get(&sst_id).cloned()
+        self.vlog_refs.read().sst_to_vlogs.get(&sst_id).cloned()
     }
 
     /// Get all SSTs that reference a given vLog file.
     /// Uses the reverse index for O(1) lookup.
     pub fn get_ssts_referencing(&self, vlog_id: u32) -> Vec<usize> {
-        self.vlog_to_ssts
+        self.vlog_refs
             .read()
+            .vlog_to_ssts
             .get(&vlog_id)
             .map(|ssts| ssts.iter().copied().collect())
             .unwrap_or_default()
     }
 
     /// Remove all vLog references for a deleted SST.
-    /// Updates both forward and reverse indexes.
+    /// Updates both indexes atomically under one lock.
     pub fn unregister_sst_references(&self, sst_id: usize) {
-        if let Some(vlog_ids) = self.sst_to_vlogs.write().remove(&sst_id) {
-            let mut reverse = self.vlog_to_ssts.write();
+        let mut refs = self.vlog_refs.write();
+        if let Some(vlog_ids) = refs.sst_to_vlogs.remove(&sst_id) {
             for vlog_id in vlog_ids {
-                if let Some(ssts) = reverse.get_mut(&vlog_id) {
+                if let Some(ssts) = refs.vlog_to_ssts.get_mut(&vlog_id) {
                     ssts.remove(&sst_id);
                     if ssts.is_empty() {
-                        reverse.remove(&vlog_id);
+                        refs.vlog_to_ssts.remove(&vlog_id);
                     }
                 }
             }
@@ -677,10 +690,17 @@ pub struct VlogEntry {
 }
 
 /// Analysis result for a single vLog file.
+/// Lightweight reference to a live vLog entry — stores only the pointer
+/// and key (not the value) to avoid holding large values in memory during analysis.
+pub struct LiveEntryRef {
+    pub ptr: ValuePointer,
+    pub key: Vec<u8>,
+}
+
 pub struct GcAnalysis {
     pub file_id: u32,
     pub stale_ratio: f64,
-    pub live_entries: Vec<VlogEntry>,
+    pub live_entries: Vec<LiveEntryRef>,
     pub dead_bytes: usize,
 }
 
@@ -710,11 +730,13 @@ impl GarbageCollector {
         let mut live_bytes = 0;
 
         for entry in reader.iter() {
+            let entry_size = entry.size;
             if self.is_entry_live(&entry)? {
-                live_entries.push(entry);
-                live_bytes += entry.size;
+                // Store only key + pointer, not the (potentially large) value.
+                live_entries.push(LiveEntryRef { ptr: entry.ptr, key: entry.key });
+                live_bytes += entry_size;
             } else {
-                dead_bytes += entry.size;
+                dead_bytes += entry_size;
             }
         }
 
@@ -749,9 +771,11 @@ impl GarbageCollector {
         let new_file_id = self.vlog.next_file_id();
         let mut writer = ValueLogWriter::create(self.vlog.path_of_file(new_file_id))?;
 
-        // Rewrite live entries and update LSM index
-        for entry in &analysis.live_entries {
-            let new_ptr = writer.append(&entry.key, &entry.value)?;
+        // Rewrite live entries and update LSM index.
+        // Values are re-read from the vLog (not held in memory from analysis).
+        for entry_ref in &analysis.live_entries {
+            let value = self.vlog.read(&entry_ref.ptr, &entry_ref.key)?;
+            let new_ptr = writer.append(&entry_ref.key, &value)?;
             let mut buf = Vec::with_capacity(ValuePointer::encoded_size());
             new_ptr.encode(&mut buf);
 
@@ -762,11 +786,13 @@ impl GarbageCollector {
             // GC writes with the write batch lock and re-check `is_entry_live`
             // inside the critical section.
             let mut expected_buf = Vec::with_capacity(ValuePointer::encoded_size());
-            entry.ptr.encode(&mut expected_buf);
-            if !self.lsm.compare_and_set(
-                &entry.key,
-                &expected_buf,
-                &buf,
+            entry_ref.ptr.encode(&mut expected_buf);
+            // Kind-aware CAS: ensures we don't overwrite an inline user value
+            // that happens to be byte-identical to the old pointer encoding.
+            if !self.lsm.compare_and_set_with_kind(
+                &entry_ref.key,
+                &expected_buf, KvKind::ValuePointer,
+                &buf, KvKind::ValuePointer,
             )? {
                 continue; // A concurrent user write changed the value — skip this entry
             }
@@ -996,6 +1022,13 @@ impl MiniLsm {
     /// Returns true if the swap succeeded, false if the value changed.
     /// Used by GC to avoid overwriting fresher user writes during re-insertion.
     pub fn compare_and_set(&self, key: &[u8], old: &[u8], new: &[u8]) -> Result<bool>;
+
+    /// Kind-aware CAS: checks both value bytes AND KvKind.
+    /// Prevents GC from overwriting an inline user value that happens to be
+    /// byte-identical to an encoded ValuePointer (17 bytes starting with 0xFF).
+    pub fn compare_and_set_with_kind(
+        &self, key: &[u8], old: &[u8], old_kind: KvKind, new: &[u8], new_kind: KvKind,
+    ) -> Result<bool>;
 }
 ```
 
@@ -1116,10 +1149,10 @@ pub enum ManifestRecord {
 ```
 
 Recovery walks the manifest as before; for every `Flush` / `Compaction` record
-it inserts the carried `(sst_id, vlog_ids)` pairs into `sst_to_vlogs`. SSTable
-footers still embed the vLog reference list as a redundant copy, used by
-`fsck`-style consistency checks and by older snapshots whose manifest record
-predates this format.
+it calls `register_sst_references(sst_id, vlog_ids)` to populate **both**
+`sst_to_vlogs` and `vlog_to_ssts` indexes. SSTable footers still embed the
+vLog reference list as a redundant copy, used by `fsck`-style consistency
+checks and by older snapshots whose manifest record predates this format.
 
 ## Crash Recovery
 
