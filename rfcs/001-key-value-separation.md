@@ -461,6 +461,10 @@ pub struct ValueLog {
     /// it references are registered via register_sst_references().
     sst_to_vlogs: RwLock<HashMap<usize, HashSet<u32>>>,
 
+    /// Reverse index: vLog file ID → set of SSTs referencing it.
+    /// Kept in sync with sst_to_vlogs for O(1) lookups during GC.
+    vlog_to_ssts: RwLock<HashMap<u32, HashSet<usize>>>,
+
     /// Monotonic clock / timestamp provider (shared with the LSM engine).
     /// Used by `schedule_deletion` to stamp each retired file with the
     /// current MVCC epoch so the deferred-reclamation pass can compare it
@@ -493,10 +497,12 @@ impl ValueLog {
     }
 
     /// Register SST -> vLog references when an SST is finalized.
-    /// This populates the sst_to_vlogs mapping for GC tracking.
+    /// Updates both forward (sst_to_vlogs) and reverse (vlog_to_ssts) indexes.
     pub fn register_sst_references(&self, sst_id: usize, vlog_ids: HashSet<u32>) {
-        let mut mapping = self.sst_to_vlogs.write();
-        mapping.insert(sst_id, vlog_ids);
+        for vlog_id in &vlog_ids {
+            self.vlog_to_ssts.write().entry(*vlog_id).or_default().insert(sst_id);
+        }
+        self.sst_to_vlogs.write().insert(sst_id, vlog_ids);
     }
 
     /// Get all vLog files referenced by a given SST.
@@ -506,26 +512,29 @@ impl ValueLog {
     }
 
     /// Get all SSTs that reference a given vLog file.
-    /// Used during GC to find which SSTs need pointer updates.
+    /// Uses the reverse index for O(1) lookup.
     pub fn get_ssts_referencing(&self, vlog_id: u32) -> Vec<usize> {
-        let mapping = self.sst_to_vlogs.read();
-        mapping
-            .iter()
-            .filter_map(|(sst_id, vlogs)| {
-                if vlogs.contains(&vlog_id) {
-                    Some(*sst_id)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.vlog_to_ssts
+            .read()
+            .get(&vlog_id)
+            .map(|ssts| ssts.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Remove all vLog references for a deleted SST.
-    /// Must be called whenever an SST is removed (compaction, manual deletion)
-    /// to prevent stale entries in sst_to_vlogs from blocking vLog reclamation.
+    /// Updates both forward and reverse indexes.
     pub fn unregister_sst_references(&self, sst_id: usize) {
-        self.sst_to_vlogs.write().remove(&sst_id);
+        if let Some(vlog_ids) = self.sst_to_vlogs.write().remove(&sst_id) {
+            let mut reverse = self.vlog_to_ssts.write();
+            for vlog_id in vlog_ids {
+                if let Some(ssts) = reverse.get_mut(&vlog_id) {
+                    ssts.remove(&sst_id);
+                    if ssts.is_empty() {
+                        reverse.remove(&vlog_id);
+                    }
+                }
+            }
+        }
     }
 
     /// Read a value using a ValuePointer. Returns only the value bytes
@@ -754,11 +763,13 @@ impl GarbageCollector {
             // inside the critical section.
             let mut expected_buf = Vec::with_capacity(ValuePointer::encoded_size());
             entry.ptr.encode(&mut expected_buf);
-            self.lsm.compare_and_set(
+            if !self.lsm.compare_and_set(
                 &entry.key,
                 &expected_buf,
                 &buf,
-            )?;
+            )? {
+                continue; // A concurrent user write changed the value — skip this entry
+            }
         }
 
         writer.close()?;
@@ -776,16 +787,15 @@ impl GarbageCollector {
     }
 
     /// Check if a vLog entry is still referenced by the LSM tree.
+    /// Uses KvKind (authoritative SST block metadata) to classify the current
+    /// value, avoiding ambiguous payload-based pointer detection.
     fn is_entry_live(&self, entry: &VlogEntry) -> Result<bool> {
-        match self.lsm.get(&entry.key)? {
-            Some(value) => {
-                if let Some(ptr) = ValuePointer::try_decode(&value) {
-                    Ok(ptr.file_id == entry.ptr.file_id && ptr.offset == entry.ptr.offset)
-                } else {
-                    Ok(false) // Value is now inline (untagged) — not a pointer
-                }
+        match self.lsm.get_with_kind(&entry.key)? {
+            Some((value, KvKind::ValuePointer)) => {
+                let ptr = ValuePointer::decode(&value)?;
+                Ok(ptr.file_id == entry.ptr.file_id && ptr.offset == entry.ptr.offset)
             }
-            None => Ok(false), // Key was deleted
+            _ => Ok(false), // Key deleted, or value is now inline — entry is stale
         }
     }
 }
@@ -974,6 +984,11 @@ impl MiniLsm {
     /// Get statistics about value log usage
     pub fn vlog_stats(&self) -> ValueLogStats;
 
+    /// Get a value along with its authoritative KvKind metadata from SST blocks.
+    /// Returns None if the key is deleted. Used by GC's is_entry_live() to avoid
+    /// ambiguous payload-based pointer detection.
+    pub fn get_with_kind(&self, key: &[u8]) -> Result<Option<(Bytes, KvKind)>>;
+
     /// Trigger manual garbage collection
     pub fn trigger_gc(&self) -> Result<()>;
 
@@ -1084,14 +1099,15 @@ O(total SST count) once vLog adoption grows.
 pub enum ManifestRecord {
     /// Flush of a memtable to L0. Carries the vLog files this new SST
     /// references (empty if the SST has no separated values).
-    Flush(usize, Vec<u32>),
+    /// `#[serde(default)]` ensures old manifests without vLog data still parse.
+    Flush(usize, #[serde(default)] Vec<u32>),
 
     NewMemtable(usize),
 
     /// Compaction output. For each output SST, record the set of vLog files
     /// it references so the SST → vLog map is reconstructable from the
     /// manifest alone.
-    Compaction(CompactionTask, Vec<(usize, Vec<u32>)>),
+    Compaction(CompactionTask, #[serde(default)] Vec<(usize, Vec<u32>)>),
 
     /// vLog file lifecycle.
     NewVlogFile(u32),
