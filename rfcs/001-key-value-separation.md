@@ -343,32 +343,36 @@ pub struct SsTableBuilder {
 }
 
 impl SsTableBuilder {
-    pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+    /// Add a key-value pair to the builder.
+    /// `input_kind`: pass `Some(KvKind)` during compaction (from source SST metadata),
+    /// or `None` for new writes (memtable flush) — the builder decides automatically.
+    pub fn add(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
         }
 
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
-        // NEW: Check if value should be separated and annotate with KvKind
-        let (value_to_store, kind) = if self.should_separate_value(key, value) {
+        // NEW: Determine value-to-store and KvKind.
+        //
+        // During compaction the caller passes `input_kind` from the source SST's
+        // block metadata, so classification is authoritative — no payload sniffing.
+        // For new writes (memtable flush) `input_kind` is None and we decide here.
+        let (value_to_store, kind) = if let Some(k) = input_kind {
+            // Compaction path: trust the caller's authoritative metadata.
+            if k == KvKind::ValuePointer {
+                if let Some(vptr) = ValuePointer::try_decode(value) {
+                    self.referenced_vlogs.insert(vptr.file_id);
+                }
+            }
+            (value, k)
+        } else if self.should_separate_value(key, value) {
             let vptr = self.write_to_vlog(key, value);
-            // Store the encoded pointer instead of the value
             self.vlog_buffer.clear();
             vptr.encode(&mut self.vlog_buffer);
             (&self.vlog_buffer[..ValuePointer::encoded_size()], KvKind::ValuePointer)
         } else {
-            // During compaction, values may already be encoded ValuePointers.
-            // Detect existing pointers and preserve KvKind so readers dereference
-            // them correctly instead of returning raw pointer bytes.
-            let mut kind = KvKind::Inline;
-            if value.len() == ValuePointer::encoded_size() && value[0] == VALUE_POINTER_TAG {
-                if let Some(vptr) = ValuePointer::try_decode(value) {
-                    self.referenced_vlogs.insert(vptr.file_id);
-                    kind = KvKind::ValuePointer;
-                }
-            }
-            (value, kind)
+            (value, KvKind::Inline)
         };
 
         // Each block entry now carries (key, value, KvKind) so that the
@@ -420,7 +424,7 @@ pub struct PendingDeletion {
 /// from being unlinked while an iterator or snapshot still reads them.
 pub struct ValueLogReaderHandle {
     reader: Arc<ValueLogReader>,
-    vlog: ValueLog,  // Clone (Arc-backed) for drop-time release
+    vlog: Arc<ValueLog>,  // Shared ref ensures increment/decrement hit the same map
     file_id: u32,
 }
 
@@ -517,17 +521,26 @@ impl ValueLog {
             .collect()
     }
 
+    /// Remove all vLog references for a deleted SST.
+    /// Must be called whenever an SST is removed (compaction, manual deletion)
+    /// to prevent stale entries in sst_to_vlogs from blocking vLog reclamation.
+    pub fn unregister_sst_references(&self, sst_id: usize) {
+        self.sst_to_vlogs.write().remove(&sst_id);
+    }
+
     /// Read a value using a ValuePointer. Returns only the value bytes
     /// (the caller never needs to see the vLog header or key).
-    pub fn read(&self, ptr: &ValuePointer) -> Result<Bytes> {
+    pub fn read(self: &Arc<ValueLog>, ptr: &ValuePointer) -> Result<Bytes> {
         let reader = self.get_reader(ptr.file_id)?;
         let entry = reader.read_entry(ptr.offset, ptr.size)?;
-        Ok(entry.value.freeze())
+        Ok(Bytes::from(entry.value))
     }
 
     /// Get a cached reader for the specified vLog file.
     /// Returns a RAII guard that decrements the refcount on drop.
-    fn get_reader(&self, file_id: u32) -> Result<ValueLogReaderHandle> {
+    /// `self_arc` is the `Arc<ValueLog>` that owns this instance (passed by caller
+    /// so the handle can share the same refcount map).
+    fn get_reader(self: &Arc<ValueLog>, file_id: u32) -> Result<ValueLogReaderHandle> {
         let reader = self.readers.try_get_with(file_id, || {
             ValueLogReader::open(self.path_of_file(file_id)).map(Arc::new)
         }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))?;
@@ -952,9 +965,14 @@ pub struct LsmStorageOptions {
 impl MiniLsm {
     /// Get statistics about value log usage
     pub fn vlog_stats(&self) -> ValueLogStats;
-    
+
     /// Trigger manual garbage collection
     pub fn trigger_gc(&self) -> Result<()>;
+
+    /// Atomically replace `key` only if the current value equals `old`.
+    /// Returns true if the swap succeeded, false if the value changed.
+    /// Used by GC to avoid overwriting fresher user writes during re-insertion.
+    pub fn compare_and_set(&self, key: &[u8], old: &[u8], new: &[u8]) -> Result<bool>;
 }
 ```
 
