@@ -364,6 +364,9 @@ pub struct SsTableBuilder {
     key_hashes: Vec<u32>,
     
     // NEW: Value log components
+    // `vlog_builder` is a per-flush writer that allocates its own vLog file ID
+    // from `ValueLog::next_file_id()`. This avoids contention on the shared
+    // `active_writer` during flush. Each concurrent flush gets its own file.
     vlog_options: Option<ValueSeparationOptions>,
     vlog_builder: Option<ValueLogBuilder>,
     vlog_buffer: Vec<u8>,
@@ -374,6 +377,10 @@ impl SsTableBuilder {
     /// Add a key-value pair to the builder.
     /// `input_kind`: pass `Some(KvKind)` during compaction (from source SST metadata),
     /// or `None` for new writes (memtable flush) — the builder decides automatically.
+    ///
+    /// When `input_kind` is `None` (flush path), this method writes large values
+    /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
+    /// fsynced before the SST entry is written, so every pointer is durable.
     pub fn add(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
@@ -381,11 +388,13 @@ impl SsTableBuilder {
 
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
-        // NEW: Determine value-to-store and KvKind.
+        // Determine value-to-store and KvKind.
         //
         // During compaction the caller passes `input_kind` from the source SST's
         // block metadata, so classification is authoritative — no payload sniffing.
-        // For new writes (memtable flush) `input_kind` is None and we decide here.
+        // During flush `input_kind` is None and we decide here: large values are
+        // written to the vLog (with fsync), and only the ValuePointer is stored
+        // in the SST.
         let (value_to_store, kind) = if let Some(k) = input_kind {
             // Compaction path: trust the caller's authoritative metadata.
             if k == KvKind::ValuePointer {
@@ -428,6 +437,7 @@ impl SsTableBuilder {
             Some(opts) if opts.enabled => {
                 // Keys stored in vLog must fit in the u16 key_len field
                 value.len() >= opts.min_value_size
+                    && value.len() <= opts.max_value_size
                     && key.raw_ref().len() <= u16::MAX as usize
             }
             _ => false,
@@ -519,6 +529,12 @@ pub struct ValueLog {
 impl ValueLog {
     /// Write a key-value pair to the active vLog file.
     /// Returns a ValuePointer that can be stored in the LSM tree.
+    ///
+    /// This is the primary write path for GC rewrites and any direct vLog
+    /// writes. The flush path uses `ValueLogBuilder` (owned by `SsTableBuilder`)
+    /// which writes to its own per-flush file; this method writes to the shared
+    /// `active_writer` and serializes via `active_writer.lock()`.
+    ///
     /// Delegates to ValueLogWriter::append which applies the same 8-byte
     /// alignment padding as ValueLogBuilder::add.
     pub fn write(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
@@ -677,7 +693,7 @@ impl ValueLog {
     /// SSTs. Instead the file is parked on a pending-deletion queue and a
     /// background task reclaims it once it is safe.
     ///
-    /// Safety condition (any one is sufficient):
+    /// Safety conditions (all required):
     /// - the file's reader/iterator refcount has dropped to zero, **and**
     /// - the MVCC watermark has advanced past the timestamp at which the file
     ///   was retired (so no snapshot can still hold a pointer into it), **and**
@@ -824,26 +840,39 @@ impl GarbageCollector {
         let new_file_id = self.vlog.next_file_id();
         let mut writer = ValueLogWriter::create(self.vlog.path_of_file(new_file_id))?;
 
-        // Rewrite live entries and update LSM index.
-        // Values are re-read from the vLog (not held in memory from analysis).
+        // Phase 1: Rewrite all live entries to the new vLog file.
+        // We collect the (key, old_ptr, new_ptr) tuples first, then fsync,
+        // then CAS — so every pointer we bind into the LSM already references
+        // durable vLog data.
+        let mut rewrites: Vec<(Vec<u8>, ValuePointer, ValuePointer)> = Vec::new();
         for entry_ref in &analysis.live_entries {
             let value = self.vlog.read(&entry_ref.ptr, &entry_ref.key)?;
             let new_ptr = writer.append(&entry_ref.key, &value)?;
+            rewrites.push((entry_ref.key.clone(), entry_ref.ptr, new_ptr));
+        }
+
+        // Fsync the new vLog BEFORE binding any pointers into the LSM tree.
+        // This prevents dangling pointers on crash: every ValuePointer we
+        // CAS into the memtable is already durable on disk.
+        writer.close()?;
+
+        // Phase 2: CAS each live key to point at the new vLog location.
+        for (key, old_ptr, new_ptr) in &rewrites {
             let mut buf = Vec::with_capacity(ValuePointer::encoded_size());
             new_ptr.encode(&mut buf);
 
             // Atomic rebind: only swap the pointer if the key still resolves
-            // to `entry.ptr`. `compare_and_set` performs the get + put under
+            // to `old_ptr`. `compare_and_set` performs the get + put under
             // the same MVCC sequence so a concurrent user write cannot be
             // overwritten. Implementations without explicit CAS can serialize
             // GC writes with the write batch lock and re-check `is_entry_live`
             // inside the critical section.
             let mut expected_buf = Vec::with_capacity(ValuePointer::encoded_size());
-            entry_ref.ptr.encode(&mut expected_buf);
+            old_ptr.encode(&mut expected_buf);
             // Kind-aware CAS: ensures we don't overwrite an inline user value
             // that happens to be byte-identical to the old pointer encoding.
             if !self.lsm.compare_and_set_with_kind(
-                &entry_ref.key,
+                key,
                 &expected_buf, KvKind::ValuePointer,
                 &buf, KvKind::ValuePointer,
             )? {
@@ -851,10 +880,7 @@ impl GarbageCollector {
             }
         }
 
-        writer.close()?;
-
-        // Ensure new vLog entries and LSM writes are durable before scheduling
-        // the old file for reclamation.
+        // Ensure LSM writes are durable before scheduling the old file for reclamation.
         self.lsm.sync()?;
 
         // Defer deletion until all active snapshots/iterators referencing the
@@ -1134,7 +1160,7 @@ fn test_vlog_write_read() {
     let value = vec![0u8; 4096]; // Large value
     
     let ptr = vlog.write(key, &value).unwrap();
-    let read_value = vlog.read(&ptr).unwrap();
+    let read_value = vlog.read(&ptr, key).unwrap();
     
     assert_eq!(value, read_value.as_ref());
 }
@@ -1160,11 +1186,11 @@ fn test_key_value_separation_workflow() {
     // Write small value (inline)
     storage.put(b"small", b"tiny").unwrap();
     
-    // Write large value (separated)
+    // Write large value — stored in WAL + memtable, separated to vLog on flush
     let large_value = vec![0u8; 10000];
     storage.put(b"large", &large_value).unwrap();
-    
-    // Force flush to create SST
+
+    // Force flush — this is where vLog write + separation happens
     storage.force_flush().unwrap();
     
     // Verify both values can be read
@@ -1231,24 +1257,39 @@ checks and by older snapshots whose manifest record predates this format.
 
 ## Crash Recovery
 
-Because vLog files are append-only and written before their corresponding SSTs, crash recovery follows these ordering rules:
+The WAL stores full values, so crash recovery does not depend on vLog pointers at all. Recovery proceeds in two phases:
 
-1. **vLog writes happen before SST writes**: When flushing a memtable, values are first appended to the vLog, then the SST is built with pointers to those vLog locations.
-2. **SST atomically installed**: The SST is only added to the LSM state (and manifest updated) after both vLog and SST files are fully written and synced.
-3. **Recovery on restart**: The manifest is replayed as usual. Any vLog files referenced by SSTs in the manifest are valid. vLog files not referenced by any SST can be garbage collected on startup.
-4. **Partial vLog write**: If a crash occurs during vLog writing, the partially written entry is detected by CRC32 mismatch and skipped during reads.
+1. **WAL replay**: rebuilds the memtable with full values — identical to a non-separated engine. No vLog validation needed.
+2. **Manifest replay**: for every `Flush` / `Compaction` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
+
+**Flush-time crash safety**: vLog writes are fsynced (batch, once per flush) before the SST is written to disk. If a crash occurs:
+- **Before SST is committed to manifest**: the flush is incomplete — the memtable (rebuilt from WAL) still contains the full values. The partially written vLog and SST files are orphaned.
+- **After SST is committed to manifest**: all vLog pointers in the SST are guaranteed valid (vLog was fsynced first).
+- **Partial vLog write**: detected by CRC32 mismatch and skipped during reads.
+
+**Orphan cleanup on startup**: after WAL and manifest replay, the engine scans the data directory for `.vlog` files. Any file not referenced by a `NewVlogFile` manifest record (or by an SST's vLog reference list) is orphaned and deleted. This handles vLog files from crashed flushes that were never committed to the manifest.
 
 ### WAL Interaction
 
-To avoid doubling write amplification by writing large values to both the WAL and the vLog, the WAL stores only the `ValuePointer` for separated values (not the full value). The vLog write must be synced **before** the WAL entry is committed to prevent dangling pointers on crash:
+The WAL stores the **full value** for every write — the same as a non-separated LSM tree. Value separation into the vLog happens **during flush** (memtable → SST), not during the put path:
 
-- **Write path**: value → vLog append → **vLog fsync** → WAL (pointer only) → **WAL fsync** → memtable
-- **Recovery**: replay WAL; for entries with ValuePointer, the pointer is already durable — no vLog re-read needed
-- **Crash before vLog fsync**: the WAL entry is also incomplete (write ordering), so the entry is lost — this is the same guarantee as a non-separated write
-- **Crash after WAL fsync**: vLog is guaranteed synced (ordering above), so the pointer is always valid
-- **Key invariant**: `fsync(vLog)` must complete before `write(WAL)` to prevent dangling pointers
+- **Write path (put)**: value → WAL (full value) → **WAL fsync** → memtable
+- **Flush path**: scan memtable → for each entry with `value.len() >= min_value_size`:
+  1. append value to vLog buffer (in-memory)
+  2. add `ValuePointer` to in-memory SST block
+  3. after all entries are processed: **vLog fsync** (once, batch)
+  4. write SST file to disk
+- **Small values** (< `min_value_size`): written inline to SST as before, no vLog involvement
 
-**Performance note**: the extra `sync()` call on the vLog adds latency per separated write. This can be amortized by batching multiple vLog appends before a single sync (group commit), which is the natural result of the Mutex on `active_writer`.
+This design avoids the double-fsync problem entirely. The write path has exactly one fsync (WAL), identical to a non-separated engine. The vLog fsync cost is paid once per flush (not per entry), which is a background operation and does not add latency to the put path.
+
+**Tradeoff**: the WAL now stores full values instead of 17-byte pointers, increasing WAL size and recovery time. For workloads with many large values, the WAL can grow significantly between flushes. This is mitigated by (a) frequent flushes (small memtable), and (b) the fact that WAL entries are deleted after flush.
+
+**Crash recovery**:
+- **Crash before flush**: WAL replay rebuilds the memtable with full values — no vLog pointers to validate.
+- **Crash during flush**: the flush is atomic — either the SST (with valid vLog pointers) is committed to the manifest, or it is not. Partial vLog writes are detected by CRC32 mismatch and skipped.
+- **No dangling pointers**: because vLog writes are fsynced (batch, once per flush) before the SST is written, every `ValuePointer` in every SST is guaranteed to reference durable data.
+- **Orphan cleanup**: on startup, any `.vlog` file not referenced by the manifest or any SST is deleted.
 
 ## Performance Considerations
 
@@ -1256,9 +1297,9 @@ To avoid doubling write amplification by writing large values to both the WAL an
 
 | Operation | Latency Impact | Notes |
 |-----------|---------------|-------|
-| Small value (< threshold) | None | Stored inline as before |
-| Large value | +1 disk write | Sequential write to vLog |
-| Flush | Neutral | Sequential vLog writes are fast |
+| Small value (< threshold) | None | Stored inline, same as non-separated |
+| Large value | None | Full value goes to WAL + memtable, no vLog on write path |
+| Flush (background) | +1 fsync per flush (batch) | vLog fsync once before SST write; does not block put path |
 
 ### Read Path
 
@@ -1330,6 +1371,7 @@ data/
 ValueSeparationOptions {
     enabled: true,
     min_value_size: 512,
+    max_value_size: 128 << 20,     // 128MB
     max_vlog_file_size: 16 << 20,  // 16MB
     gc_threshold_ratio: 0.3,       // Aggressive GC
     max_open_vlog_files: 16,
@@ -1342,6 +1384,7 @@ ValueSeparationOptions {
 ValueSeparationOptions {
     enabled: true,
     min_value_size: 4096,          // 4KB
+    max_value_size: 128 << 20,     // 128MB
     max_vlog_file_size: 256 << 20, // 256MB
     gc_threshold_ratio: 0.5,
     max_open_vlog_files: 128,
