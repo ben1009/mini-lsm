@@ -97,15 +97,38 @@ pub struct ValuePointer {
     pub size: u32,
 }
 
+/// Per-entry value-kind stored in SST block metadata alongside each key-value
+/// pair. This is the authoritative source of truth for distinguishing inline
+/// values from vLog pointers. A single-byte tag prefix in the value payload
+/// (see `VALUE_POINTER_TAG`) is also present as a fast-path sanity check, but
+/// the `KvKind` is what the reader trusts — it eliminates the collision risk
+/// where a user value whose first byte happens to be `0xFF` would otherwise be
+/// misclassified as a pointer.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvKind {
+    /// The value is stored inline in the SST block.
+    Inline = 0,
+    /// The value is a 17-byte encoded `ValuePointer` that references the vLog.
+    ValuePointer = 1,
+}
+
+impl KvKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Inline),
+            1 => Some(Self::ValuePointer),
+            _ => None,
+        }
+    }
+}
+
 /// Magic tag byte that prefixes every encoded `ValuePointer`.
 ///
-/// Without an explicit tag, any 16-byte inline value (UUID, hash, small blob,
-/// etc.) would be indistinguishable from an encoded pointer. The tag makes the
-/// encoding self-describing so `try_decode` can safely classify a value during
-/// compaction or GC analysis. `0xFF` is chosen because it is an extremely
-/// uncommon prefix for legitimate user payloads; a stronger guarantee can be
-/// obtained by also tracking the type via a per-entry meta flag in the SST
-/// (see `KvKind` in section 5).
+/// Serves as a fast-path sanity check: if the first byte of a candidate value
+/// is not `0xFF`, the value is definitely not a pointer. However the
+/// authoritative classification comes from `KvKind` stored in the SST block
+/// metadata, because a user value can legitimately start with `0xFF`.
 const VALUE_POINTER_TAG: u8 = 0xFF;
 
 impl ValuePointer {
@@ -119,27 +142,34 @@ impl ValuePointer {
         buf.put_u32(self.size);
     }
 
-    /// Decode from bytes. Panics if the buffer is malformed.
-    pub fn decode(mut buf: &[u8]) -> Self {
-        assert!(buf.len() >= Self::encoded_size(), "ValuePointer buffer too short");
+    /// Decode from bytes. Returns an error if the buffer is malformed.
+    pub fn decode(mut buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::encoded_size() {
+            return Err(anyhow!("ValuePointer buffer too short: {} < {}", buf.len(), Self::encoded_size()));
+        }
         let tag = buf.get_u8();
-        assert_eq!(tag, VALUE_POINTER_TAG, "ValuePointer tag mismatch");
-        Self {
+        if tag != VALUE_POINTER_TAG {
+            return Err(anyhow!("ValuePointer tag mismatch: expected 0x{:02X}, got 0x{:02X}", VALUE_POINTER_TAG, tag));
+        }
+        Ok(Self {
             file_id: buf.get_u32(),
             offset: buf.get_u64(),
             size: buf.get_u32(),
-        }
+        })
     }
 
     /// Try to decode from bytes. Returns `None` if the buffer is too short or
-    /// does not start with the `VALUE_POINTER_TAG` byte. This makes the
-    /// classification of "inline value" vs. "value pointer" unambiguous, so an
-    /// inline 16-byte UUID can never be mistaken for a pointer.
+    /// does not start with the `VALUE_POINTER_TAG` byte.
+    ///
+    /// Callers that have access to the SST block's `KvKind` metadata should
+    /// check that first (it is authoritative) and only use `try_decode` as a
+    /// fast-path filter. This avoids the edge-case collision where a user value
+    /// whose first byte is `0xFF` could be misclassified as a pointer.
     pub fn try_decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < Self::encoded_size() || buf[0] != VALUE_POINTER_TAG {
             return None;
         }
-        Some(Self::decode(buf))
+        Self::decode(buf).ok()
     }
 
     /// Total encoded size: 17 bytes (1-byte tag + 4 + 8 + 4)
@@ -183,6 +213,7 @@ impl ValuePointer {
 const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
 
 /// Value log file header (first 16 bytes of each vLog file)
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct VlogFileHeader {
     pub magic: u32,           // 4 bytes
@@ -319,30 +350,34 @@ impl SsTableBuilder {
 
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
-        // NEW: Check if value should be separated
-        let value_to_store = if self.should_separate_value(value) {
+        // NEW: Check if value should be separated and annotate with KvKind
+        let (value_to_store, kind) = if self.should_separate_value(key, value) {
             let vptr = self.write_to_vlog(key, value);
             // Store the encoded pointer instead of the value
             self.vlog_buffer.clear();
             vptr.encode(&mut self.vlog_buffer);
-            &self.vlog_buffer[..ValuePointer::encoded_size()]
+            (&self.vlog_buffer[..ValuePointer::encoded_size()], KvKind::ValuePointer)
         } else {
             // During compaction, values may already be encoded ValuePointers.
-            // Track their vLog references to prevent premature GC.
-            if let Some(vptr) = ValuePointer::try_decode(value) {
-                self.referenced_vlogs.insert(vptr.file_id);
+            // Use KvKind metadata (authoritative) rather than try_decode alone.
+            if value.len() == ValuePointer::encoded_size() && value[0] == VALUE_POINTER_TAG {
+                if let Some(vptr) = ValuePointer::try_decode(value) {
+                    self.referenced_vlogs.insert(vptr.file_id);
+                }
             }
-            value
+            (value, KvKind::Inline)
         };
 
-        if self.builder.add(key, value_to_store) {
+        // Each block entry now carries (key, value, KvKind) so that the
+        // reader can classify the value without guessing from the payload.
+        if self.builder.add_with_kind(key, value_to_store, kind) {
             self.last_key.set_from_slice(key);
             return;
         }
 
         self.finish_block();
         self.first_key.set_from_slice(key);
-        assert!(self.builder.add(key, value_to_store));
+        assert!(self.builder.add_with_kind(key, value_to_store, kind));
         self.last_key.set_from_slice(key);
     }
 
@@ -353,9 +388,13 @@ impl SsTableBuilder {
         ptr
     }
 
-    fn should_separate_value(&self, value: &[u8]) -> bool {
+    fn should_separate_value(&self, key: KeySlice, value: &[u8]) -> bool {
         match &self.vlog_options {
-            Some(opts) if opts.enabled => value.len() >= opts.min_value_size,
+            Some(opts) if opts.enabled => {
+                // Keys stored in vLog must fit in the u16 key_len field
+                value.len() >= opts.min_value_size
+                    && key.raw_ref().len() <= u16::MAX as usize
+            }
             _ => false,
         }
     }
@@ -365,28 +404,51 @@ impl SsTableBuilder {
 ### 6. ValueLog Implementation
 
 ```rust
+/// Pending deletion entry: a vLog file that has been retired by GC but whose
+/// on-disk deletion is deferred until it is safe.
+pub struct PendingDeletion {
+    file_id: u32,
+    /// The engine timestamp / epoch at the moment GC retired this file.
+    obsolete_at_ts: u64,
+}
+
 /// Manages value log files for the storage engine.
 pub struct ValueLog {
     /// Path to the vLog directory
     path: PathBuf,
-    
+
     /// Currently active vLog file for writing
     active_writer: Mutex<ValueLogWriter>,
-    
+
     /// Read cache for vLog files (file_id -> Arc<ValueLogReader>)
     readers: moka::sync::Cache<u32, Arc<ValueLogReader>>,
-    
+
     /// Next vLog file ID
     next_file_id: AtomicU32,
-    
+
     /// Configuration options
     options: ValueSeparationOptions,
-    
-    /// Tracks which SSTs reference which vLog entries
-    /// Used for garbage collection
+
+    /// Tracks which SSTs reference which vLog entries.
     /// Populated during SST build: when an SST is finalized, the vLog file IDs
-    /// it references are registered via register_sst_references()
+    /// it references are registered via register_sst_references().
     sst_to_vlogs: RwLock<HashMap<usize, HashSet<u32>>>,
+
+    /// Monotonic clock / timestamp provider (shared with the LSM engine).
+    /// Used by `schedule_deletion` to stamp each retired file with the
+    /// current MVCC epoch so the deferred-reclamation pass can compare it
+    /// against the MVCC watermark.
+    lsm_clock: Arc<dyn Clock>,
+
+    /// vLog files that have been retired by GC but not yet unlinked.
+    /// Protected by a mutex; drained by `reclaim_pending_deletions`.
+    pending_deletions: Mutex<Vec<PendingDeletion>>,
+
+    /// Per-file open-reader reference count. Incremented when a
+    /// `ValueLogReader` is fetched from the cache; decremented on drop.
+    /// Used by `reclaim_pending_deletions` to ensure a file is not deleted
+    /// while an iterator or snapshot still holds an open handle.
+    reader_refcounts: RwLock<HashMap<u32, usize>>,
 }
 
 impl ValueLog {
@@ -432,17 +494,45 @@ impl ValueLog {
             .collect()
     }
 
-    /// Read a value using a ValuePointer.
+    /// Read a value using a ValuePointer. Returns only the value bytes
+    /// (the caller never needs to see the vLog header or key).
     pub fn read(&self, ptr: &ValuePointer) -> Result<Bytes> {
         let reader = self.get_reader(ptr.file_id)?;
-        reader.read_at(ptr.offset, ptr.size)
+        let entry = reader.read_entry(ptr.offset, ptr.size)?;
+        Ok(entry.value.freeze())
     }
 
     /// Get a cached reader for the specified vLog file.
     fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
-        self.readers.try_get_with(file_id, || {
-            ValueLogReader::open(self.path_of_file(file_id))
-        }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))
+        let reader = self.readers.try_get_with(file_id, || {
+            ValueLogReader::open(self.path_of_file(file_id)).map(Arc::new)
+        }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))?;
+        // Track open-reader reference count for safe deferred deletion.
+        *self.reader_refcounts.write().entry(file_id).or_insert(0) += 1;
+        Ok(reader)
+    }
+
+    /// Decrements the reference count for a vLog file reader.
+    /// Called when a `ValueLogReaderHandle` is dropped.
+    fn release_reader(&self, file_id: u32) {
+        let mut counts = self.reader_refcounts.write();
+        if let Some(count) = counts.get_mut(&file_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&file_id);
+            }
+        }
+    }
+
+    /// Returns the current open-reader reference count for a vLog file.
+    /// Used by `reclaim_pending_deletions` to ensure a file is not deleted
+    /// while iterators or snapshots still hold an open handle.
+    pub fn reader_refcount(&self, file_id: u32) -> usize {
+        self.reader_refcounts
+            .read()
+            .get(&file_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Return the current configuration options.
