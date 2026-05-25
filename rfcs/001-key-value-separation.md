@@ -163,7 +163,7 @@ pub struct VlogFileHeader {
 #[repr(C)]
 pub struct VlogEntryHeader {
     pub crc32: u32,           // CRC32 of key + value (4 bytes)
-    pub key_len: u16,         // Key length (max 64KB) (2 bytes)
+    pub key_len: u16,         // Key length (max 64KB). Large keys must be stored inline. (2 bytes)
     pub value_len: u32,       // Value length (max 4GB) (4 bytes)
     pub flags: u16,           // Flags (tombstone, etc.) (2 bytes)
     pub _padding: [u8; 4],    // Padding to 16 bytes for alignment
@@ -172,6 +172,31 @@ pub struct VlogEntryHeader {
 const HEADER_SIZE: usize = std::mem::size_of::<VlogEntryHeader>();
 const TRAILER_SIZE: usize = 4; // CRC32 checksum
 const ALIGNMENT: usize = 8;
+```
+
+### 2.5 ValueLogBuilder
+
+The `ValueLogBuilder` constructs vLog entries during SSTable building. It is owned by `SsTableBuilder` and writes sequentially to the current vLog file.
+
+```rust
+/// Builder for constructing vLog entries during SST construction.
+pub struct ValueLogBuilder {
+    writer: ValueLogWriter,
+    file_id: u32,
+}
+
+impl ValueLogBuilder {
+    /// Add a key-value pair to the vLog. Returns a ValuePointer.
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> ValuePointer {
+        let offset = self.writer.offset();
+        self.writer.append(key, value);
+        ValuePointer {
+            file_id: self.file_id,
+            offset,
+            size: (key.len() + value.len() + HEADER_SIZE + TRAILER_SIZE) as u32,
+        }
+    }
+}
 ```
 
 ### 3. ValueLog Module Structure
@@ -235,16 +260,11 @@ pub struct SsTableBuilder {
     // NEW: Value log components
     vlog_options: Option<ValueSeparationOptions>,
     vlog_builder: Option<ValueLogBuilder>,
-    current_vlog_id: u32,
-    vlog_entries: Vec<(ValuePointer, Bytes)>, // Pending entries
+    vlog_buffer: Vec<u8>,
+    referenced_vlogs: HashSet<u32>,
 }
 
 impl SsTableBuilder {
-    /// Tracks which vLog files are referenced by the SST being built.
-    /// Populated during add() when values are separated to vLog.
-    /// This is used to register the SST -> vLog mapping when the SST is finalized.
-    referenced_vlogs: HashSet<u32>,
-
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
@@ -256,7 +276,6 @@ impl SsTableBuilder {
         let value_to_store = if self.should_separate_value(value) {
             let vptr = self.write_to_vlog(key, value);
             // Store the encoded pointer instead of the value
-            // Clear buffer first to avoid accumulating encoded pointers
             self.vlog_buffer.clear();
             vptr.encode(&mut self.vlog_buffer);
             &self.vlog_buffer[..ValuePointer::encoded_size()]
@@ -272,6 +291,13 @@ impl SsTableBuilder {
         self.finish_block();
         assert!(self.builder.add(key, value_to_store));
         self.last_key.set_from_slice(key);
+    }
+
+    /// Write a key-value pair to the active vLog builder and return a pointer.
+    fn write_to_vlog(&mut self, key: KeySlice, value: &[u8]) -> ValuePointer {
+        let ptr = self.vlog_builder.as_mut().unwrap().add(key.raw_ref(), value);
+        self.referenced_vlogs.insert(ptr.file_id);
+        ptr
     }
 
     fn should_separate_value(&self, value: &[u8]) -> bool {
@@ -365,6 +391,29 @@ impl ValueLog {
             ValueLogReader::open(self.path_of_file(file_id))
         }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))
     }
+
+    /// Return the current configuration options.
+    pub fn options(&self) -> &ValueSeparationOptions {
+        &self.options
+    }
+
+    /// Allocate and return the next vLog file ID.
+    pub fn next_file_id(&self) -> u32 {
+        self.next_file_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Return the filesystem path for a given vLog file ID.
+    fn path_of_file(&self, file_id: u32) -> PathBuf {
+        self.path.join(format!("{:05}.vlog", file_id))
+    }
+
+    /// Remove a vLog file from disk and invalidate the cache entry.
+    pub fn remove_file(&self, file_id: u32) -> Result<()> {
+        let path = self.path_of_file(file_id);
+        std::fs::remove_file(&path)?;
+        self.readers.invalidate(&file_id);
+        Ok(())
+    }
 }
 ```
 
@@ -372,11 +421,35 @@ impl ValueLog {
 
 Garbage collection is triggered during compaction when the ratio of stale data exceeds a threshold.
 
+**Important design choice**: Instead of rewriting SSTs to update value pointers (which would add massive write amplification and break SST immutability), we use the standard WiscKey approach:
+
+1. Scan the target vLog file and identify live entries
+2. Rewrite live entries to a new vLog file
+3. Re-insert each live key with its new `ValuePointer` into the LSM tree via the normal write path
+4. Old SSTs still contain stale pointers, but they are shadowed by the newer entries in the memtable and upper LSM levels
+5. Eventually, normal compaction removes old SSTs containing stale pointers
+
 ```rust
+/// A single entry read from a vLog file.
+pub struct VlogEntry {
+    pub ptr: ValuePointer,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub size: usize,
+}
+
+/// Analysis result for a single vLog file.
+pub struct GcAnalysis {
+    pub file_id: u32,
+    pub stale_ratio: f64,
+    pub live_entries: Vec<VlogEntry>,
+    pub dead_bytes: usize,
+}
+
 /// Garbage collector for reclaiming space in value logs.
 pub struct GarbageCollector {
     vlog: Arc<ValueLog>,
-    lsm: Arc<MiniLsm>,  // Reference to LSM tree for liveness checks
+    lsm: Arc<MiniLsm>,
     threshold: f64,
 }
 
@@ -387,7 +460,11 @@ impl GarbageCollector {
     }
 
     /// Analyze a vLog file and determine which entries are still live.
-    /// Returns the ratio of live data.
+    /// Returns the ratio of stale (dead) data.
+    ///
+    /// Performance note: This performs an LSM `get()` for every entry in the vLog file.
+    /// For large vLog files this can be expensive. Consider scheduling GC during
+    /// low-traffic periods or processing files incrementally.
     pub fn analyze_file(&self, file_id: u32) -> Result<GcAnalysis> {
         let reader = self.vlog.get_reader(file_id)?;
         let mut live_entries = Vec::new();
@@ -396,7 +473,7 @@ impl GarbageCollector {
 
         for entry in reader.iter() {
             if self.is_entry_live(&entry)? {
-                live_entries.push(entry.ptr);
+                live_entries.push(entry);
                 live_bytes += entry.size;
             } else {
                 dead_bytes += entry.size;
@@ -404,84 +481,53 @@ impl GarbageCollector {
         }
 
         let total = live_bytes + dead_bytes;
-        let live_ratio = if total > 0 { live_bytes as f64 / total as f64 } else { 1.0 };
+        let stale_ratio = if total > 0 { dead_bytes as f64 / total as f64 } else { 0.0 };
 
         Ok(GcAnalysis {
             file_id,
-            live_ratio,
+            stale_ratio,
             live_entries,
             dead_bytes,
         })
     }
 
-    /// Rewrite live entries to a new vLog file and update pointers in SSTs.
-    /// Note: This function assumes the caller has already checked that
-    /// analysis.live_ratio < threshold. The threshold check is done once
-    /// in the caller (post_compaction_gc) to avoid inconsistency.
+    /// Rewrite live entries to a new vLog file and update the LSM index.
+    /// Old SSTs are NOT rewritten; stale pointers are shadowed by new LSM writes.
     pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<()> {
+        if analysis.stale_ratio < self.threshold {
+            return Ok(());
+        }
+
         // Create new vLog file with live entries
         let new_file_id = self.vlog.next_file_id();
         let mut writer = ValueLogWriter::create(self.vlog.path_of_file(new_file_id))?;
-        
-        // Map: old_ptr -> new_ptr
-        let mut pointer_map: HashMap<ValuePointer, ValuePointer> = HashMap::new();
 
-        // Rewrite live entries preserving both key and value
+        // Rewrite live entries and update LSM index
         for entry in &analysis.live_entries {
-            // Must include the key for future GC liveness checks
             let new_ptr = writer.append(&entry.key, &entry.value)?;
-            pointer_map.insert(entry.ptr, new_ptr);
+            // Re-insert key with new pointer into LSM tree. Old SSTs still contain
+            // stale pointers, but LSM levels above them (memtable, newer SSTs)
+            // shadow those old entries with the updated pointer.
+            let mut buf = Vec::with_capacity(ValuePointer::encoded_size());
+            new_ptr.encode(&mut buf);
+            self.lsm.put(&entry.key, &buf)?;
         }
 
         writer.close()?;
 
-        // Update SSTs that reference this vLog file
-        // This rewrites affected SSTs to update value pointers, which adds
-        // write amplification. The GC threshold should account for this cost.
-        self.update_sst_pointers(analysis.file_id, &pointer_map)?;
+        // Ensure new vLog entries and LSM writes are durable before removing old file
+        self.lsm.sync()?;
 
-        // Remove old vLog file
+        // Remove old vLog file and invalidate cache
         self.vlog.remove_file(analysis.file_id)?;
 
         Ok(())
     }
 
-    /// Update value pointers in SSTs that reference the old vLog file.
-    /// This is expensive as it requires rewriting SSTs, but is necessary
-    /// because SSTs are immutable. The strategy:
-    /// 1. Find all SSTs referencing the old vLog file (using sst_to_vlogs)
-    /// 2. For each SST, read entries and rewrite with updated pointers
-    /// 3. Atomically replace old SSTs with new ones
-    /// 4. Update manifest to reflect new SST IDs
-    /// 
-    /// Performance note: To minimize write amplification, we batch SST updates
-    /// and only trigger this when the space savings justify the rewrite cost.
-    fn update_sst_pointers(
-        &self,
-        old_file_id: u32,
-        pointer_map: &HashMap<ValuePointer, ValuePointer>,
-    ) -> Result<()> {
-        // Get all SSTs referencing this vLog file
-        let affected_ssts = self.vlog.get_ssts_referencing(old_file_id);
-        
-        for sst_id in affected_ssts {
-            // Rewrite SST with updated pointers
-            let new_sst_id = self.rewrite_sst_with_new_pointers(sst_id, pointer_map)?;
-            
-            // Update manifest atomically
-            self.vlog.update_sst_reference(sst_id, new_sst_id, old_file_id)?;
-        }
-        
-        Ok(())
-    }
-
     /// Check if a vLog entry is still referenced by the LSM tree.
     fn is_entry_live(&self, entry: &VlogEntry) -> Result<bool> {
-        // Query the LSM tree to see if this key still references this vLog entry
-        let key = &entry.key;
-        match self.lsm.get(key)? {
+        match self.lsm.get(&entry.key)? {
             Some(value) => {
-                // Decode value pointer and check if it matches
                 if value.len() == ValuePointer::encoded_size() {
                     let ptr = ValuePointer::decode(&value);
                     Ok(ptr.file_id == entry.ptr.file_id && ptr.offset == entry.ptr.offset)
@@ -493,6 +539,21 @@ impl GarbageCollector {
         }
     }
 }
+
+### 7.1 Stale Pointer Handling
+
+Because SSTs are immutable, old SSTs continue to contain pointers to the old vLog file even after GC moves values to a new file. This is handled naturally by the LSM tree's tiered structure:
+
+- New GC writes go to the **memtable** first
+- `get()` searches memtable → immutable memtables → L0 → L1 → ...
+- The new pointer in the memtable (or a recently flushed SST) shadows the old pointer
+- Range scans may encounter both old and new pointers; merge iterators deduplicate by key
+- Eventually, compaction removes old SSTs containing stale pointers entirely
+
+If a `get()` reads a stale pointer from an old SST after the old vLog file has been deleted, it will get an I/O error. To prevent this, GC must only delete old vLog files after:
+1. All live entries are rewritten to the new vLog file
+2. The new pointers are durably written to the LSM tree (via `sync()`)
+3. No active snapshots or iterators are reading the old file
 ```
 
 ### 8. Integration with Compaction
@@ -505,6 +566,7 @@ impl CompactionController {
         input_ssts: &[usize],
         output_ssts: &[usize],
         vlog: &Arc<ValueLog>,
+        lsm: &Arc<MiniLsm>,
     ) -> Result<()> {
         // Collect all vLog files referenced by input SSTs
         let mut affected_vlogs: HashSet<u32> = HashSet::new();
@@ -516,20 +578,20 @@ impl CompactionController {
         }
 
         // Run GC analysis on affected files
-        let gc = GarbageCollector::new(vlog.clone(), self.lsm.clone(), vlog.options().gc_threshold_ratio);
+        let gc = GarbageCollector::new(vlog.clone(), lsm.clone(), vlog.options().gc_threshold_ratio);
         for file_id in affected_vlogs {
             let analysis = gc.analyze_file(file_id)?;
-            if analysis.live_ratio < vlog.options().gc_threshold_ratio {
+            if analysis.stale_ratio >= vlog.options().gc_threshold_ratio {
                 gc.compact_file(&analysis)?;
             }
         }
 
-        // Update references for output SSTs
-        // Output SSTs register their vLog references during SST construction
-        // The SST builder calls register_sst_references() when finalizing each SST
+        // Register vLog references for output SSTs.
+        // In practice, each output SST is built by an SsTableBuilder which already
+        // populates referenced_vlogs. When the SST is finalized, the builder's
+        // referenced_vlogs set is passed to vlog.register_sst_references().
         for sst_id in output_ssts {
-            // SSTs created during compaction will register themselves
-            // via their builder's referenced_vlogs set
+            // SST builders register references automatically during finalization.
         }
 
         Ok(())
@@ -749,6 +811,15 @@ pub enum ManifestRecord {
     DeleteVlogFile(u32),
 }
 ```
+
+## Crash Recovery
+
+Because vLog files are append-only and written before their corresponding SSTs, crash recovery follows these ordering rules:
+
+1. **vLog writes happen before SST writes**: When flushing a memtable, values are first appended to the vLog, then the SST is built with pointers to those vLog locations.
+2. **SST atomically installed**: The SST is only added to the LSM state (and manifest updated) after both vLog and SST files are fully written and synced.
+3. **Recovery on restart**: The manifest is replayed as usual. Any vLog files referenced by SSTs in the manifest are valid. vLog files not referenced by any SST can be garbage collected on startup.
+4. **Partial vLog write**: If a crash occurs during vLog writing, the partially written entry is detected by CRC32 mismatch and skipped during reads.
 
 ## Performance Considerations
 
