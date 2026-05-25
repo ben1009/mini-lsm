@@ -662,10 +662,12 @@ impl ValueLog {
 
     /// Remove a vLog file from disk and invalidate the cache entry.
     /// Only call this when no active snapshots or iterators reference the file.
+    /// Cache is invalidated BEFORE unlink to prevent new readers from opening
+    /// a file that's about to be deleted.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
+        self.readers.invalidate(&file_id);
         let path = self.path_of_file(file_id);
         std::fs::remove_file(&path)?;
-        self.readers.invalidate(&file_id);
         Ok(())
     }
 
@@ -1240,10 +1242,11 @@ Because vLog files are append-only and written before their corresponding SSTs, 
 
 To avoid doubling write amplification by writing large values to both the WAL and the vLog, the WAL stores only the `ValuePointer` for separated values (not the full value). The vLog write must be synced **before** the WAL entry is committed to prevent dangling pointers on crash:
 
-- **Write path**: value → vLog append → **vLog sync** → WAL (pointer only) → memtable
+- **Write path**: value → vLog append → **vLog fsync** → WAL (pointer only) → **WAL fsync** → memtable
 - **Recovery**: replay WAL; for entries with ValuePointer, the pointer is already durable — no vLog re-read needed
-- **Crash before vLog sync**: the WAL entry is also incomplete (write ordering), so the entry is lost — this is the same guarantee as a non-separated write
-- **Crash after WAL commit**: vLog is guaranteed synced (ordering above), so the pointer is always valid
+- **Crash before vLog fsync**: the WAL entry is also incomplete (write ordering), so the entry is lost — this is the same guarantee as a non-separated write
+- **Crash after WAL fsync**: vLog is guaranteed synced (ordering above), so the pointer is always valid
+- **Key invariant**: `fsync(vLog)` must complete before `write(WAL)` to prevent dangling pointers
 
 **Performance note**: the extra `sync()` call on the vLog adds latency per separated write. This can be amortized by batching multiple vLog appends before a single sync (group commit), which is the natural result of the Mutex on `active_writer`.
 
