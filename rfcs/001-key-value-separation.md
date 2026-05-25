@@ -528,6 +528,14 @@ impl ValueLog {
             "key length {} exceeds vLog header u16 capacity",
             key.len()
         );
+        // Enforce max_value_size to prevent u32 overflow in ValuePointer::size
+        // and to keep GC scan times reasonable.
+        anyhow::ensure!(
+            value.len() <= self.options.max_value_size,
+            "value length {} exceeds max_value_size {}",
+            value.len(),
+            self.options.max_value_size
+        );
 
         let mut writer = self.active_writer.lock();
 
@@ -793,7 +801,14 @@ impl GarbageCollector {
     /// before insertion, and only insert when the LSM still observes the
     /// *exact* old pointer for that key. If the key has been overwritten or
     /// deleted in the meantime, the new pointer is discarded — the new vLog
-    /// entry is simply unreferenced and will be reclaimed by the next GC pass.
+    /// entry becomes orphaned (unreferenced by any SST).
+    ///
+    /// **Orphan reclamation**: entries written to the new vLog before a failed
+    /// CAS are unreferenced but occupy space. Two strategies:
+    /// (a) Track a "committed watermark" per vLog file — entries above the
+    ///     watermark are treated as dead by the next GC pass.
+    /// (b) Use a tombstone marker: on CAS failure, write a zero-length tombstone
+    ///     entry so the reader knows to skip it and the GC can reclaim the space.
     pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<()> {
         if analysis.stale_ratio < self.threshold {
             return Ok(());
