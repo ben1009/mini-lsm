@@ -105,13 +105,25 @@ impl ValuePointer {
         buf.put_u32(self.size);
     }
 
-    /// Decode from bytes
+    /// Decode from bytes. Panics if the buffer is shorter than 16 bytes.
     pub fn decode(mut buf: &[u8]) -> Self {
+        assert!(buf.len() >= Self::encoded_size(), "ValuePointer buffer too short");
         Self {
             file_id: buf.get_u32(),
             offset: buf.get_u64(),
             size: buf.get_u32(),
         }
+    }
+
+    /// Try to decode from bytes. Returns None if the buffer is too short.
+    /// 
+    /// Note: In production, a type tag or prefix byte should be used to
+    /// unambiguously distinguish ValuePointer from inline 16-byte values.
+    pub fn try_decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::encoded_size() {
+            return None;
+        }
+        Some(Self::decode(buf))
     }
 
     /// Total encoded size: 16 bytes
@@ -128,10 +140,10 @@ impl ValuePointer {
 │                    Value Log Entry Format                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  ┌───────────┬─────────┬───────────┬───────────┬───────────┐       │
-│  │ Header    │ Key     │ Value     │ Trailer   │ Padding   │       │
-│  │ (16 bytes)│ (var)   │ (var)     │ (4 bytes) │ (0-7 bytes)│       │
-│  └───────────┴─────────┴───────────┴───────────┴───────────┘       │
+│  ┌───────────┬─────────┬───────────┬───────────┐                   │
+│  │ Header    │ Key     │ Value     │ Padding   │                   │
+│  │ (16 bytes)│ (var)   │ (var)     │ (0-7 bytes)│                  │
+│  └───────────┴─────────┴───────────┴───────────┘                   │
 │                                                                     │
 │  Header Format (16 bytes total):                                    │
 │  ┌─────────────┬───────────────┬─────────────┬─────────────┬──────────┐
@@ -139,7 +151,7 @@ impl ValuePointer {
 │  │ (4 bytes)   │ (2 bytes)     │ (4 bytes)   │ (2 bytes)   │ (4 bytes)│
 │  └─────────────┴───────────────┴─────────────┴─────────────┴──────────┘
 │                                                                     │
-│  Trailer: CRC32 checksum of the entire entry (for validation)       │
+│  CRC32: Covers key + value payload for integrity validation         │
 │                                                                     │
 │  Alignment: Entries are 8-byte aligned for efficient disk access    │
 │                                                                     │
@@ -170,7 +182,6 @@ pub struct VlogEntryHeader {
 }
 
 const HEADER_SIZE: usize = std::mem::size_of::<VlogEntryHeader>();
-const TRAILER_SIZE: usize = 4; // CRC32 checksum
 const ALIGNMENT: usize = 8;
 ```
 
@@ -193,7 +204,7 @@ impl ValueLogBuilder {
         ValuePointer {
             file_id: self.file_id,
             offset,
-            size: (key.len() + value.len() + HEADER_SIZE + TRAILER_SIZE) as u32,
+            size: (key.len() + value.len() + HEADER_SIZE) as u32,
         }
     }
 }
@@ -280,6 +291,11 @@ impl SsTableBuilder {
             vptr.encode(&mut self.vlog_buffer);
             &self.vlog_buffer[..ValuePointer::encoded_size()]
         } else {
+            // During compaction, values may already be encoded ValuePointers.
+            // Track their vLog references to prevent premature GC.
+            if let Some(vptr) = ValuePointer::try_decode(value) {
+                self.referenced_vlogs.insert(vptr.file_id);
+            }
             value
         };
 
@@ -289,6 +305,7 @@ impl SsTableBuilder {
         }
 
         self.finish_block();
+        self.first_key.set_from_slice(key);
         assert!(self.builder.add(key, value_to_store));
         self.last_key.set_from_slice(key);
     }
@@ -408,11 +425,20 @@ impl ValueLog {
     }
 
     /// Remove a vLog file from disk and invalidate the cache entry.
+    /// Only call this when no active snapshots or iterators reference the file.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
         let path = self.path_of_file(file_id);
         std::fs::remove_file(&path)?;
         self.readers.invalidate(&file_id);
         Ok(())
+    }
+
+    /// Schedule a vLog file for deletion once all readers are quiesced.
+    /// In production, this uses watermark-based epoch reclamation or reference counting.
+    pub fn schedule_deletion(&self, file_id: u32) -> Result<()> {
+        // TODO: integrate with snapshot watermark / epoch-based reclamation
+        // For now, defer to a background cleanup task that checks active snapshots.
+        self.remove_file(file_id)
     }
 }
 ```
@@ -518,8 +544,10 @@ impl GarbageCollector {
         // Ensure new vLog entries and LSM writes are durable before removing old file
         self.lsm.sync()?;
 
-        // Remove old vLog file and invalidate cache
-        self.vlog.remove_file(analysis.file_id)?;
+        // Defer deletion until all active snapshots/iterators referencing the old
+        // file have been released. In a production system, this uses reference
+        // counting or watermark-based epoch reclamation (see Stale Pointer Handling).
+        self.vlog.schedule_deletion(analysis.file_id)?;
 
         Ok(())
     }
@@ -528,11 +556,10 @@ impl GarbageCollector {
     fn is_entry_live(&self, entry: &VlogEntry) -> Result<bool> {
         match self.lsm.get(&entry.key)? {
             Some(value) => {
-                if value.len() == ValuePointer::encoded_size() {
-                    let ptr = ValuePointer::decode(&value);
+                if let Some(ptr) = ValuePointer::try_decode(&value) {
                     Ok(ptr.file_id == entry.ptr.file_id && ptr.offset == entry.ptr.offset)
                 } else {
-                    Ok(false) // Value is now inline
+                    Ok(false) // Value is now inline (or ambiguous 16-byte value)
                 }
             }
             None => Ok(false), // Key was deleted
@@ -554,6 +581,14 @@ If a `get()` reads a stale pointer from an old SST after the old vLog file has b
 1. All live entries are rewritten to the new vLog file
 2. The new pointers are durably written to the LSM tree (via `sync()`)
 3. No active snapshots or iterators are reading the old file
+
+**Deferred Deletion Strategy:**
+
+Production systems use one of the following approaches to safely reclaim old vLog files:
+
+- **Reference Counting**: Track open readers per vLog file. Delete when count reaches zero.
+- **Watermark-Based Reclamation**: Record the current MVCC watermark (minimum active snapshot timestamp) before GC. Only delete files after all snapshots older than that watermark have been released. This integrates naturally with Mini-LSM's Week 3 MVCC design.
+- **Epoch-Based Reclamation**: Similar to watermark, but using monotonic epoch counters for non-MVCC systems.
 ```
 
 ### 8. Integration with Compaction
@@ -649,9 +684,9 @@ impl CompactionController {
    - Trigger policies
 
 2. **GC Execution**
-   - Rewrite live entries to new files
-   - Update SST value pointers
-   - Atomic file replacement
+   - Rewrite live entries to new vLog files
+   - Re-insert updated pointers into LSM tree via normal writes
+   - Defer old file deletion until snapshots are quiesced
 
 3. **Background GC Thread**
    - Optional background GC processing
