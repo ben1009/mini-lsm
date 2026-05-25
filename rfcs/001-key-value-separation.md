@@ -131,6 +131,14 @@ impl KvKind {
 /// is not `0xFF`, the value is definitely not a pointer. However the
 /// authoritative classification comes from `KvKind` stored in the SST block
 /// metadata, because a user value can legitimately start with `0xFF`.
+/// Fast-path sanity byte prefix on encoded ValuePointers.
+/// With KvKind as authoritative SST metadata, this tag is technically redundant
+/// for classification. It is retained as a cheap corruption/desync detector:
+/// if a reader sees KvKind::ValuePointer but the payload doesn't start with
+/// 0xFF, something is wrong. The 1-byte overhead (17 vs 16 bytes) is negligible
+/// compared to the values it references. Removing it would save one byte per
+/// pointer but lose the cross-check; a future optimization can drop it if the
+/// encoded size becomes a bottleneck.
 const VALUE_POINTER_TAG: u8 = 0xFF;
 
 impl ValuePointer {
@@ -449,12 +457,13 @@ pub struct VlogReferences {
 }
 
 /// RAII guard for a cached vLog reader. Automatically decrements the
-/// ValueLog's reader_refcount when dropped, preventing retired vLog files
+/// per-file atomic refcount when dropped, preventing retired vLog files
 /// from being unlinked while an iterator or snapshot still reads them.
 pub struct ValueLogReaderHandle {
     reader: Arc<ValueLogReader>,
-    vlog: Arc<ValueLog>,  // Shared ref ensures increment/decrement hit the same map
+    vlog: Arc<ValueLog>,
     file_id: u32,
+    counter: Arc<AtomicUsize>,  // Per-file atomic — no global lock on increment/decrement
 }
 
 impl std::ops::Deref for ValueLogReaderHandle {
@@ -464,7 +473,7 @@ impl std::ops::Deref for ValueLogReaderHandle {
 
 impl Drop for ValueLogReaderHandle {
     fn drop(&mut self) {
-        self.vlog.release_reader(self.file_id);
+        self.vlog.release_reader(self.file_id, &self.counter);
     }
 }
 
@@ -504,7 +513,7 @@ pub struct ValueLog {
     /// `ValueLogReader` is fetched from the cache; decremented on drop.
     /// Used by `reclaim_pending_deletions` to ensure a file is not deleted
     /// while an iterator or snapshot still holds an open handle.
-    reader_refcounts: RwLock<HashMap<u32, usize>>,
+    reader_refcounts: RwLock<HashMap<u32, Arc<AtomicUsize>>>,
 }
 
 impl ValueLog {
@@ -588,26 +597,28 @@ impl ValueLog {
 
     /// Get a cached reader for the specified vLog file.
     /// Returns a RAII guard that decrements the refcount on drop.
-    /// `self_arc` is the `Arc<ValueLog>` that owns this instance (passed by caller
-    /// so the handle can share the same refcount map).
+    /// Uses per-file AtomicUsize to avoid global write-lock contention.
     fn get_reader(self: &Arc<ValueLog>, file_id: u32) -> Result<ValueLogReaderHandle> {
         let reader = self.readers.try_get_with(file_id, || {
             ValueLogReader::open(self.path_of_file(file_id)).map(Arc::new)
         }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))?;
-        // Track open-reader reference count for safe deferred deletion.
-        *self.reader_refcounts.write().entry(file_id).or_insert(0) += 1;
-        Ok(ValueLogReaderHandle { reader, vlog: self.clone(), file_id })
+        // Get or create per-file atomic counter. Write lock only on first access.
+        let counter = self.reader_refcounts
+            .write()
+            .entry(file_id)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(ValueLogReaderHandle { reader, vlog: self.clone(), file_id, counter })
     }
 
     /// Decrements the reference count for a vLog file reader.
     /// Called when a `ValueLogReaderHandle` is dropped.
-    fn release_reader(&self, file_id: u32) {
-        let mut counts = self.reader_refcounts.write();
-        if let Some(count) = counts.get_mut(&file_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&file_id);
-            }
+    fn release_reader(&self, file_id: u32, counter: &AtomicUsize) {
+        counter.fetch_sub(1, Ordering::Relaxed);
+        // Clean up map entry when count reaches zero (best-effort).
+        if counter.load(Ordering::Relaxed) == 0 {
+            self.reader_refcounts.write().remove(&file_id);
         }
     }
 
@@ -618,7 +629,7 @@ impl ValueLog {
         self.reader_refcounts
             .read()
             .get(&file_id)
-            .copied()
+            .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -1206,6 +1217,14 @@ Because vLog files are append-only and written before their corresponding SSTs, 
 3. **Recovery on restart**: The manifest is replayed as usual. Any vLog files referenced by SSTs in the manifest are valid. vLog files not referenced by any SST can be garbage collected on startup.
 4. **Partial vLog write**: If a crash occurs during vLog writing, the partially written entry is detected by CRC32 mismatch and skipped during reads.
 
+### WAL Interaction
+
+To avoid doubling write amplification by writing large values to both the WAL and the vLog, the WAL should store only the `ValuePointer` for separated values (not the full value). The vLog write is the durable copy; the WAL entry just records the pointer so recovery can reconstruct the memtable. This means:
+
+- **Write path**: value → vLog (durable) → WAL (pointer only) → memtable
+- **Recovery**: replay WAL; for entries with ValuePointer, the pointer is already correct — no vLog re-read needed
+- **Crash before vLog sync**: the WAL entry is also incomplete (write ordering), so the entry is lost — this is the same guarantee as a non-separated write
+
 ## Performance Considerations
 
 ### Write Path
@@ -1248,6 +1267,10 @@ Because vLog files are append-only and written before their corresponding SSTs, 
 3. **Parallel GC**: Concurrent garbage collection across multiple files
 4. **vLog Index**: In-memory index for faster lookups
 5. **Value Caching**: Dedicated cache for hot values
+6. **Batch GC CAS**: Batch `compare_and_set_with_kind` calls for live entries during GC to reduce atomic operation overhead and contention with user writes
+7. **Lock-free vLog writer**: Replace the `active_writer` Mutex with a lock-free append buffer, dedicated writer thread with request channel, or multiple active vLog files to improve write concurrency
+8. **Pre-created vLog rotation**: Prepare the next vLog file in the background so rotation doesn't block the writer with synchronous file creation
+9. **Remove VALUE_POINTER_TAG**: If the 1-byte tag overhead becomes a bottleneck, remove it and rely solely on KvKind for classification (encoded size drops from 17 to 16 bytes)
 
 ## References
 
