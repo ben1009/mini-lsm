@@ -359,13 +359,16 @@ impl SsTableBuilder {
             (&self.vlog_buffer[..ValuePointer::encoded_size()], KvKind::ValuePointer)
         } else {
             // During compaction, values may already be encoded ValuePointers.
-            // Use KvKind metadata (authoritative) rather than try_decode alone.
+            // Detect existing pointers and preserve KvKind so readers dereference
+            // them correctly instead of returning raw pointer bytes.
+            let mut kind = KvKind::Inline;
             if value.len() == ValuePointer::encoded_size() && value[0] == VALUE_POINTER_TAG {
                 if let Some(vptr) = ValuePointer::try_decode(value) {
                     self.referenced_vlogs.insert(vptr.file_id);
+                    kind = KvKind::ValuePointer;
                 }
             }
-            (value, KvKind::Inline)
+            (value, kind)
         };
 
         // Each block entry now carries (key, value, KvKind) so that the
@@ -410,6 +413,26 @@ pub struct PendingDeletion {
     file_id: u32,
     /// The engine timestamp / epoch at the moment GC retired this file.
     obsolete_at_ts: u64,
+}
+
+/// RAII guard for a cached vLog reader. Automatically decrements the
+/// ValueLog's reader_refcount when dropped, preventing retired vLog files
+/// from being unlinked while an iterator or snapshot still reads them.
+pub struct ValueLogReaderHandle {
+    reader: Arc<ValueLogReader>,
+    vlog: ValueLog,  // Clone (Arc-backed) for drop-time release
+    file_id: u32,
+}
+
+impl std::ops::Deref for ValueLogReaderHandle {
+    type Target = ValueLogReader;
+    fn deref(&self) -> &Self::Target { &self.reader }
+}
+
+impl Drop for ValueLogReaderHandle {
+    fn drop(&mut self) {
+        self.vlog.release_reader(self.file_id);
+    }
 }
 
 /// Manages value log files for the storage engine.
@@ -503,13 +526,14 @@ impl ValueLog {
     }
 
     /// Get a cached reader for the specified vLog file.
-    fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
+    /// Returns a RAII guard that decrements the refcount on drop.
+    fn get_reader(&self, file_id: u32) -> Result<ValueLogReaderHandle> {
         let reader = self.readers.try_get_with(file_id, || {
             ValueLogReader::open(self.path_of_file(file_id)).map(Arc::new)
         }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))?;
         // Track open-reader reference count for safe deferred deletion.
         *self.reader_refcounts.write().entry(file_id).or_insert(0) += 1;
-        Ok(reader)
+        Ok(ValueLogReaderHandle { reader, vlog: self.clone(), file_id })
     }
 
     /// Decrements the reference count for a vLog file reader.
@@ -807,10 +831,21 @@ impl CompactionController {
             // SST builders register references automatically during finalization.
         }
 
+        // Clean up vLog references for input SSTs that are being replaced.
+        // Without this, get_ssts_referencing() would still return stale SST IDs,
+        // preventing reclaim_pending_deletions() from ever unlinking retired vLogs.
+        for sst_id in input_ssts {
+            vlog.unregister_sst_references(*sst_id);
+        }
+
         Ok(())
     }
 }
 ```
+
+**Important**: `unregister_sst_references(sst_id)` removes the SST's entry from the
+`sst_to_vlogs` mapping. This must be called whenever an SST is deleted (compaction,
+manual removal) to prevent leaked references that block vLog space reclamation.
 
 ## Implementation Plan
 
