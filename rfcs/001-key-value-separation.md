@@ -610,24 +610,28 @@ impl ValueLog {
         let reader = self.readers.try_get_with(file_id, || {
             ValueLogReader::open(self.path_of_file(file_id)).map(Arc::new)
         }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))?;
-        // Get or create per-file atomic counter. Write lock only on first access.
-        let counter = self.reader_refcounts
-            .write()
-            .entry(file_id)
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
+        // Get or create per-file atomic counter. Read lock first to avoid
+        // contention on the common path (counter already exists).
+        let counter = if let Some(c) = self.reader_refcounts.read().get(&file_id) {
+            c.clone()
+        } else {
+            self.reader_refcounts
+                .write()
+                .entry(file_id)
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone()
+        };
         counter.fetch_add(1, Ordering::Relaxed);
         Ok(ValueLogReaderHandle { reader, vlog: self.clone(), file_id, counter })
     }
 
     /// Decrements the reference count for a vLog file reader.
     /// Called when a `ValueLogReaderHandle` is dropped.
-    fn release_reader(&self, file_id: u32, counter: &AtomicUsize) {
+    /// Counter map entries are NOT removed here to avoid write-lock contention
+    /// on the hot path. Stale entries are cleaned up periodically by
+    /// `cleanup_stale_counters` or left in place (they are small).
+    fn release_reader(&self, _file_id: u32, counter: &AtomicUsize) {
         counter.fetch_sub(1, Ordering::Relaxed);
-        // Clean up map entry when count reaches zero (best-effort).
-        if counter.load(Ordering::Relaxed) == 0 {
-            self.reader_refcounts.write().remove(&file_id);
-        }
     }
 
     /// Returns the current open-reader reference count for a vLog file.
@@ -1234,11 +1238,14 @@ Because vLog files are append-only and written before their corresponding SSTs, 
 
 ### WAL Interaction
 
-To avoid doubling write amplification by writing large values to both the WAL and the vLog, the WAL should store only the `ValuePointer` for separated values (not the full value). The vLog write is the durable copy; the WAL entry just records the pointer so recovery can reconstruct the memtable. This means:
+To avoid doubling write amplification by writing large values to both the WAL and the vLog, the WAL stores only the `ValuePointer` for separated values (not the full value). The vLog write must be synced **before** the WAL entry is committed to prevent dangling pointers on crash:
 
-- **Write path**: value → vLog (durable) → WAL (pointer only) → memtable
-- **Recovery**: replay WAL; for entries with ValuePointer, the pointer is already correct — no vLog re-read needed
+- **Write path**: value → vLog append → **vLog sync** → WAL (pointer only) → memtable
+- **Recovery**: replay WAL; for entries with ValuePointer, the pointer is already durable — no vLog re-read needed
 - **Crash before vLog sync**: the WAL entry is also incomplete (write ordering), so the entry is lost — this is the same guarantee as a non-separated write
+- **Crash after WAL commit**: vLog is guaranteed synced (ordering above), so the pointer is always valid
+
+**Performance note**: the extra `sync()` call on the vLog adds latency per separated write. This can be amortized by batching multiple vLog appends before a single sync (group commit), which is the natural result of the Mutex on `active_writer`.
 
 ## Performance Considerations
 
