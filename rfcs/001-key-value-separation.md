@@ -486,7 +486,7 @@ impl ValueLog {
         
         // Rotate to new file if current is full
         if writer.size() >= self.options.max_vlog_file_size {
-            writer = self.rotate_vlog_file(writer)?;
+            self.rotate_vlog_file(&mut writer)?;
         }
         
         writer.append(key, value)
@@ -530,9 +530,15 @@ impl ValueLog {
 
     /// Read a value using a ValuePointer. Returns only the value bytes
     /// (the caller never needs to see the vLog header or key).
-    pub fn read(self: &Arc<ValueLog>, ptr: &ValuePointer) -> Result<Bytes> {
+    /// `expected_key` is validated against the stored key to detect stale or
+    /// corrupted pointers that land on a different entry's offset.
+    pub fn read(self: &Arc<ValueLog>, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
         let reader = self.get_reader(ptr.file_id)?;
         let entry = reader.read_entry(ptr.offset, ptr.size)?;
+        if entry.key != expected_key {
+            anyhow::bail!("vLog key mismatch at offset {}: expected {:?}, found {:?}",
+                ptr.offset, expected_key, entry.key);
+        }
         Ok(Bytes::from(entry.value))
     }
 
@@ -629,8 +635,8 @@ impl ValueLog {
                 && self.reader_refcount(p.file_id) == 0
                 && self.get_ssts_referencing(p.file_id).is_empty();
             if safe {
-                let _ = self.remove_file(p.file_id);
-                false // drop from queue
+                // Keep the entry in the queue if unlink fails so it can be retried.
+                self.remove_file(p.file_id).is_err()
             } else {
                 true // keep, retry later
             }
@@ -746,10 +752,12 @@ impl GarbageCollector {
             // overwritten. Implementations without explicit CAS can serialize
             // GC writes with the write batch lock and re-check `is_entry_live`
             // inside the critical section.
+            let mut expected_buf = Vec::with_capacity(ValuePointer::encoded_size());
+            entry.ptr.encode(&mut expected_buf);
             self.lsm.compare_and_set(
                 &entry.key,
-                /* expected = */ &entry.ptr,
-                /* new      = */ &buf,
+                &expected_buf,
+                &buf,
             )?;
         }
 
