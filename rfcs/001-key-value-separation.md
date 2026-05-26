@@ -607,7 +607,14 @@ impl ValueLog {
 
         let mut writer = self.active_writer.lock();
 
-        // Rotate to new file if current is full
+        // Rotate to new file if current is full.
+        // NOTE: rotate_vlog_file must NOT write to the manifest directly,
+        // because ValueLog::write does not hold the state_lock and acquiring
+        // it here would create an AB-BA deadlock (active_writer → state_lock
+        // vs. state_lock → active_writer in flush/compaction paths). Instead,
+        // rotation just creates the new file; the manifest NewVlogFile record
+        // is written by the caller (flush or compaction) which already holds
+        // the state_lock.
         if writer.size() >= self.options.max_vlog_file_size {
             self.rotate_vlog_file(&mut writer)?;
         }
@@ -1063,11 +1070,16 @@ impl CompactionController {
         self.gc_pool.spawn(move || {
             let gc = GarbageCollector::new(vlog.clone(), lsm, vlog.options().gc_threshold_ratio);
             for file_id in affected_vlogs {
+                // Skip if another GC task is already processing this file.
+                if !gc.try_acquire_gc_lock(file_id) {
+                    continue;
+                }
                 if let Ok(analysis) = gc.analyze_file(file_id) {
                     if analysis.stale_ratio >= vlog.options().gc_threshold_ratio {
                         let _ = gc.compact_file(&analysis);
                     }
                 }
+                gc.release_gc_lock(file_id);
             }
         });
 
@@ -1086,11 +1098,20 @@ impl CompactionController {
         }
 
         // Clean up vLog references for input SSTs that are being replaced.
-        // Without this, get_ssts_referencing() would still return stale SST IDs,
-        // preventing reclaim_pending_deletions() from ever unlinking retired vLogs.
-        for sst_id in input_ssts {
-            vlog.unregister_sst_references(*sst_id);
-        }
+        // DEFERRED: Do NOT unregister immediately here. Active snapshots or
+        // long-running iterators may still hold Arc<SsTable> references to
+        // these input SSTs. If we unregister now and GC runs, it could see
+        // get_ssts_referencing().is_empty() and delete the vLog file while
+        // those iterators still need it.
+        //
+        // Instead, defer unregistration to SsTable::drop (or a drop token/
+        // callback). This guarantees a vLog file is never physically deleted
+        // while any snapshot or iterator holds a reference to an SST that
+        // points to it.
+        //
+        // for sst_id in input_ssts {
+        //     vlog.unregister_sst_references(*sst_id);
+        // }
 
         Ok(())
     }
