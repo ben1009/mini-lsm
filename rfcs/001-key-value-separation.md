@@ -114,6 +114,13 @@ pub enum KvKind {
     /// The value is a 17-byte encoded `ValuePointer` that references the vLog.
     ValuePointer = 1,
 }
+// NOTE: KvKind is stored per-entry in SST block metadata (not in the
+// memtable or WAL). During normal writes the memtable stores full values,
+// so the read path never needs KvKind from the memtable. During GC rewrites
+// the memtable receives a ValuePointer entry — the reader distinguishes it
+// by the VALUE_POINTER_TAG prefix byte (0xFF) which is reserved and cannot
+// appear as the first byte of a valid user value. This avoids changing the
+// memtable/WAL format.
 
 impl KvKind {
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -259,6 +266,13 @@ pub struct VlogEntryHeader {
     pub flags: u16,           // Flags (tombstone, etc.) (2 bytes)
     pub _padding: [u8; 4],    // Reserved / padding to a 16-byte total
 }
+// NOTE: The CRC32 covers the rest of the header + key + value, so a
+// header-only iterator (which skips the value payload) cannot validate
+// the checksum. To allow header-only validation and resynchronization
+// after corruption, the on-disk format should prepend a 4-byte magic
+// marker (e.g., 0x76_4C_6F_67 = "vLog") before each entry header.
+// A header-only scanner can then skip forward to the next magic marker
+// if the current header's fields are implausible (e.g., value_len > max).
 
 const HEADER_SIZE: usize = 16; // VlogEntryHeader is always 16 bytes
 const ALIGNMENT: usize = 8;
@@ -282,28 +296,28 @@ impl ValueLogBuilder {
     /// to the next `ALIGNMENT` (8-byte) boundary. The pad bytes are written to
     /// disk *and* counted in `ValuePointer::size`, so a reader can validate
     /// the entry and advance to the next one without re-reading the header.
-    pub fn add(&mut self, key: &[u8], value: &[u8]) -> ValuePointer {
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
         let offset = self.writer.offset();
 
         // Validate BEFORE writing to avoid corrupting the vLog with an oversized entry.
         let entry_size = HEADER_SIZE + key.len() + value.len();
         let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
         let total = entry_size + padding;
-        assert!(
+        anyhow::ensure!(
             total <= u32::MAX as usize,
             "vLog entry size {} exceeds u32 capacity — increase max_value_size or reduce key/value size",
             total
         );
 
-        let written = self.writer.append(key, value);
+        let written = self.writer.append(key, value)?;
         debug_assert_eq!(written, total);
         debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
 
-        ValuePointer {
+        Ok(ValuePointer {
             file_id: self.file_id,
             offset,
             size: total as u32,
-        }
+        })
     }
 }
 ```
@@ -389,8 +403,8 @@ impl SsTableBuilder {
     /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
     /// fsynced before the SST entry is written, so every pointer is durable.
     /// Backward-compatible wrapper: defaults to `input_kind = None` (flush path).
-    pub fn add(&mut self, key: KeySlice, value: &[u8]) {
-        self.add_with_kind(key, value, None);
+    pub fn add(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
+        self.add_with_kind(key, value, None)
     }
 
     /// Add a key-value pair to the builder with an explicit KvKind.
@@ -400,7 +414,7 @@ impl SsTableBuilder {
     /// When `input_kind` is `None` (flush path), this method writes large values
     /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
     /// fsynced before the SST file is written, so every pointer is durable.
-    pub fn add_with_kind(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) {
+    pub fn add_with_kind(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) -> Result<()> {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
         }
@@ -428,7 +442,7 @@ impl SsTableBuilder {
             }
             (value, k)
         } else if self.should_separate_value(key, value) {
-            let vptr = self.write_to_vlog(key, value);
+            let vptr = self.write_to_vlog(key, value)?;
             // Encode into a local Vec — avoids borrow checker conflict with
             // self.finish_block() below. The buffer is small (17 bytes) and
             // only allocated on the separation path, so the cost is negligible.
@@ -443,20 +457,21 @@ impl SsTableBuilder {
         // reader can classify the value without guessing from the payload.
         if self.builder.add_with_kind(key, value_to_store, kind) {
             self.last_key.set_from_slice(key);
-            return;
+            return Ok(());
         }
 
         self.finish_block();
         self.first_key.set_from_slice(key);
         assert!(self.builder.add_with_kind(key, value_to_store, kind));
         self.last_key.set_from_slice(key);
+        Ok(())
     }
 
     /// Write a key-value pair to the active vLog builder and return a pointer.
-    fn write_to_vlog(&mut self, key: KeySlice, value: &[u8]) -> ValuePointer {
-        let ptr = self.vlog_builder.as_mut().unwrap().add(key.raw_ref(), value);
+    fn write_to_vlog(&mut self, key: KeySlice, value: &[u8]) -> Result<ValuePointer> {
+        let ptr = self.vlog_builder.as_mut().unwrap().add(key.raw_ref(), value)?;
         self.referenced_vlogs.insert(ptr.file_id);
-        ptr
+        Ok(ptr)
     }
 
     fn should_separate_value(&self, key: KeySlice, value: &[u8]) -> bool {
@@ -551,6 +566,10 @@ pub struct ValueLog {
     /// Used by `reclaim_pending_deletions` to ensure a file is not deleted
     /// while an iterator or snapshot still holds an open handle.
     reader_refcounts: RwLock<HashMap<u32, Arc<AtomicUsize>>>,
+
+    /// Reference to the manifest for writing NewVlogFile/DeleteVlogFile
+    /// records during file rotation and deletion.
+    manifest: Arc<Manifest>,
 }
 
 impl ValueLog {
