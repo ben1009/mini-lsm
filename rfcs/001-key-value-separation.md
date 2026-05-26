@@ -245,11 +245,13 @@ pub struct VlogFileHeader {
 /// between the declared fields. The trailing `_padding` brings the total to a
 /// flat 16 bytes and preserves the file's 8-byte alignment guarantee.
 ///
-/// **Portability note:** `#[repr(C)]` guarantees field order and size but not
-/// endianness. All serialization code MUST use explicit little-endian encoding
-/// (e.g., `u32::to_le_bytes()`) rather than `std::mem::transmute`, so the
-/// on-disk format is architecture-independent.
-#[repr(C)]
+/// **Serialization note:** Do NOT cast raw byte buffers to `&VlogEntryHeader`
+/// — vLog entries are read from arbitrary file offsets where 4-byte alignment
+/// is not guaranteed, making pointer casts undefined behavior.  Instead,
+/// serialize/deserialize each field individually using explicit little-endian
+/// encoding (e.g., `bytes::Buf::get_u32_le()` / `bytes::BufMut::put_u32_le()`).
+/// This also makes `#[repr(C)]` and `std::mem::size_of` unnecessary; the
+/// header is always exactly 16 bytes by construction.
 pub struct VlogEntryHeader {
     pub crc32: u32,           // CRC32 of the rest of the header + key + value (4 bytes)
     pub value_len: u32,       // Value length (max 4GB) (4 bytes)
@@ -258,7 +260,7 @@ pub struct VlogEntryHeader {
     pub _padding: [u8; 4],    // Reserved / padding to a 16-byte total
 }
 
-const HEADER_SIZE: usize = std::mem::size_of::<VlogEntryHeader>(); // 16
+const HEADER_SIZE: usize = 16; // VlogEntryHeader is always 16 bytes
 const ALIGNMENT: usize = 8;
 ```
 
@@ -282,25 +284,21 @@ impl ValueLogBuilder {
     /// the entry and advance to the next one without re-reading the header.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> ValuePointer {
         let offset = self.writer.offset();
-        let payload = HEADER_SIZE + key.len() + value.len();
-        let padded = (payload + ALIGNMENT - 1) & !(ALIGNMENT - 1);
-        let pad = padded - payload;
 
         // Validate BEFORE writing to avoid corrupting the vLog with an oversized entry.
+        let total = self.writer.append(key, value);
         assert!(
-            padded <= u32::MAX as usize,
+            total <= u32::MAX as usize,
             "vLog entry size {} exceeds u32 capacity — increase max_value_size or reduce key/value size",
-            padded
+            total
         );
-
-        self.writer.append_with_pad(key, value, pad);
 
         debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
 
         ValuePointer {
             file_id: self.file_id,
             offset,
-            size: padded as u32,
+            size: total as u32,
         }
     }
 }
@@ -856,11 +854,12 @@ impl GarbageCollector {
     /// entry becomes orphaned (unreferenced by any SST).
     ///
     /// **Orphan reclamation**: entries written to the new vLog before a failed
-    /// CAS are unreferenced but occupy space. Two strategies:
-    /// (a) Track a "committed watermark" per vLog file — entries above the
-    ///     watermark are treated as dead by the next GC pass.
-    /// (b) Use a tombstone marker: on CAS failure, write a zero-length tombstone
-    ///     entry so the reader knows to skip it and the GC can reclaim the space.
+    /// CAS are unreferenced but occupy space. No special watermark or tombstone
+    /// tracking is needed — the LSM tree is the authoritative source of truth
+    /// for liveness.  During the next GC pass of the new vLog file,
+    /// `check_liveness` will return `false` for any orphaned entries (they are
+    /// not pointed to by any SST), so they are naturally reclaimed by the
+    /// standard GC mechanism.
     pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<()> {
         if analysis.stale_ratio < self.threshold {
             return Ok(());
@@ -1010,11 +1009,16 @@ impl CompactionController {
             }
         });
 
-        // Register vLog references for output SSTs.
+        // Register vLog references for output SSTs BEFORE removing input refs.
         // SsTableBuilder is a low-level component without access to ValueLog.
         // Registration is handled by the storage engine (LsmStorageInner) when
         // it receives the finalized SST: the builder exposes its referenced_vlogs
         // set via a getter, and the engine calls vlog.register_sst_references().
+        //
+        // CRITICAL: output registration must precede input unregistration.
+        // Otherwise reclaim_pending_deletions() can observe an empty
+        // get_ssts_referencing(file_id) for a still-live vLog file and unlink
+        // it, causing read failures or data loss.
         for sst_id in output_ssts {
             // Engine registers: builder.get_referenced_vlogs() → vlog.register_sst_references(sst_id, vlogs)
         }
@@ -1261,22 +1265,26 @@ O(total SST count) once vLog adoption grows.
 ```rust
 #[derive(Serialize, Deserialize)]
 pub enum ManifestRecord {
-    /// Flush of a memtable to L0. Carries the vLog files this new SST
-    /// references (empty if the SST has no separated values).
-    /// `#[serde(default)]` ensures old manifests without vLog data still parse.
-    Flush(usize, #[serde(default)] Vec<u32>),
+    /// Flush of a memtable to L0. Original variant kept for backward compat.
+    Flush(usize),
+
+    /// Flush with vLog references. Named fields so serde_json can deserialize
+    /// even when the `vlogs` key is absent from old manifests.
+    FlushV2 { sst_id: usize, #[serde(default)] vlogs: Vec<u32> },
 
     NewMemtable(usize),
 
     /// Compaction output. For each output SST, record the set of vLog files
     /// it references so the SST → vLog map is reconstructable from the
     /// manifest alone.
-    // NOTE: serde(default) on a tuple variant field works with bincode but may
-    // not work with all serde formats (e.g., serde_json requires the field to
-    // be optional or have a default for each element). Since the manifest uses
-    // bincode this is safe, but if the format ever changes this line must be
-    // revisited. An alternative is to introduce a CompactionV2 variant.
-    Compaction(CompactionTask, #[serde(default)] Vec<(usize, Vec<u32>)>),
+    // NOTE: The manifest uses serde_json, and #[serde(default)] on a tuple
+    // variant field does NOT work with serde_json (it cannot deserialize a
+    // single-element JSON array into a two-element Rust tuple). To preserve
+    // backward compatibility with existing manifests, keep the original
+    // variants unchanged and introduce new V2 variants with named fields.
+    // The recovery code should accept both old and new variants.
+    Compaction(CompactionTask, Vec<usize>),
+    CompactionV2 { task: CompactionTask, output_ssts: Vec<(usize, Vec<u32>)> },
 
     /// vLog file lifecycle.
     NewVlogFile(u32),
@@ -1284,18 +1292,20 @@ pub enum ManifestRecord {
 }
 ```
 
-Recovery walks the manifest as before; for every `Flush` / `Compaction` record
-it calls `register_sst_references(sst_id, vlog_ids)` to populate **both**
-`sst_to_vlogs` and `vlog_to_ssts` indexes. SSTable footers still embed the
-vLog reference list as a redundant copy, used by `fsck`-style consistency
-checks and by older snapshots whose manifest record predates this format.
+Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
+`Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
+vlog_ids)` to populate **both** `sst_to_vlogs` and `vlog_to_ssts` indexes.
+Old `Flush(usize)` and `Compaction(usize, Vec<usize>)` records are treated as
+having an empty vLog set. SSTable footers still embed the vLog reference list
+as a redundant copy, used by `fsck`-style consistency checks and by older
+snapshots whose manifest record predates this format.
 
 ## Crash Recovery
 
 The WAL stores full values for user writes, so crash recovery for the normal write path does not depend on vLog pointers at all. Recovery proceeds in three phases:
 
 1. **WAL replay**: rebuilds the memtable with full values — identical to a non-separated engine. No vLog validation needed for user writes.
-2. **Manifest replay**: for every `Flush` / `Compaction` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
+2. **Manifest replay**: for every `Flush` / `FlushV2` / `Compaction` / `CompactionV2` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
 3. **Orphan vLog cleanup**: scan the data directory for `.vlog` files. Any file not referenced by a `NewVlogFile` manifest record, by any SST's vLog reference list, **or by the WAL-recovered memtable** is orphaned and deleted. The memtable check is critical: GC's `compare_and_set_with_kind` writes `ValuePointer` entries to the memtable (and WAL), so after WAL replay these pointers must remain valid. Deleting a vLog file reachable only through the recovered memtable would cause read failures.
 
 **Flush-time crash safety**: vLog writes are fsynced (batch, once per flush) before the SST is written to disk. If a crash occurs:
