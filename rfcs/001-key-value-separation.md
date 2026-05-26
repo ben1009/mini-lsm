@@ -244,6 +244,11 @@ pub struct VlogFileHeader {
 /// keeps the C struct layout naturally 4-byte-aligned with no implicit padding
 /// between the declared fields. The trailing `_padding` brings the total to a
 /// flat 16 bytes and preserves the file's 8-byte alignment guarantee.
+///
+/// **Portability note:** `#[repr(C)]` guarantees field order and size but not
+/// endianness. All serialization code MUST use explicit little-endian encoding
+/// (e.g., `u32::to_le_bytes()`) rather than `std::mem::transmute`, so the
+/// on-disk format is architecture-independent.
 #[repr(C)]
 pub struct VlogEntryHeader {
     pub crc32: u32,           // CRC32 of the rest of the header + key + value (4 bytes)
@@ -400,6 +405,11 @@ impl SsTableBuilder {
 
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
+        // Local buffer for encoded ValuePointer — declared here so its slice
+        // reference can be used in the `value_to_store` binding below without
+        // borrow checker conflicts with self.finish_block().
+        let mut local_buf = Vec::new();
+
         // Determine value-to-store and KvKind.
         //
         // During compaction the caller passes `input_kind` from the source SST's
@@ -418,12 +428,11 @@ impl SsTableBuilder {
         } else if self.should_separate_value(key, value) {
             let vptr = self.write_to_vlog(key, value);
             // Encode into a local Vec — avoids borrow checker conflict with
-            // self.finish_block() below (self.vlog_buffer would hold &mut self).
-            // The buffer is small (17 bytes) and only allocated on the separation
-            // path, so the cost is negligible.
-            let mut local_buf = Vec::with_capacity(ValuePointer::encoded_size());
+            // self.finish_block() below. The buffer is small (17 bytes) and
+            // only allocated on the separation path, so the cost is negligible.
+            local_buf.reserve(ValuePointer::encoded_size());
             vptr.encode(&mut local_buf);
-            return self.add_with_kind(key, &local_buf, Some(KvKind::ValuePointer));
+            (local_buf.as_slice(), KvKind::ValuePointer)
         } else {
             (value, KvKind::Inline)
         };
@@ -1262,6 +1271,11 @@ pub enum ManifestRecord {
     /// Compaction output. For each output SST, record the set of vLog files
     /// it references so the SST → vLog map is reconstructable from the
     /// manifest alone.
+    // NOTE: serde(default) on a tuple variant field works with bincode but may
+    // not work with all serde formats (e.g., serde_json requires the field to
+    // be optional or have a default for each element). Since the manifest uses
+    // bincode this is safe, but if the format ever changes this line must be
+    // revisited. An alternative is to introduce a CompactionV2 variant.
     Compaction(CompactionTask, #[serde(default)] Vec<(usize, Vec<u32>)>),
 
     /// vLog file lifecycle.
