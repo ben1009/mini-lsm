@@ -154,9 +154,9 @@ impl ValuePointer {
     /// Layout (17 bytes): `[tag:1][file_id:4][offset:8][size:4]`
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.put_u8(VALUE_POINTER_TAG);
-        buf.put_u32(self.file_id);
-        buf.put_u64(self.offset);
-        buf.put_u32(self.size);
+        buf.put_u32_le(self.file_id);
+        buf.put_u64_le(self.offset);
+        buf.put_u32_le(self.size);
     }
 
     /// Decode from bytes. Returns an error if the buffer is malformed.
@@ -169,9 +169,9 @@ impl ValuePointer {
             return Err(anyhow!("ValuePointer tag mismatch: expected 0x{:02X}, got 0x{:02X}", VALUE_POINTER_TAG, tag));
         }
         Ok(Self {
-            file_id: buf.get_u32(),
-            offset: buf.get_u64(),
-            size: buf.get_u32(),
+            file_id: buf.get_u32_le(),
+            offset: buf.get_u64_le(),
+            size: buf.get_u32_le(),
         })
     }
 
@@ -190,9 +190,9 @@ impl ValuePointer {
         // and anyhow error construction in the hot path.
         let mut b = &buf[1..];
         Some(Self {
-            file_id: b.get_u32(),
-            offset: b.get_u64(),
-            size: b.get_u32(),
+            file_id: b.get_u32_le(),
+            offset: b.get_u64_le(),
+            size: b.get_u32_le(),
         })
     }
 
@@ -301,6 +301,11 @@ impl ValueLogBuilder {
         let offset = self.writer.offset();
 
         // Validate BEFORE writing to avoid corrupting the vLog with an oversized entry.
+        anyhow::ensure!(
+            key.len() <= u16::MAX as usize,
+            "key length {} exceeds vLog header u16 capacity",
+            key.len()
+        );
         let entry_size = HEADER_SIZE + key.len() + value.len();
         let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
         let total = entry_size + padding;
@@ -620,6 +625,18 @@ impl ValueLog {
     /// Updates both forward and reverse indexes atomically under one lock.
     pub fn register_sst_references(&self, sst_id: usize, vlog_ids: HashSet<u32>) {
         let mut refs = self.vlog_refs.write();
+        // Unregister any existing references for this SST first to prevent
+        // stale entries in the reverse index from leaking.
+        if let Some(old_vlogs) = refs.sst_to_vlogs.remove(&sst_id) {
+            for vlog_id in old_vlogs {
+                if let Some(ssts) = refs.vlog_to_ssts.get_mut(&vlog_id) {
+                    ssts.remove(&sst_id);
+                    if ssts.is_empty() {
+                        refs.vlog_to_ssts.remove(&vlog_id);
+                    }
+                }
+            }
+        }
         for vlog_id in &vlog_ids {
             refs.vlog_to_ssts.entry(*vlog_id).or_default().insert(sst_id);
         }
@@ -665,11 +682,12 @@ impl ValueLog {
     pub fn read(self: &Arc<ValueLog>, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
         // Defensive validation: a corrupted ptr.size (up to u32::MAX) could
         // cause an OOM panic in read_entry. Reject implausible sizes early.
+        let min_entry = HEADER_SIZE + expected_key.len();
         let max_entry = self.options.max_value_size + HEADER_SIZE + expected_key.len() + ALIGNMENT;
         anyhow::ensure!(
-            ptr.size as usize <= max_entry,
-            "ValuePointer size {} exceeds maximum allowed entry size {}",
-            ptr.size, max_entry
+            ptr.size as usize >= min_entry && ptr.size as usize <= max_entry,
+            "ValuePointer size {} is invalid (must be between {} and {})",
+            ptr.size, min_entry, max_entry
         );
         let reader = self.get_reader(ptr.file_id)?;
         let entry = reader.read_entry(ptr.offset, ptr.size)?;
@@ -700,7 +718,7 @@ impl ValueLog {
                 .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
                 .clone()
         };
-        counter.fetch_add(1, Ordering::Acquire);
+        counter.fetch_add(1, Ordering::AcqRel);
         Ok(ValueLogReaderHandle { reader, vlog: self.clone(), file_id, counter })
     }
 
