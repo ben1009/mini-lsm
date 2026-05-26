@@ -281,15 +281,16 @@ impl ValueLogBuilder {
         let padded = (payload + ALIGNMENT - 1) & !(ALIGNMENT - 1);
         let pad = padded - payload;
 
-        self.writer.append_with_pad(key, value, pad);
-
-        debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
-
+        // Validate BEFORE writing to avoid corrupting the vLog with an oversized entry.
         assert!(
             padded <= u32::MAX as usize,
             "vLog entry size {} exceeds u32 capacity — increase max_value_size or reduce key/value size",
             padded
         );
+
+        self.writer.append_with_pad(key, value, pad);
+
+        debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
 
         ValuePointer {
             file_id: self.file_id,
@@ -369,7 +370,6 @@ pub struct SsTableBuilder {
     // `active_writer` during flush. Each concurrent flush gets its own file.
     vlog_options: Option<ValueSeparationOptions>,
     vlog_builder: Option<ValueLogBuilder>,
-    vlog_buffer: Vec<u8>,
     referenced_vlogs: HashSet<u32>,
 }
 
@@ -417,9 +417,13 @@ impl SsTableBuilder {
             (value, k)
         } else if self.should_separate_value(key, value) {
             let vptr = self.write_to_vlog(key, value);
-            self.vlog_buffer.clear();
-            vptr.encode(&mut self.vlog_buffer);
-            (&self.vlog_buffer[..ValuePointer::encoded_size()], KvKind::ValuePointer)
+            // Encode into a local Vec — avoids borrow checker conflict with
+            // self.finish_block() below (self.vlog_buffer would hold &mut self).
+            // The buffer is small (17 bytes) and only allocated on the separation
+            // path, so the cost is negligible.
+            let mut local_buf = Vec::with_capacity(ValuePointer::encoded_size());
+            vptr.encode(&mut local_buf);
+            return self.add_with_kind(key, &local_buf, Some(KvKind::ValuePointer));
         } else {
             (value, KvKind::Inline)
         };
@@ -1286,7 +1290,8 @@ The WAL stores full values for user writes, so crash recovery for the normal wri
 - **Partial vLog write**: detected by CRC32 mismatch and skipped during reads.
 
 **GC crash safety**: GC's `compact_file` fsyncs the new vLog BEFORE performing any CAS operations (Phase 1 → Phase 2 ordering). On crash:
-- **Before CAS is flushed to SST**: WAL replay restores the old ValuePointer (pre-CAS state). The new vLog file is orphaned but harmless — it will be cleaned up on the next GC pass or startup orphan sweep.
+- **Before CAS**: WAL replay restores the old ValuePointer (pre-CAS state). The new vLog file is orphaned but harmless — it will be cleaned up on the next GC pass or startup orphan sweep.
+- **After CAS, before SST flush**: WAL replay restores the NEW ValuePointer (post-CAS state). This is safe because the new vLog was fsynced before the CAS (Phase 1 ordering), so the pointer is always valid.
 - **After CAS is flushed to SST**: the new ValuePointer is durable in the SST. The new vLog file is referenced by the SST and will not be deleted.
 
 ### WAL Interaction
@@ -1309,7 +1314,7 @@ This design avoids the double-fsync problem entirely. The write path has exactly
 - **Crash before flush**: WAL replay rebuilds the memtable with full values — no vLog pointers to validate.
 - **Crash during flush**: the flush is atomic — either the SST (with valid vLog pointers) is committed to the manifest, or it is not. Partial vLog writes are detected by CRC32 mismatch and skipped.
 - **No dangling pointers**: because vLog writes are fsynced (batch, once per flush) before the SST is written, every `ValuePointer` in every SST is guaranteed to reference durable data.
-- **Orphan cleanup**: on startup, any `.vlog` file not referenced by the manifest or any SST is deleted.
+- **Orphan cleanup**: on startup, any `.vlog` file not referenced by the manifest, any SST, or the WAL-recovered memtable is deleted.
 
 ## Performance Considerations
 
