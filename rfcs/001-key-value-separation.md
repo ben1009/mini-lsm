@@ -266,13 +266,14 @@ pub struct VlogEntryHeader {
     pub flags: u16,           // Flags (tombstone, etc.) (2 bytes)
     pub _padding: [u8; 4],    // Reserved / padding to a 16-byte total
 }
-// NOTE: The CRC32 covers the rest of the header + key + value, so a
-// header-only iterator (which skips the value payload) cannot validate
-// the checksum. To allow header-only validation and resynchronization
-// after corruption, the on-disk format should prepend a 4-byte magic
-// marker (e.g., 0x76_4C_6F_67 = "vLog") before each entry header.
-// A header-only scanner can then skip forward to the next magic marker
-// if the current header's fields are implausible (e.g., value_len > max).
+// NOTE: To allow robust header-only validation and resynchronization
+// after corruption, the on-disk format should use a split checksum:
+// 1. A 4-byte CRC32 covering the header and key (allowing the header-only
+//    iterator to fully validate integrity and safely skip the value).
+// 2. A separate CRC32 covering the value payload.
+// The current single-CRC32 design means a corrupted value_len or key_len
+// cannot be detected without reading the full entry, which risks
+// desynchronization during header-only scans.
 
 const HEADER_SIZE: usize = 16; // VlogEntryHeader is always 16 bytes
 const ALIGNMENT: usize = 8;
@@ -662,6 +663,14 @@ impl ValueLog {
     /// `expected_key` is validated against the stored key to detect stale or
     /// corrupted pointers that land on a different entry's offset.
     pub fn read(self: &Arc<ValueLog>, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
+        // Defensive validation: a corrupted ptr.size (up to u32::MAX) could
+        // cause an OOM panic in read_entry. Reject implausible sizes early.
+        let max_entry = self.options.max_value_size + HEADER_SIZE + expected_key.len() + ALIGNMENT;
+        anyhow::ensure!(
+            ptr.size as usize <= max_entry,
+            "ValuePointer size {} exceeds maximum allowed entry size {}",
+            ptr.size, max_entry
+        );
         let reader = self.get_reader(ptr.file_id)?;
         let entry = reader.read_entry(ptr.offset, ptr.size)?;
         if entry.key != expected_key {
@@ -988,7 +997,7 @@ Because SSTs are immutable, old SSTs continue to contain pointers to the old vLo
 If a `get()` reads a stale pointer from an old SST after the old vLog file has been deleted, it will get an I/O error. To prevent this, GC must only delete old vLog files after:
 1. All live entries are rewritten to the new vLog file
 2. The new pointers are durably written to the LSM tree (via `sync()`)
-3. No active snapshots or iterators are reading the old file
+3. No active snapshots, iterators, or open SSTables are referencing the old file. This can be achieved by having each `SsTable` instance hold a shared reference/handle to the vLog files it references, keeping the files open and preventing physical deletion until the `SsTable` is dropped.
 
 **Deferred Deletion Strategy:**
 
@@ -1330,6 +1339,9 @@ pub enum ManifestRecord {
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
 vlog_ids)` to populate **both** `sst_to_vlogs` and `vlog_to_ssts` indexes.
+Additionally, for compaction records, it extracts the input SST IDs from the
+`CompactionTask` and calls `unregister_sst_references` for each, preventing
+reference leaks that would block vLog garbage collection.
 Old `Flush(usize)` and `Compaction(usize, Vec<usize>)` records are treated as
 having an empty vLog set. SSTable footers still embed the vLog reference list
 as a redundant copy, used by `fsck`-style consistency checks and by older
