@@ -286,13 +286,17 @@ impl ValueLogBuilder {
         let offset = self.writer.offset();
 
         // Validate BEFORE writing to avoid corrupting the vLog with an oversized entry.
-        let total = self.writer.append(key, value);
+        let entry_size = HEADER_SIZE + key.len() + value.len();
+        let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
+        let total = entry_size + padding;
         assert!(
             total <= u32::MAX as usize,
             "vLog entry size {} exceeds u32 capacity — increase max_value_size or reduce key/value size",
             total
         );
 
+        let written = self.writer.append(key, value);
+        debug_assert_eq!(written, total);
         debug_assert_eq!(self.writer.offset() % ALIGNMENT as u64, 0);
 
         ValuePointer {
@@ -418,9 +422,9 @@ impl SsTableBuilder {
         let (value_to_store, kind) = if let Some(k) = input_kind {
             // Compaction path: trust the caller's authoritative metadata.
             if k == KvKind::ValuePointer {
-                if let Some(vptr) = ValuePointer::try_decode(value) {
-                    self.referenced_vlogs.insert(vptr.file_id);
-                }
+                let vptr = ValuePointer::decode(value)
+                    .expect("failed to decode ValuePointer during compaction — metadata is authoritative");
+                self.referenced_vlogs.insert(vptr.file_id);
             }
             (value, k)
         } else if self.should_separate_value(key, value) {
@@ -583,7 +587,13 @@ impl ValueLog {
             self.rotate_vlog_file(&mut writer)?;
         }
 
-        writer.append(key, value)
+        let offset = writer.offset();
+        let total = writer.append(key, value)?;
+        Ok(ValuePointer {
+            file_id: writer.file_id(),
+            offset,
+            size: total as u32,
+        })
     }
 
     /// Register SST -> vLog references when an SST is finalized.
@@ -876,7 +886,13 @@ impl GarbageCollector {
         let mut rewrites: Vec<(Vec<u8>, ValuePointer, ValuePointer)> = Vec::new();
         for entry_ref in &analysis.live_entries {
             let value = self.vlog.read(&entry_ref.ptr, &entry_ref.key)?;
-            let new_ptr = writer.append(&entry_ref.key, &value)?;
+            let offset = writer.offset();
+            let total = writer.append(&entry_ref.key, &value)?;
+            let new_ptr = ValuePointer {
+                file_id: new_file_id,
+                offset,
+                size: total as u32,
+            };
             rewrites.push((entry_ref.key.clone(), entry_ref.ptr, new_ptr));
         }
 
