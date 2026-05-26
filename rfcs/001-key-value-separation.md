@@ -381,7 +381,19 @@ impl SsTableBuilder {
     /// When `input_kind` is `None` (flush path), this method writes large values
     /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
     /// fsynced before the SST entry is written, so every pointer is durable.
-    pub fn add(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) {
+    /// Backward-compatible wrapper: defaults to `input_kind = None` (flush path).
+    pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        self.add_with_kind(key, value, None);
+    }
+
+    /// Add a key-value pair to the builder with an explicit KvKind.
+    /// `input_kind`: pass `Some(KvKind)` during compaction (from source SST metadata),
+    /// or `None` for new writes (memtable flush) — the builder decides automatically.
+    ///
+    /// When `input_kind` is `None` (flush path), this method writes large values
+    /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
+    /// fsynced before the SST file is written, so every pointer is durable.
+    pub fn add_with_kind(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
         }
@@ -628,8 +640,10 @@ impl ValueLog {
         }).map_err(|e| anyhow!("Failed to open vlog {}: {}", file_id, e))?;
         // Get or create per-file atomic counter. Read lock first to avoid
         // contention on the common path (counter already exists).
-        let counter = if let Some(c) = self.reader_refcounts.read().get(&file_id) {
-            c.clone()
+        // Block expression drops the read guard before entering the else branch,
+        // preventing deadlock when upgrading to a write lock.
+        let counter = if let Some(c) = { self.reader_refcounts.read().get(&file_id).cloned() } {
+            c
         } else {
             self.reader_refcounts
                 .write()
@@ -637,7 +651,7 @@ impl ValueLog {
                 .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
                 .clone()
         };
-        counter.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Acquire);
         Ok(ValueLogReaderHandle { reader, vlog: self.clone(), file_id, counter })
     }
 
@@ -647,7 +661,10 @@ impl ValueLog {
     /// on the hot path. Stale entries are cleaned up periodically by
     /// `cleanup_stale_counters` or left in place (they are small).
     fn release_reader(&self, _file_id: u32, counter: &AtomicUsize) {
-        counter.fetch_sub(1, Ordering::Relaxed);
+        // Release ordering ensures all prior reads from the vLog file complete
+        // before the count is decremented. This prevents another thread from
+        // seeing count == 0 and deleting the file while reads are still in flight.
+        counter.fetch_sub(1, Ordering::Release);
     }
 
     /// Returns the current open-reader reference count for a vLog file.
@@ -657,7 +674,7 @@ impl ValueLog {
         self.reader_refcounts
             .read()
             .get(&file_id)
-            .map(|c| c.load(Ordering::Relaxed))
+            .map(|c| c.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
@@ -1257,17 +1274,20 @@ checks and by older snapshots whose manifest record predates this format.
 
 ## Crash Recovery
 
-The WAL stores full values, so crash recovery does not depend on vLog pointers at all. Recovery proceeds in two phases:
+The WAL stores full values for user writes, so crash recovery for the normal write path does not depend on vLog pointers at all. Recovery proceeds in three phases:
 
-1. **WAL replay**: rebuilds the memtable with full values — identical to a non-separated engine. No vLog validation needed.
+1. **WAL replay**: rebuilds the memtable with full values — identical to a non-separated engine. No vLog validation needed for user writes.
 2. **Manifest replay**: for every `Flush` / `Compaction` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
+3. **Orphan vLog cleanup**: scan the data directory for `.vlog` files. Any file not referenced by a `NewVlogFile` manifest record, by any SST's vLog reference list, **or by the WAL-recovered memtable** is orphaned and deleted. The memtable check is critical: GC's `compare_and_set_with_kind` writes `ValuePointer` entries to the memtable (and WAL), so after WAL replay these pointers must remain valid. Deleting a vLog file reachable only through the recovered memtable would cause read failures.
 
 **Flush-time crash safety**: vLog writes are fsynced (batch, once per flush) before the SST is written to disk. If a crash occurs:
 - **Before SST is committed to manifest**: the flush is incomplete — the memtable (rebuilt from WAL) still contains the full values. The partially written vLog and SST files are orphaned.
 - **After SST is committed to manifest**: all vLog pointers in the SST are guaranteed valid (vLog was fsynced first).
 - **Partial vLog write**: detected by CRC32 mismatch and skipped during reads.
 
-**Orphan cleanup on startup**: after WAL and manifest replay, the engine scans the data directory for `.vlog` files. Any file not referenced by a `NewVlogFile` manifest record (or by an SST's vLog reference list) is orphaned and deleted. This handles vLog files from crashed flushes that were never committed to the manifest.
+**GC crash safety**: GC's `compact_file` fsyncs the new vLog BEFORE performing any CAS operations (Phase 1 → Phase 2 ordering). On crash:
+- **Before CAS is flushed to SST**: WAL replay restores the old ValuePointer (pre-CAS state). The new vLog file is orphaned but harmless — it will be cleaned up on the next GC pass or startup orphan sweep.
+- **After CAS is flushed to SST**: the new ValuePointer is durable in the SST. The new vLog file is referenced by the SST and will not be deleted.
 
 ### WAL Interaction
 
