@@ -1316,10 +1316,13 @@ impl MiniLsm {
 ### CAS Semantics
 
 `compare_and_set_with_kind` is a **per-key** operation. It acquires the write
-batch lock (same lock used by `put`/`delete`), reads the current value + KvKind
-from the memtable, and performs the swap only if both match the expected
-(old, old_kind) pair. The entire get-check-put sequence is atomic with respect
-to user writes — no concurrent `put` or `delete` for the same key can interleave.
+batch lock (same lock used by `put`/`delete`), performs a full LSM tree lookup
+(via `get_with_kind` — memtable → immutable memtables → L0 → L1 → ...) to
+read the current value + KvKind, and performs the swap only if both match the
+expected (old, old_kind) pair. The entire get-check-put sequence is atomic with
+respect to user writes — no concurrent `put` or `delete` for the same key can
+interleave. The full lookup is essential because the key's latest version may
+have already been flushed to an SST and is no longer in the memtable.
 
 This means:
 
@@ -1543,7 +1546,10 @@ non-separated LSM tree. GC CAS rewrites store the encoded `ValuePointer` with
 without payload sniffing. Value separation for normal user writes still happens
 **during flush** (memtable → SST), not during the put path:
 
-- **Write path (put)**: value + `KvKind::Inline` → WAL → **WAL fsync** → memtable
+- **Write path (put)**: `max_value_size` validation → value + `KvKind::Inline` → WAL → **WAL fsync** → memtable.
+  Values exceeding `max_value_size` are rejected at `put`/`write_batch` time with
+  an error, preventing background flush failures. This validation is cheap (one
+  length check) and adds no latency.
 - **GC CAS path**: encoded `ValuePointer` + `KvKind::ValuePointer` → WAL → memtable
 - **Flush path**: scan memtable → for each entry with `value.len() >= min_value_size`:
   1. append value to vLog buffer (in-memory)
@@ -1566,10 +1572,12 @@ values, infrequent flushes), the following strategies can bound WAL size:
   the WAL exceeds a configurable threshold (e.g., 64MB), independent of the
   memtable size trigger. This caps recovery time at the cost of more frequent
   flushes.
-- **WAL value truncation** (future optimization): store a tombstone marker in the
-  WAL instead of the full value once the value has been fsynced to the vLog.
-  This requires a vLog fsync mid-flush (before the WAL marker is written) and
-  adds complexity, but eliminates WAL bloat entirely for separated values.
+- **Write-path separation** (future optimization): move value separation to the
+  `put` path instead of flush. The value is written to the vLog (with fsync)
+  first, then only the `ValuePointer` is stored in the WAL and memtable. This
+  eliminates WAL bloat entirely but adds a vLog fsync to the write latency
+  (one fsync per value instead of one per flush). Only worthwhile for workloads
+  where WAL size is the dominant bottleneck.
 - **Rate-limited writes**: under extreme memory pressure, back-pressure the write
   path until the current flush completes and the WAL can be rotated.
 
@@ -1636,9 +1644,11 @@ The following metrics should be exposed via `ValueLogStats` for monitoring:
 Background GC should not starve foreground I/O. The following controls bound GC
 resource usage:
 
-- **I/O budget**: limit GC reads to a configurable bytes/sec budget (e.g., 50MB/s).
-  The GC thread sleeps when the budget is exhausted, yielding I/O bandwidth to
-  foreground reads and flushes.
+- **I/O budget**: limit GC reads and writes to a configurable bytes/sec budget
+  (e.g., 50MB/s total). The GC thread sleeps when the budget is exhausted,
+  yielding I/O bandwidth to foreground reads and flushes. Both read and write
+  bandwidth must be tracked — on SSDs, write bandwidth is often the tighter
+  constraint and can trigger write stalls if not bounded.
 - **Concurrency cap**: limit the number of concurrent `compact_file` operations
   (default: 1). The `gc_pool` thread pool size controls this directly.
 - **Back-pressure**: if the pending-deletion queue or stale ratio exceeds a
@@ -1663,9 +1673,13 @@ Key-value separation is **opt-in** and backward-compatible:
    1 to 2 when vLog references are present. Readers that understand version 1
    will reject version 2 SSTs with a clear error. Upgrading the binary is
    required before enabling separation.
-4. **Manifest compatibility**: `FlushV2` and `CompactionV2` records use
-   `#[serde(default)]` so old readers can parse them (ignoring the vLog fields).
-   New readers handle both old and new variants.
+4. **Manifest compatibility**: `FlushV2` and `CompactionV2` are new enum variants
+   that old binaries **cannot** deserialize — serde will reject unknown variants
+   even with `#[serde(default)]` on the fields. This makes V2 manifest records
+   a **downgrade-incompatible** change. New readers handle both old and new
+   variants. Downgrading to an old binary after V2 records have been written
+   requires either (a) rewriting the manifest with only V1 variants, or (b)
+   using the rollback procedure below.
 
 ### Rollback
 
