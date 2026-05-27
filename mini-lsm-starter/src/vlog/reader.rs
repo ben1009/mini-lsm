@@ -74,6 +74,18 @@ impl ValueLogReader {
             HEADER_SIZE
         );
 
+        // Guard against OOM from corrupted pointers before allocating.
+        let file_len = self.file.metadata()?.len();
+        anyhow::ensure!(
+            offset
+                .checked_add(size as u64)
+                .is_some_and(|end| end <= file_len),
+            "entry offset {} and size {} exceeds file length {}",
+            offset,
+            size,
+            file_len
+        );
+
         // Read the entire entry in a single system call to minimize I/O overhead.
         let mut buf = vec![0u8; size];
         self.file.read_exact_at(&mut buf, offset).map_err(|e| {
