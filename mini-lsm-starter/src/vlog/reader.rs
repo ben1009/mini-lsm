@@ -1,9 +1,12 @@
+#[cfg(not(unix))]
+compile_error!("vLog reader currently requires Unix platforms");
+
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bytes::Buf;
 
 use super::{HEADER_SIZE, ValuePointer, VlogEntry, VlogEntryHeader, VlogFileHeader};
@@ -32,11 +35,17 @@ impl ValueLogReader {
     /// Open a vLog file and validate its file header.
     /// Reads and verifies the 16-byte `VlogFileHeader` at offset 0.
     pub fn open(path: PathBuf) -> Result<Self> {
-        let mut file = File::open(&path)?;
-        let file_len = file.metadata()?.len();
+        let mut file =
+            File::open(&path).with_context(|| format!("failed to open vLog file {:?}", path))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("failed to get metadata for vLog file {:?}", path))?
+            .len();
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
-        file.read_exact(&mut header_buf)?;
-        VlogFileHeader::decode(&header_buf)?;
+        file.read_exact(&mut header_buf)
+            .with_context(|| format!("failed to read header of vLog file {:?}", path))?;
+        VlogFileHeader::decode(&header_buf)
+            .with_context(|| format!("failed to decode header of vLog file {:?}", path))?;
         Ok(Self {
             file,
             path,
