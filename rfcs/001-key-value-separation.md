@@ -4,7 +4,7 @@
 **Author**: Mini-LSM Contributors  
 **Created**: 2026-03-08  
 **Target Version**: Post-Week 3  
-**Tracking Issue**: TBD
+**Tracking Issue**: N/A (design RFC, tracked via implementation tasks)
 
 ---
 
@@ -43,7 +43,7 @@ Consider a workload with:
 - Value size: 10 KB
 - Total data: 10 GB (100M key-value pairs)
 
-With leveled compaction (amplification ~10x), the system writes ~100 GB during compactions. With key-value separation, only ~1 GB of keys are rewritten, reducing amplification by **10x**.
+With leveled compaction (amplification ~10x), the system writes ~100 GB during compactions. With key-value separation, only ~1 GB of keys are rewritten — reducing compaction write amplification from ~100 GB to ~1 GB, a **10x reduction**.
 
 ## Design Overview
 
@@ -238,7 +238,8 @@ impl ValuePointer {
 /// Magic number for vLog file header
 const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
 
-/// Value log file header (first 16 bytes of each vLog file).
+/// Value log file header (first 16 bytes of each vLog file; distinct from the
+/// 24-byte per-entry `VlogEntryHeader` defined below).
 /// Serialized/deserialized field-by-field with explicit little-endian encoding
 /// (same as VlogEntryHeader — do NOT cast raw byte buffers to this struct).
 #[derive(Clone, Debug)]
@@ -466,6 +467,7 @@ impl SsTableBuilder {
 
         // Each block entry now carries (key, value, KvKind) so that the
         // reader can classify the value without guessing from the payload.
+        // add_with_kind returns true if the entry fit in the current block.
         if self.builder.add_with_kind(key, value_to_store, kind) {
             self.last_key.set_from_slice(key);
             return Ok(());
@@ -803,6 +805,11 @@ impl ValueLog {
     /// - all SSTs that referenced this `file_id` have been compacted away
     ///   (so no `get()` can produce a stale pointer to it).
     ///
+    /// **Caller contract**: `schedule_deletion` itself only enqueues the file.
+    /// The caller (`compact_file`) is responsible for ensuring the first two
+    /// preconditions are met — specifically, that all live entries have been
+    /// rewritten and the new pointers synced — before calling this method.
+    ///
     /// `obsolete_at_ts` is the engine's current commit timestamp / epoch at
     /// the moment GC retired the file, used by the watermark check.
     pub fn schedule_deletion(&self, file_id: u32) -> Result<()> {
@@ -835,6 +842,9 @@ impl ValueLog {
 ```
 
 ### 7. Garbage Collection
+
+> **Note**: GC uses `compare_and_set_with_kind` for atomic pointer rebinding.
+> See the [CAS Semantics](#cas-semantics) section for locking and atomicity details.
 
 Garbage collection is triggered during compaction when the ratio of stale data exceeds a threshold.
 
@@ -875,12 +885,26 @@ pub struct GarbageCollector {
     vlog: Arc<ValueLog>,
     lsm: Arc<MiniLsm>,
     threshold: f64,
+    /// Per-file GC locks: prevents two GC tasks from compacting the same file.
+    /// Keyed by vLog file ID.
+    gc_locks: Mutex<HashSet<u32>>,
 }
 
 impl GarbageCollector {
     /// Create a new garbage collector.
     pub fn new(vlog: Arc<ValueLog>, lsm: Arc<MiniLsm>, threshold: f64) -> Self {
-        Self { vlog, lsm, threshold }
+        Self { vlog, lsm, threshold, gc_locks: Mutex::new(HashSet::new()) }
+    }
+
+    /// Try to acquire the GC lock for a file. Returns false if another GC task
+    /// is already processing this file.
+    pub fn try_acquire_gc_lock(&self, file_id: u32) -> bool {
+        self.gc_locks.lock().insert(file_id)
+    }
+
+    /// Release the GC lock for a file.
+    pub fn release_gc_lock(&self, file_id: u32) {
+        self.gc_locks.lock().remove(&file_id);
     }
 
     /// Analyze a vLog file and determine which entries are still live.
@@ -953,6 +977,11 @@ impl GarbageCollector {
             let value = self.vlog.read(&entry_ref.ptr, &entry_ref.key)?;
             let offset = writer.offset();
             let total = writer.append(&entry_ref.key, &value)?;
+            anyhow::ensure!(
+                total <= u32::MAX as usize,
+                "GC entry size {} exceeds u32 capacity",
+                total
+            );
             let new_ptr = ValuePointer {
                 file_id: new_file_id,
                 offset,
@@ -991,6 +1020,8 @@ impl GarbageCollector {
         }
 
         // Ensure LSM writes are durable before scheduling the old file for reclamation.
+        // This sync() is what makes the CAS results crash-safe — without it, a crash
+        // after schedule_deletion could lose the new pointers.
         self.lsm.sync()?;
 
         // Defer deletion until all active snapshots/iterators referencing the
@@ -1130,9 +1161,9 @@ impl CompactionController {
 }
 ```
 
-**Important**: `unregister_sst_references(sst_id)` removes the SST's entry from the
-`sst_to_vlogs` mapping. This must be called whenever an SST is deleted (compaction,
-manual removal) to prevent leaked references that block vLog space reclamation.
+> **Important**: `unregister_sst_references(sst_id)` removes the SST's entry from the
+> `sst_to_vlogs` mapping. This must be called whenever an SST is deleted (compaction,
+> manual removal) to prevent leaked references that block vLog space reclamation.
 
 ## Implementation Plan
 
@@ -1190,7 +1221,7 @@ manual removal) to prevent leaked references that block vLog space reclamation.
 
 2. **GC Execution**
    - Rewrite live entries to new vLog files
-   - Re-insert updated pointers into LSM tree via normal writes
+   - Re-insert updated pointers into LSM tree via `compare_and_set_with_kind` (atomic CAS)
    - Defer old file deletion until snapshots are quiesced
 
 3. **Background GC Thread**
@@ -1223,7 +1254,22 @@ manual removal) to prevent leaked references that block vLog space reclamation.
 pub mod vlog {
     pub struct ValuePointer { ... }
     pub struct ValueSeparationOptions { ... }
-    pub struct ValueLogStats { ... }
+
+    /// Runtime statistics for value log monitoring.
+    pub struct ValueLogStats {
+        /// Total bytes across all vLog files on disk.
+        pub vlog_total_bytes: u64,
+        /// Bytes referenced by live SST entries (estimated from GC analysis).
+        pub vlog_live_bytes: u64,
+        /// Overall stale data ratio (1.0 - live/total).
+        pub vlog_stale_ratio: f64,
+        /// Number of vLog files on disk.
+        pub vlog_file_count: u32,
+        /// Number of entries rewritten by GC since startup.
+        pub gc_entries_rewritten: u64,
+        /// Bytes reclaimed by GC since startup.
+        pub gc_bytes_reclaimed: u64,
+    }
 }
 ```
 
@@ -1280,7 +1326,7 @@ This means:
 - **Serialization**: CAS and user writes for the same key are fully serialized.
   GC never silently overwrites a user write that landed between the liveness check
   and the CAS.
-- **No batch batching**: each `compare_and_set_with_kind` call is an independent
+- **No CAS batching**: each `compare_and_set_with_kind` call is an independent
   atomic operation. GC rewrites N live entries as N separate CAS calls (not a
   single write batch). This simplifies correctness but adds per-call lock
   overhead. A future optimization (item 6 in Future Work) can batch CAS calls
@@ -1351,6 +1397,46 @@ fn test_key_value_separation_workflow() {
     // Verify both values can be read
     assert_eq!(storage.get(b"small").unwrap().unwrap(), b"tiny");
     assert_eq!(storage.get(b"large").unwrap().unwrap(), large_value);
+}
+
+#[test]
+fn test_gc_with_concurrent_writes() {
+    // Write values, flush, overwrite some keys, trigger GC.
+    // Verify: (a) overwritten keys retain new values, (b) non-overwritten
+    // keys are still readable, (c) stale vLog space is reclaimed.
+}
+
+#[test]
+fn test_crash_recovery_after_partial_flush() {
+    // Write values, simulate crash mid-flush (kill process after vLog fsync
+    // but before SST commit). Restart and verify: memtable is rebuilt from
+    // WAL with full values, no dangling pointers.
+}
+
+#[test]
+fn test_orphan_vlog_cleanup_on_startup() {
+    // Write values, flush, then manually create an orphan .vlog file.
+    // Restart and verify: orphan file is deleted, live files are preserved.
+}
+
+#[test]
+fn test_range_scan_deduplication() {
+    // Write a key, flush (separated), overwrite same key, flush again.
+    // Range scan should return only the latest value, not both old and new
+    // pointers. Merge iterator must deduplicate by key.
+}
+
+#[test]
+fn test_mixed_inline_pointer_after_enable() {
+    // Create DB with separation disabled, write values, flush.
+    // Enable separation, write more values, flush.
+    // Verify: old SSTs have inline values, new SSTs have pointers, both readable.
+}
+
+#[test]
+fn test_gc_100_percent_dead() {
+    // Write values, flush, delete all keys, compact so all entries are dead.
+    // GC should reclaim the entire vLog file (file deleted, not rewritten).
 }
 ```
 
@@ -1448,7 +1534,7 @@ entries for GC CAS rewrites. Recovery proceeds in three phases:
 - **After CAS, before SST flush**: WAL replay restores the NEW ValuePointer (post-CAS state). This is safe because the new vLog was fsynced before the CAS (Phase 1 ordering), so the pointer is always valid.
 - **After CAS is flushed to SST**: the new ValuePointer is durable in the SST. The new vLog file is referenced by the SST and will not be deleted.
 
-### WAL Interaction
+## WAL Interaction
 
 The WAL stores `(key, value, KvKind)` for every write. Normal user writes store
 the full value with `KvKind::Inline`, preserving the same latency profile as a
@@ -1581,13 +1667,47 @@ Key-value separation is **opt-in** and backward-compatible:
    `#[serde(default)]` so old readers can parse them (ignoring the vLog fields).
    New readers handle both old and new variants.
 
+### Rollback
+
+Rolling back after enabling key-value separation requires care:
+
+1. **Disable separation** (`enabled = false`) and restart. New writes go inline.
+   Existing `ValuePointer` entries in SSTs remain readable — the engine continues
+   to resolve them from vLog files.
+2. **Wait for GC to reclaim all vLog files**. Once every vLog file is fully
+   reclaimed (no SST references remain), the `.vlog` files are deleted
+   automatically. Monitor `vlog_file_count` to confirm it reaches zero.
+3. **Downgrade the binary** only after all vLog files are gone. A v1 binary
+   encountering a v2 SST or a `ValuePointer` entry will return an error.
+4. **If immediate rollback is needed** (before GC finishes): the engine can be
+   patched to inline all `ValuePointer` values on startup (a one-time migration
+   pass that reads each pointer, fetches the value, and rewrites the SST with
+   inline values). This is not implemented by default but is straightforward to
+   add as an offline tool.
+
 ## Future Work
 
-1. **Compression**: Compress values in vLog to reduce space
-2. **Hot/Cold Separation**: Tiered storage for frequently accessed values
-3. **Parallel GC**: Concurrent garbage collection across multiple files
-4. **vLog Index**: In-memory index for faster lookups
-5. **Value Caching**: Dedicated cache for hot values
+### Exploratory (no near-term plan)
+
+1. **Compression**: Compress values in vLog to reduce space. Could use LZ4/Snappy
+   per-entry or per-block. Requires decompression on read; trade space savings vs
+   CPU overhead. Prerequisite: benchmark baseline read latency first.
+2. **Hot/Cold Separation**: Tiered storage for frequently accessed values. Hot
+   values stay in a memory-mapped vLog; cold values move to slower storage.
+   Requires access frequency tracking (e.g., per-key counters or sampling).
+3. **Parallel GC**: Concurrent garbage collection across multiple files. Needs
+   per-file GC locks (already designed) and a way to merge overlapping CAS
+   batches without deadlock.
+4. **vLog Index**: In-memory index for faster lookups. A persistent hash index
+   mapping (file_id, offset) ranges to reduce random reads. Trade memory for
+   I/O; most useful when vLog files are large.
+5. **Value Caching**: Dedicated cache for hot values. A separate LRU cache for
+   vLog values (distinct from the block cache). Useful when point-get latency is
+   dominated by vLog seeks.
+
+### Concrete (near-term)
+
+6. **Batch GC CAS**: Batch `compare_and_set_with_kind` calls for live entries during GC to reduce atomic operation overhead and contention with user writes
 6. **Batch GC CAS**: Batch `compare_and_set_with_kind` calls for live entries during GC to reduce atomic operation overhead and contention with user writes
 7. **Lock-free vLog writer**: Replace the `active_writer` Mutex with a lock-free append buffer, dedicated writer thread with request channel, or multiple active vLog files to improve write concurrency
 8. **Pre-created vLog rotation**: Prepare the next vLog file in the background so rotation doesn't block the writer with synchronous file creation
