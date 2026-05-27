@@ -23,6 +23,7 @@ pub struct VlogEntryMeta {
 /// through `&self` (the reader is typically shared behind an `Arc`).
 pub struct ValueLogReader {
     file: Mutex<File>,
+    path: PathBuf,
 }
 
 impl ValueLogReader {
@@ -35,6 +36,7 @@ impl ValueLogReader {
         VlogFileHeader::decode(&header_buf)?;
         Ok(Self {
             file: Mutex::new(file),
+            path,
         })
     }
 
@@ -45,12 +47,13 @@ impl ValueLogReader {
     /// - Validates `header_crc32` and `value_crc32`
     /// - Returns a `VlogEntry` with ptr, key, value, size
     pub fn read_entry(&self, offset: u64, size: u32) -> Result<VlogEntry> {
-        // Clone the file handle so we don't hold the lock during I/O.
+        // Hold the lock for the entire seek+read to avoid data corruption.
+        // File::try_clone shares the underlying file offset on Unix, so
+        // concurrent seeks on clones would race.
         let mut file = self
             .file
             .lock()
-            .map_err(|e| anyhow!("lock poisoned: {}", e))?
-            .try_clone()?;
+            .map_err(|e| anyhow!("lock poisoned: {}", e))?;
         file.seek(SeekFrom::Start(offset))?;
 
         let size = size as usize;
@@ -146,11 +149,9 @@ impl ValueLogReader {
     /// Return an iterator that yields `VlogEntryMeta` for each entry,
     /// reading only headers + keys (skipping values for efficiency).
     pub fn iter_headers(&self) -> Result<VlogHeaderIterator> {
-        let file = self
-            .file
-            .lock()
-            .map_err(|e| anyhow!("lock poisoned: {}", e))?
-            .try_clone()?;
+        // Open an independent file handle so the iterator does not share
+        // the underlying file offset with the Mutex-guarded random reader.
+        let file = File::open(&self.path)?;
         let file_size = file.metadata()?.len();
         Ok(VlogHeaderIterator {
             reader: file,
