@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
 use bytes::Buf;
@@ -19,10 +19,10 @@ pub struct VlogEntryMeta {
 
 /// Random-read vLog file reader.
 ///
-/// The `File` is wrapped in a `Mutex` so that `read_entry` can be called
-/// through `&self` (the reader is typically shared behind an `Arc`).
+/// Uses positional reads (`read_exact_at`) for concurrent, lock-free
+/// random access on Unix platforms.
 pub struct ValueLogReader {
-    file: Mutex<File>,
+    file: File,
     path: PathBuf,
     file_size: u64,
 }
@@ -37,7 +37,7 @@ impl ValueLogReader {
         VlogFileHeader::decode(&header_buf)?;
         let file_size = file.metadata()?.len();
         Ok(Self {
-            file: Mutex::new(file),
+            file,
             path,
             file_size,
         })
@@ -50,15 +50,6 @@ impl ValueLogReader {
     /// - Validates `header_crc32` and `value_crc32`
     /// - Returns a `VlogEntry` with ptr, key, value, size
     pub fn read_entry(&self, offset: u64, size: u32) -> Result<VlogEntry> {
-        // Hold the lock for the entire seek+read to avoid data corruption.
-        // File::try_clone shares the underlying file offset on Unix, so
-        // concurrent seeks on clones would race.
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|e| anyhow!("lock poisoned: {}", e))?;
-        file.seek(SeekFrom::Start(offset))?;
-
         let size = size as usize;
         anyhow::ensure!(
             size >= HEADER_SIZE,
@@ -76,10 +67,7 @@ impl ValueLogReader {
         );
 
         let mut buf = vec![0u8; size];
-        file.read_exact(&mut buf)?;
-
-        // Drop the lock early — all remaining work is CPU-bound on `buf`.
-        drop(file);
+        self.file.read_exact_at(&mut buf, offset)?;
 
         // Parse header (first 24 bytes)
         let mut hdr_bytes = &buf[..HEADER_SIZE];
