@@ -466,10 +466,13 @@ impl ValueLog {
     /// Attempt to delete any pending vLog files that are no longer
     /// referenced by any SST.
     pub fn reclaim_pending_deletions(&self) -> Result<usize> {
-        let to_process: Vec<u32> = {
+        let mut to_process: Vec<u32> = {
             let mut pending = self.pending_deletions.lock();
             std::mem::take(&mut *pending)
         };
+        to_process.sort_unstable();
+        to_process.dedup();
+
         let mut remaining = Vec::new();
         let mut deleted = 0usize;
         let mut first_err = None;
@@ -482,7 +485,9 @@ impl ValueLog {
                 match self.remove_file(file_id) {
                     Ok(()) => deleted += 1,
                     Err(e) => {
-                        first_err = Some(e);
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
                         remaining.push(file_id);
                     }
                 }
