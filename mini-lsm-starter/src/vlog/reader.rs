@@ -25,6 +25,7 @@ pub struct ValueLogReader {
     file: File,
     path: PathBuf,
     file_id: u32,
+    file_len: u64,
 }
 
 impl ValueLogReader {
@@ -32,6 +33,7 @@ impl ValueLogReader {
     /// Reads and verifies the 16-byte `VlogFileHeader` at offset 0.
     pub fn open(path: PathBuf) -> Result<Self> {
         let mut file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
         file.read_exact(&mut header_buf)?;
         VlogFileHeader::decode(&header_buf)?;
@@ -39,6 +41,7 @@ impl ValueLogReader {
             file,
             path,
             file_id: 0,
+            file_len,
         })
     }
 
@@ -75,7 +78,7 @@ impl ValueLogReader {
         );
 
         // Guard against OOM from corrupted pointers before allocating.
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.file_len;
         anyhow::ensure!(
             offset
                 .checked_add(size as u64)
