@@ -397,9 +397,9 @@ impl ValueLog {
 
     /// Get a cached reader for `file_id`, opening it on cache miss.
     pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
-        let path = self.path_of_file(file_id);
         self.readers
             .try_get_with(file_id, || {
+                let path = self.path_of_file(file_id);
                 let reader = ValueLogReader::open(path)?.with_file_id(file_id);
                 Ok::<_, anyhow::Error>(Arc::new(reader))
             })
