@@ -5,7 +5,6 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Buf;
@@ -29,7 +28,6 @@ pub struct ValueLogReader {
     file: File,
     path: PathBuf,
     file_id: u32,
-    file_len: AtomicU64,
 }
 
 impl ValueLogReader {
@@ -38,10 +36,6 @@ impl ValueLogReader {
     pub fn open(path: PathBuf) -> Result<Self> {
         let mut file =
             File::open(&path).with_context(|| format!("failed to open vLog file {:?}", path))?;
-        let file_len = file
-            .metadata()
-            .with_context(|| format!("failed to get metadata for vLog file {:?}", path))?
-            .len();
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
         file.read_exact(&mut header_buf)
             .with_context(|| format!("failed to read header of vLog file {:?}", path))?;
@@ -51,7 +45,6 @@ impl ValueLogReader {
             file,
             path,
             file_id: 0,
-            file_len: AtomicU64::new(file_len),
         })
     }
 
@@ -96,28 +89,8 @@ impl ValueLogReader {
             size,
             MAX_ENTRY_SIZE
         );
-        // Dynamically refresh the cached file length if the read appears to
-        // exceed it, allowing reads on actively-growing vLog files.
-        let mut file_len = self.file_len.load(Ordering::Relaxed);
-        if offset
-            .checked_add(size as u64)
-            .is_none_or(|end| end > file_len)
-        {
-            let new_len = self.file.metadata()?.len();
-            self.file_len.store(new_len, Ordering::Relaxed);
-            file_len = new_len;
-        }
-        anyhow::ensure!(
-            offset
-                .checked_add(size as u64)
-                .is_some_and(|end| end <= file_len),
-            "entry offset {} and size {} exceeds file length {}",
-            offset,
-            size,
-            file_len
-        );
-
         // Read the entire entry in a single system call to minimize I/O overhead.
+        // If the entry is past EOF, `read_exact_at` will fail with UnexpectedEof.
         let mut buf = vec![0u8; size];
         self.file.read_exact_at(&mut buf, offset).map_err(|e| {
             anyhow!(
