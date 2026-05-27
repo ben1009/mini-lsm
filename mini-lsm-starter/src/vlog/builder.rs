@@ -119,7 +119,7 @@ impl ValueLogWriter {
     /// Flush all buffered data and sync to disk.
     pub fn close(&mut self) -> Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        self.file.get_ref().sync_data()?;
         Ok(())
     }
 }

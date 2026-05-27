@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -45,6 +45,11 @@ impl ValueLogReader {
     /// - Returns a `VlogEntry` with ptr, key, value, size
     pub fn read_entry(&self, offset: u64, size: u32) -> Result<VlogEntry> {
         let size = size as usize;
+        anyhow::ensure!(
+            offset >= VlogFileHeader::SIZE as u64,
+            "offset {} is within the file header region",
+            offset
+        );
         anyhow::ensure!(
             size >= HEADER_SIZE,
             "entry size {} is smaller than header size {}",
@@ -138,12 +143,13 @@ impl ValueLogReader {
     /// reading only headers + keys (skipping values for efficiency).
     pub fn iter_headers(&self) -> Result<VlogHeaderIterator> {
         // Clone the underlying file descriptor so the iterator survives
-        // path renames/unlinks and does not share the file offset with
-        // concurrent positional reads.
-        let file = self.file.try_clone()?;
+        // path renames/unlinks, then wrap it in a BufReader for efficient
+        // sequential reads during GC analysis.
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(VlogFileHeader::SIZE as u64))?;
         let file_size = file.metadata()?.len();
         Ok(VlogHeaderIterator {
-            reader: file,
+            reader: BufReader::new(file),
             offset: VlogFileHeader::SIZE as u64,
             file_size,
             file_id: 0, // caller can set via `with_file_id()`
@@ -154,7 +160,7 @@ impl ValueLogReader {
 /// Header-only iterator for GC analysis.
 /// Reads only the header and key for each entry, skipping value payloads.
 pub struct VlogHeaderIterator {
-    reader: File,
+    reader: BufReader<File>,
     offset: u64,
     file_size: u64,
     file_id: u32,
@@ -178,9 +184,9 @@ impl Iterator for VlogHeaderIterator {
         }
 
         let result = (|| -> Result<VlogEntryMeta> {
-            // Read the 24-byte entry header via positional read
+            // Read the 24-byte entry header sequentially
             let mut hdr_buf = [0u8; HEADER_SIZE];
-            self.reader.read_exact_at(&mut hdr_buf, self.offset)?;
+            self.reader.read_exact(&mut hdr_buf)?;
 
             let mut hdr_bytes: &[u8] = &hdr_buf;
             let header_crc32 = hdr_bytes.get_u32_le();
@@ -204,8 +210,13 @@ impl Iterator for VlogHeaderIterator {
 
             // Read only the key bytes (skip the value payload for efficiency).
             let mut key = vec![0u8; key_len];
-            self.reader
-                .read_exact_at(&mut key, self.offset + HEADER_SIZE as u64)?;
+            self.reader.read_exact(&mut key)?;
+
+            // Skip value + padding to position cursor for the next entry.
+            let skip = entry_size as i64 - HEADER_SIZE as i64 - key_len as i64;
+            if skip > 0 {
+                self.reader.seek(SeekFrom::Current(skip))?;
+            }
 
             // Validate header CRC32
             let entry_header = VlogEntryHeader {
