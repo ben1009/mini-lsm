@@ -88,6 +88,19 @@ impl ValueLogReader {
             size
         );
 
+        // Guard against OOM from corrupted headers: ensure the entry fits
+        // within the actual physical file before allocating key/value vectors.
+        let file_len = self.file.metadata()?.len();
+        let end_offset = offset
+            .checked_add(expected_size as u64)
+            .ok_or_else(|| anyhow!("offset overflow"))?;
+        anyhow::ensure!(
+            end_offset <= file_len,
+            "entry end offset {} exceeds file length {}",
+            end_offset,
+            file_len
+        );
+
         // Read key and value directly into their destination vectors to avoid
         // copying large payloads through an intermediate buffer.
         let mut key = vec![0u8; key_len];
@@ -157,10 +170,10 @@ impl ValueLogReader {
     /// Return an iterator that yields `VlogEntryMeta` for each entry,
     /// reading only headers + keys (skipping values for efficiency).
     pub fn iter_headers(&self) -> Result<VlogHeaderIterator> {
-        // Clone the underlying file descriptor so the iterator survives
-        // path renames/unlinks, then wrap it in a BufReader for efficient
-        // sequential reads during GC analysis.
-        let mut file = self.file.try_clone()?;
+        // Open an independent file descriptor so the iterator has its own
+        // file offset, avoiding corruption when multiple iterators run
+        // concurrently. Wrap it in a BufReader for efficient sequential reads.
+        let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(VlogFileHeader::SIZE as u64))?;
         let file_size = file.metadata()?.len();
         Ok(VlogHeaderIterator {
