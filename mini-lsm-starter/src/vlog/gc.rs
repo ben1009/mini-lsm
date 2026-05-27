@@ -172,14 +172,14 @@ impl<'a> GarbageCollector<'a> {
         // Sync the LSM writes
         self.inner.sync()?;
 
-        // Only schedule the old file for deletion if ALL CAS operations succeeded.
-        // Any failure means a concurrent write may have created a new live entry
-        // in the old file — deleting it would create a dangling pointer.
-        if cas_failures == 0 {
-            self.vlog.schedule_deletion(analysis.file_id);
-        } else if cas_failures == rewrites.len() {
-            // All CAS operations failed — the new vLog file is entirely unreferenced.
-            // Schedule it for immediate deletion to avoid space leak.
+        // Always schedule the old file for deletion. Concurrent writes during GC
+        // go to the memtable (not the old vLog), so the old file has no live
+        // entries after the CAS loop completes — even if some CAS operations
+        // failed due to concurrent overwrites.
+        self.vlog.schedule_deletion(analysis.file_id);
+        if cas_failures == rewrites.len() {
+            // All CAS operations failed — the new vLog file is entirely
+            // unreferenced. Schedule it for immediate deletion to avoid leak.
             self.vlog.schedule_deletion(new_file_id);
         }
 
@@ -216,6 +216,9 @@ impl<'a> GarbageCollector<'a> {
                 vlog_files.extend(refs);
             }
         }
+
+        let mut vlog_files: Vec<u32> = vlog_files.into_iter().collect();
+        vlog_files.sort_unstable();
 
         let mut results = Vec::new();
         for file_id in vlog_files {
