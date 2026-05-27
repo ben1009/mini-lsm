@@ -239,22 +239,27 @@ impl MemTable {
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    /// Always uses `add()` which handles value separation (writing large values
-    /// to vLog) and KvKind prefixing correctly.
+    /// When vlog_enabled, checks the KvKind prefix: ValuePointer entries are
+    /// passed through via `add_raw()` to preserve the pointer; Inline entries
+    /// have their prefix stripped and go through `add()` for value separation.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
         for e in self.map.iter() {
             let key_bytes = Key::from_bytes(e.key().clone());
             let key = key_bytes.as_key_slice();
             if self.vlog_enabled {
-                // Values have KvKind prefix from put(); strip it before add()
-                // so add() can apply value separation and re-prefix correctly.
                 let val = e.value();
-                let raw = if !val.is_empty() {
-                    &val[1..]
+                if !val.is_empty() && val[0] == crate::vlog::KvKind::ValuePointer as u8 {
+                    // ValuePointer entry (from GC CAS) — pass through as-is
+                    builder.add_raw(key, val)?;
                 } else {
-                    val.as_ref()
-                };
-                builder.add(key, raw)?;
+                    // Inline entry — strip prefix, let add() handle value separation
+                    let raw = if !val.is_empty() {
+                        &val[1..]
+                    } else {
+                        val.as_ref()
+                    };
+                    builder.add(key, raw)?;
+                }
             } else {
                 builder.add(key, e.value())?;
             }
