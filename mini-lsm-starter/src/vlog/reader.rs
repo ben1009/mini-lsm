@@ -67,28 +67,40 @@ impl ValueLogReader {
         let mut padding = [0u8; 8];
         hdr_bytes.copy_to_slice(&mut padding);
 
-        // Bounds check (overflow-safe)
+        // Validate that the caller-supplied size matches the expected aligned entry size
+        let expected_size = VlogEntryHeader::compute_entry_size(key_len, value_len)
+            .ok_or_else(|| anyhow!("entry size overflow"))?;
         anyhow::ensure!(
-            key_len <= size - HEADER_SIZE,
-            "key length {} exceeds remaining entry size {}",
-            key_len,
-            size - HEADER_SIZE
-        );
-        anyhow::ensure!(
-            value_len <= size - HEADER_SIZE - key_len,
-            "value length {} exceeds remaining entry size {}",
-            value_len,
-            size - HEADER_SIZE - key_len
+            size == expected_size,
+            "entry size mismatch: expected {}, got {}",
+            expected_size,
+            size
         );
 
         // Read key and value directly into their destination vectors.
         let mut key = vec![0u8; key_len];
         self.file
-            .read_exact_at(&mut key, offset + HEADER_SIZE as u64)?;
+            .read_exact_at(&mut key, offset + HEADER_SIZE as u64)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to read key at offset {} from {:?}: {}",
+                    offset + HEADER_SIZE as u64,
+                    self.path,
+                    e
+                )
+            })?;
 
         let mut value = vec![0u8; value_len];
         self.file
-            .read_exact_at(&mut value, offset + HEADER_SIZE as u64 + key_len as u64)?;
+            .read_exact_at(&mut value, offset + HEADER_SIZE as u64 + key_len as u64)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to read value at offset {} from {:?}: {}",
+                    offset + HEADER_SIZE as u64 + key_len as u64,
+                    self.path,
+                    e
+                )
+            })?;
 
         // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
         let entry_header = VlogEntryHeader {
