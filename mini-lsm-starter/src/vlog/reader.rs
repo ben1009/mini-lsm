@@ -66,6 +66,7 @@ impl ValueLogReader {
     /// - Parses the 24-byte `VlogEntryHeader`, then key and value
     /// - Validates `header_crc32` and `value_crc32`
     /// - Returns a `VlogEntry` with ptr, key, value, size
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn read_entry(&self, offset: u64, size: u32) -> Result<VlogEntry> {
         let size = size as usize;
         anyhow::ensure!(
@@ -74,7 +75,7 @@ impl ValueLogReader {
             offset
         );
         anyhow::ensure!(
-            offset.is_multiple_of(super::ALIGNMENT as u64),
+            offset % super::ALIGNMENT as u64 == 0,
             "offset {} is not aligned to {} bytes",
             offset,
             super::ALIGNMENT

@@ -164,6 +164,7 @@ impl VlogFileHeader {
             return Err(anyhow!("VlogFileHeader magic mismatch: 0x{:08X}", magic));
         }
         let version = buf.get_u16_le();
+        anyhow::ensure!(version == 1, "unsupported vLog version: {}", version);
         let mut reserved = [0u8; 10];
         buf.copy_to_slice(&mut reserved);
         Ok(Self {
