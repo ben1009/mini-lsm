@@ -356,6 +356,11 @@ impl ValueLog {
     pub fn open(path: impl AsRef<Path>, options: ValueSeparationOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)?;
+        anyhow::ensure!(
+            options.max_open_vlog_files >= 1,
+            "max_open_vlog_files must be at least 1, got {}",
+            options.max_open_vlog_files
+        );
 
         let mut max_id: Option<u32> = None;
         for entry in std::fs::read_dir(&path)? {
