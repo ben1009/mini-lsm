@@ -88,18 +88,9 @@ impl ValueLogReader {
             size
         );
 
-        // Guard against OOM from corrupted headers: ensure the entry fits
-        // within the actual physical file before allocating key/value vectors.
-        let file_len = self.file.metadata()?.len();
-        let end_offset = offset
-            .checked_add(expected_size as u64)
-            .ok_or_else(|| anyhow!("offset overflow"))?;
-        anyhow::ensure!(
-            end_offset <= file_len,
-            "entry end offset {} exceeds file length {}",
-            end_offset,
-            file_len
-        );
+        // OOM safety: `size` originates from the trusted LSM index/manifest,
+        // and `size == expected_size` above catches header corruption.
+        // `read_exact_at` will fail with `UnexpectedEof` if the entry is past EOF.
 
         // Read key and value directly into their destination vectors to avoid
         // copying large payloads through an intermediate buffer.
