@@ -492,7 +492,7 @@ impl ValueLog {
         }
         {
             let mut pending = self.pending_deletions.lock();
-            *pending = remaining;
+            pending.extend(remaining);
         }
         match first_err {
             Some(e) => Err(e),
