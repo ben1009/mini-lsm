@@ -26,7 +26,7 @@ use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
-use crate::vlog::{ValueLog, ValueSeparationOptions};
+use crate::vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions};
 
 // TODO: try this one https://github.com/cloudflare/pingora/tree/main/tinyufo with bech later
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -54,7 +54,7 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 }
 
 impl LsmStorageState {
-    fn create(options: &LsmStorageOptions) -> Self {
+    fn create(options: &LsmStorageOptions, vlog_enabled: bool) -> Self {
         let levels = match &options.compaction_options {
             CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
             | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
@@ -65,7 +65,11 @@ impl LsmStorageState {
             CompactionOptions::NoCompaction => vec![(1, Vec::new())],
         };
         Self {
-            memtable: Arc::new(MemTable::create(0)),
+            memtable: Arc::new(if vlog_enabled {
+                MemTable::create_vlog(0)
+            } else {
+                MemTable::create(0)
+            }),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels,
@@ -194,8 +198,13 @@ impl MiniLsm {
         }
 
         // flush memtable to imm_memtable
-        self.inner
-            .force_freeze_with_new_memtable(MemTable::create(self.inner.next_sst_id()))?;
+        let new_id = self.inner.next_sst_id();
+        let new_mt = if self.inner.vlog.is_some() {
+            MemTable::create_vlog(new_id)
+        } else {
+            MemTable::create(new_id)
+        };
+        self.inner.force_freeze_with_new_memtable(new_mt)?;
 
         // flush all imm_memtable to disk
         while !self.inner.state.read().imm_memtables.is_empty() {
@@ -273,6 +282,42 @@ impl MiniLsm {
     pub fn force_full_compaction(&self) -> Result<()> {
         self.inner.force_full_compaction()
     }
+
+    /// Trigger garbage collection on all vLog files.
+    /// Returns the number of files that were GC'd.
+    pub fn trigger_gc(&self) -> Result<usize> {
+        let Some(ref vlog) = self.inner.vlog else {
+            return Ok(0);
+        };
+        let gc = crate::vlog::gc::GarbageCollector::new(
+            vlog,
+            &self.inner,
+            vlog.options.gc_threshold_ratio,
+        );
+        let results = gc.gc_all()?;
+        let count = results.len();
+
+        // Write manifest records for GC operations
+        for result in &results {
+            if let Some(ref manifest) = self.inner.manifest {
+                manifest.add_record(
+                    &self.inner.state_lock.lock(),
+                    ManifestRecord::GcCompaction(
+                        result.old_file_id,
+                        result.new_file_id,
+                        result.keys_rewritten,
+                    ),
+                )?;
+            }
+        }
+
+        // Attempt to reclaim vLog files that are no longer referenced by any SST.
+        // Note: files with pending memtable CAS writes will still be referenced
+        // (via the SST that hasn't been re-flushed yet), so they won't be deleted.
+        let _ = vlog.reclaim_pending_deletions();
+
+        Ok(count)
+    }
 }
 
 impl LsmStorageInner {
@@ -284,7 +329,11 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
-        let mut state = LsmStorageState::create(&options);
+        let vlog_enabled = options
+            .value_separation
+            .as_ref()
+            .is_some_and(|vs| vs.enabled);
+        let mut state = LsmStorageState::create(&options, vlog_enabled);
         // seems the cache is not cleaned forever ? just let lru do the gc job.
         // better refill the cache somehow after compaction
         let block_cache = Arc::new(BlockCache::new(1024));
@@ -306,15 +355,33 @@ impl LsmStorageInner {
             fs::create_dir_all(path)?;
         }
 
+        // Initialize Value Log early so memtables can be created with vlog_enabled
+        let value_separation = options.value_separation.clone().unwrap_or_default();
+        let vlog_enabled = value_separation.enabled;
+        let vlog = if value_separation.enabled {
+            let vlog_path = path.join("vlog");
+            if !vlog_path.exists() {
+                fs::create_dir_all(&vlog_path)?;
+            }
+            Some(Arc::new(ValueLog::open(&vlog_path, value_separation)?))
+        } else {
+            None
+        };
+
         let mut max_id = state.memtable.id();
         let manifest_path = path.join("MANIFEST");
         let mut recovered_vlog_refs: HashMap<usize, Vec<u32>> = HashMap::new();
         let manifest = if !manifest_path.exists() {
             if options.enable_wal {
-                state.memtable = Arc::new(MemTable::create_with_wal(
-                    state.memtable.id(),
-                    Self::path_of_wal_static(path, state.memtable.id()),
-                )?)
+                let id = state.memtable.id();
+                let wal_path = Self::path_of_wal_static(path, id);
+                state.memtable = Arc::new(if vlog_enabled {
+                    MemTable::create_with_wal_vlog(id, wal_path)?
+                } else {
+                    MemTable::create_with_wal(id, wal_path)?
+                })
+            } else if vlog_enabled {
+                state.memtable = Arc::new(MemTable::create_vlog(state.memtable.id()));
             }
             let m = Manifest::create(manifest_path).context("failed to create manifest")?;
             m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
@@ -380,6 +447,9 @@ impl LsmStorageInner {
                     ManifestRecord::NewVlogFile(_id) | ManifestRecord::DeleteVlogFile(_id) => {
                         // vLog file lifecycle — will be handled in vLog recovery
                     }
+                    ManifestRecord::GcCompaction(_old_id, _new_id, _count) => {
+                        // GC compaction — references are updated via CAS + flush
+                    }
                 }
             }
             max_id += 1;
@@ -387,17 +457,28 @@ impl LsmStorageInner {
             if options.enable_wal {
                 // just recover all to imm_memtables, then create a new memtable
                 for id in im_memtables {
-                    let m = MemTable::recover_from_wal(id, Self::path_of_wal_static(path, id))?;
+                    let wal_path = Self::path_of_wal_static(path, id);
+                    let m = if vlog_enabled {
+                        MemTable::recover_from_wal_vlog(id, wal_path)?
+                    } else {
+                        MemTable::recover_from_wal(id, wal_path)?
+                    };
                     if !m.is_empty() {
                         state.imm_memtables.insert(0, Arc::new(m));
                     }
                 }
-                state.memtable = Arc::new(MemTable::create_with_wal(
-                    max_id,
-                    Self::path_of_wal_static(path, max_id),
-                )?);
+                let wal_path = Self::path_of_wal_static(path, max_id);
+                state.memtable = Arc::new(if vlog_enabled {
+                    MemTable::create_with_wal_vlog(max_id, wal_path)?
+                } else {
+                    MemTable::create_with_wal(max_id, wal_path)?
+                });
             } else {
-                state.memtable = Arc::new(MemTable::create(max_id));
+                state.memtable = Arc::new(if vlog_enabled {
+                    MemTable::create_vlog(max_id)
+                } else {
+                    MemTable::create(max_id)
+                });
             }
             ret.0
                 .add_record_when_init(ManifestRecord::NewMemtable(max_id))?;
@@ -422,22 +503,12 @@ impl LsmStorageInner {
             ret.0
         };
 
-        // Initialize Value Log if value separation is enabled
-        let value_separation = options.value_separation.clone().unwrap_or_default();
-        let vlog = if value_separation.enabled {
-            let vlog_path = path.join("vlog");
-            if !vlog_path.exists() {
-                fs::create_dir_all(&vlog_path)?;
-            }
-            let vlog = Arc::new(ValueLog::open(&vlog_path, value_separation)?);
-            // Register vLog references recovered from manifest records
+        // Register vLog references recovered from manifest records
+        if let Some(ref vlog) = vlog {
             for (sst_id, vlog_ids) in &recovered_vlog_refs {
                 vlog.register_sst_references(*sst_id, vlog_ids);
             }
-            Some(vlog)
-        } else {
-            None
-        };
+        }
 
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
@@ -469,19 +540,32 @@ impl LsmStorageInner {
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = self.state.read().clone();
-        if let Some(v) = state.memtable.get(key) {
-            if v.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(v));
-        }
+        let vlog_enabled = self.vlog.is_some();
 
-        for m in state.imm_memtables.iter() {
-            if let Some(v) = m.get(key) {
+        if vlog_enabled {
+            // Use get_raw to get kind-prefixed value, then resolve
+            if let Some(raw) = state.memtable.get_raw(key) {
+                return self.resolve_vlog_value(&raw);
+            }
+            for m in state.imm_memtables.iter() {
+                if let Some(raw) = m.get_raw(key) {
+                    return self.resolve_vlog_value(&raw);
+                }
+            }
+        } else {
+            if let Some(v) = state.memtable.get(key) {
                 if v.is_empty() {
                     return Ok(None);
                 }
                 return Ok(Some(v));
+            }
+            for m in state.imm_memtables.iter() {
+                if let Some(v) = m.get(key) {
+                    if v.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(v));
+                }
             }
         }
 
@@ -510,10 +594,11 @@ impl LsmStorageInner {
                 s_it.set_vlog(vlog.clone());
             }
             if s_it.is_valid() && s_it.key().raw_ref() == key {
-                if s_it.value().is_empty() {
+                let val = s_it.value();
+                if val.is_empty() {
                     return Ok(None);
                 }
-                return Ok(Some(Bytes::copy_from_slice(s_it.value())));
+                return Ok(Some(Bytes::copy_from_slice(val)));
             }
         }
 
@@ -554,6 +639,198 @@ impl LsmStorageInner {
         }
 
         Ok(None)
+    }
+
+    /// Resolve a kind-prefixed value from the memtable.
+    /// If it's a ValuePointer, dereferences through the vLog.
+    /// If it's Inline, strips the kind prefix and returns the value.
+    fn resolve_vlog_value(&self, prefixed: &[u8]) -> Result<Option<Bytes>> {
+        if prefixed.is_empty() {
+            return Ok(None);
+        }
+        match KvKind::from_u8(prefixed[0]) {
+            Some(KvKind::ValuePointer) => {
+                let ptr = ValuePointer::try_decode(&prefixed[1..]).ok_or_else(|| {
+                    anyhow!(
+                        "invalid ValuePointer in memtable: len={}, bytes={:?}",
+                        prefixed.len(),
+                        &prefixed[..prefixed.len().min(20)]
+                    )
+                })?;
+                let vlog = self.vlog.as_ref().unwrap();
+                // We don't have the key here, but the vLog read verifies key match
+                // For memtable reads, we need to read without key verification
+                let reader = vlog.get_reader(ptr.file_id)?;
+                let entry = reader.read_entry(ptr.offset, ptr.size)?;
+                Ok(Some(Bytes::from(entry.value)))
+            }
+            _ => {
+                // Inline value — strip the kind prefix
+                if prefixed.len() == 1 {
+                    // Tombstone
+                    Ok(None)
+                } else {
+                    Ok(Some(Bytes::copy_from_slice(&prefixed[1..])))
+                }
+            }
+        }
+    }
+
+    /// Parse a kind-prefixed raw value into (value, kind).
+    fn parse_value_kind(raw: &[u8]) -> (Option<Bytes>, KvKind) {
+        if raw.is_empty() {
+            return (None, KvKind::Inline);
+        }
+        match KvKind::from_u8(raw[0]) {
+            Some(KvKind::ValuePointer) => (Some(Bytes::copy_from_slice(raw)), KvKind::ValuePointer),
+            Some(KvKind::Inline) | None => {
+                if raw.len() == 1 {
+                    // Tombstone: [KvKind::Inline] only
+                    (None, KvKind::Inline)
+                } else {
+                    (Some(Bytes::copy_from_slice(&raw[1..])), KvKind::Inline)
+                }
+            }
+        }
+    }
+
+    /// Get a key from the storage, returning both the value and its KvKind.
+    /// Used by GC to determine if a key still points to a specific vLog entry.
+    pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
+        let state = self.state.read().clone();
+        let vlog_enabled = self.vlog.is_some();
+
+        // Memtable
+        if vlog_enabled {
+            if let Some(raw) = state.memtable.get_raw(key) {
+                return Ok(Self::parse_value_kind(&raw));
+            }
+        } else if let Some(v) = state.memtable.get(key) {
+            if v.is_empty() {
+                return Ok((None, KvKind::Inline));
+            }
+            return Ok((Some(v), KvKind::Inline));
+        }
+
+        // Immutable memtables
+        for m in state.imm_memtables.iter() {
+            if vlog_enabled {
+                if let Some(raw) = m.get_raw(key) {
+                    return Ok(Self::parse_value_kind(&raw));
+                }
+            } else if let Some(v) = m.get(key) {
+                if v.is_empty() {
+                    return Ok((None, KvKind::Inline));
+                }
+                return Ok((Some(v), KvKind::Inline));
+            }
+        }
+
+        // L0 SSTs
+        let mut sstables_l0 = vec![];
+        state.l0_sstables.iter().for_each(|id| {
+            if let Some(s) = state.sstables.get(id) {
+                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
+                    return;
+                }
+                if let Some(b) = &s.bloom {
+                    let key_hash = farmhash::hash32(key);
+                    if !b.may_contain(key_hash) {
+                        return;
+                    }
+                }
+                sstables_l0.push(s.clone());
+            }
+        });
+
+        for s in sstables_l0.iter() {
+            let mut s_it =
+                SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
+            if let Some(ref vlog) = self.vlog {
+                s_it.set_vlog(vlog.clone());
+            }
+            if s_it.is_valid() && s_it.key().raw_ref() == key {
+                let raw = s_it.raw_value();
+                return Ok(Self::parse_value_kind(raw));
+            }
+        }
+
+        // L1-lmax SSTs
+        for (_, sst_ids) in state.levels.iter() {
+            let mut sstables = vec![];
+            sst_ids.iter().for_each(|id| {
+                if let Some(s) = state.sstables.get(id) {
+                    if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
+                        return;
+                    }
+                    if let Some(b) = &s.bloom {
+                        let key_hash = farmhash::hash32(key);
+                        if !b.may_contain(key_hash) {
+                            return;
+                        }
+                    }
+                    sstables.push(s.clone());
+                }
+            });
+
+            let s_it = if let Some(ref vlog) = self.vlog {
+                SstConcatIterator::create_and_seek_to_key_with_vlog(
+                    sstables,
+                    KeySlice::from_slice(key),
+                    vlog.clone(),
+                )?
+            } else {
+                SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(key))?
+            };
+            if s_it.is_valid() && s_it.key().raw_ref() == key {
+                let raw = s_it.raw_value();
+                return Ok(Self::parse_value_kind(raw));
+            }
+        }
+
+        Ok((None, KvKind::Inline))
+    }
+
+    /// Atomic compare-and-swap with kind checking.
+    /// Acquires state_lock, does a full LSM lookup, and conditionally writes
+    /// the new value to the memtable if the current value matches (old, old_kind).
+    /// Returns true if the swap succeeded.
+    pub(crate) fn compare_and_set_with_kind(
+        &self,
+        key: &[u8],
+        old: &[u8],
+        old_kind: KvKind,
+        new: &[u8],
+        new_kind: KvKind,
+    ) -> Result<bool> {
+        let _lock = self.state_lock.lock();
+        let (current_val, current_kind) = self.get_with_kind(key)?;
+
+        // Check if current matches expected
+        let matches = match (current_kind, old_kind) {
+            (KvKind::Inline, KvKind::Inline) => match current_val {
+                Some(ref v) => v.as_ref() == old,
+                None => old.is_empty(),
+            },
+            (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
+                Some(ref v) => v.as_ref() == old,
+                None => false,
+            },
+            _ => false,
+        };
+
+        if !matches {
+            return Ok(false);
+        }
+
+        // Encode new value with kind prefix and write to memtable
+        let mut prefixed = Vec::with_capacity(1 + new.len());
+        prefixed.push(new_kind as u8);
+        prefixed.extend_from_slice(new);
+
+        let state = self.state.read();
+        state.memtable.put_raw(key, &prefixed)?;
+        Ok(true)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -651,8 +928,15 @@ impl LsmStorageInner {
     /// the `_state_lock_observer` will be dropped after `force_freeze_memtable` called
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let sst_id = self.next_sst_id();
+        let vlog_enabled = self.vlog.is_some();
         let mem_table = if self.options.enable_wal {
-            mem_table::MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?
+            if vlog_enabled {
+                mem_table::MemTable::create_with_wal_vlog(sst_id, self.path_of_wal(sst_id))?
+            } else {
+                mem_table::MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?
+            }
+        } else if vlog_enabled {
+            mem_table::MemTable::create_vlog(sst_id)
         } else {
             mem_table::MemTable::create(sst_id)
         };

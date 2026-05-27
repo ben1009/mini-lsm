@@ -39,6 +39,8 @@ pub struct MemTable {
     wal: Option<Wal>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
+    /// When true, values in the map are kind-prefixed: `[KvKind:1][payload]`.
+    vlog_enabled: bool,
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
@@ -58,6 +60,18 @@ impl MemTable {
             wal: None,
             id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
+            vlog_enabled: false,
+        }
+    }
+
+    /// Create a new mem-table with vLog (kind-prefixed values).
+    pub fn create_vlog(id: usize) -> Self {
+        Self {
+            map: Arc::new(SkipMap::new()),
+            wal: None,
+            id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+            vlog_enabled: true,
         }
     }
 
@@ -70,9 +84,27 @@ impl MemTable {
         Ok(ret)
     }
 
+    /// Create a new mem-table with WAL and vLog (kind-prefixed values).
+    pub fn create_with_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let mut ret = Self::create_vlog(id);
+        let wal = Wal::create(path)?;
+        ret.wal = Some(wal);
+
+        Ok(ret)
+    }
+
     /// Create a memtable from WAL
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
         let mut ret = Self::create(id);
+        let wal = Wal::recover(path, &ret.map)?;
+        ret.wal = Some(wal);
+
+        Ok(ret)
+    }
+
+    /// Create a memtable from WAL with vLog (kind-prefixed values).
+    pub fn recover_from_wal_vlog(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let mut ret = Self::create_vlog(id);
         let wal = Wal::recover(path, &ret.map)?;
         ret.wal = Some(wal);
 
@@ -95,22 +127,53 @@ impl MemTable {
         self.scan(lower, upper)
     }
 
+    /// Whether this memtable uses kind-prefixed values.
+    pub fn vlog_enabled(&self) -> bool {
+        self.vlog_enabled
+    }
+
     /// Get a value by key.
+    /// When vlog_enabled, strips the 1-byte KvKind prefix from the stored value.
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+        self.map.get(key).map(|x| {
+            let val = x.value();
+            if self.vlog_enabled && !val.is_empty() {
+                // Strip the KvKind prefix byte
+                val.slice(1..)
+            } else {
+                val.clone()
+            }
+        })
+    }
+
+    /// Get the raw value (with kind prefix if vlog_enabled) by key.
+    pub fn get_raw(&self, key: &[u8]) -> Option<Bytes> {
         self.map.get(key).map(|x| x.value().clone())
     }
 
     /// Put a key-value pair into the mem-table.
     ///
-    /// In week 1, day 1, simply put the key-value pair into the skipmap.
-    /// In week 2, day 6, also flush the data to WAL.
-    /// In week 3, day 5, modify the function to use the batch API.
+    /// When vlog_enabled, wraps the value with a KvKind::Inline prefix.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_batch(&[(KeySlice::from_slice(key), value)])
+        if self.vlog_enabled {
+            // Prepend KvKind::Inline prefix
+            let mut prefixed = Vec::with_capacity(1 + value.len());
+            prefixed.push(crate::vlog::KvKind::Inline as u8);
+            prefixed.extend_from_slice(value);
+            self.put_raw(key, &prefixed)
+        } else {
+            self.put_raw(key, value)
+        }
     }
 
-    /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+    /// Put a raw key-value pair into the mem-table without kind prefixing.
+    /// Used by compare_and_set_with_kind to write pre-prefixed values.
+    pub fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_raw_batch(&[(KeySlice::from_slice(key), value)])
+    }
+
+    /// Put a batch of raw (pre-prefixed) key-value pairs.
+    pub fn put_raw_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         if let Some(wal) = &self.wal {
             for (key, value) in data {
                 wal.put(key.raw_ref(), value)?;
@@ -133,6 +196,27 @@ impl MemTable {
         Ok(())
     }
 
+    /// Implement this in week 3, day 5.
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if self.vlog_enabled {
+            // Prefix each value with KvKind::Inline
+            let prefixed: Vec<(KeySlice, Vec<u8>)> = data
+                .iter()
+                .map(|(k, v)| {
+                    let mut p = Vec::with_capacity(1 + v.len());
+                    p.push(crate::vlog::KvKind::Inline as u8);
+                    p.extend_from_slice(v);
+                    (*k, p)
+                })
+                .collect();
+            let refs: Vec<(KeySlice, &[u8])> =
+                prefixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            self.put_raw_batch(&refs)
+        } else {
+            self.put_raw_batch(data)
+        }
+    }
+
     pub fn sync_wal(&self) -> Result<()> {
         if let Some(ref wal) = self.wal {
             wal.sync()?;
@@ -142,10 +226,12 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        let vlog_enabled = self.vlog_enabled;
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
             iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
             item: (Bytes::new(), Bytes::new()),
+            vlog_enabled,
         }
         .build();
         iter.next().unwrap();
@@ -153,9 +239,25 @@ impl MemTable {
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
+    /// Always uses `add()` which handles value separation (writing large values
+    /// to vLog) and KvKind prefixing correctly.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
         for e in self.map.iter() {
-            builder.add(Key::from_bytes(e.key().clone()).as_key_slice(), e.value())?;
+            let key_bytes = Key::from_bytes(e.key().clone());
+            let key = key_bytes.as_key_slice();
+            if self.vlog_enabled {
+                // Values have KvKind prefix from put(); strip it before add()
+                // so add() can apply value separation and re-prefix correctly.
+                let val = e.value();
+                let raw = if !val.is_empty() {
+                    &val[1..]
+                } else {
+                    val.as_ref()
+                };
+                builder.add(key, raw)?;
+            } else {
+                builder.add(key, e.value())?;
+            }
         }
 
         Ok(())
@@ -209,13 +311,21 @@ pub struct MemTableIterator {
     iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
+    /// Whether values are kind-prefixed (need to strip prefix in value()).
+    vlog_enabled: bool,
 }
 
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        self.borrow_item().1.as_ref()
+        let val = self.borrow_item().1.as_ref();
+        if *self.borrow_vlog_enabled() && !val.is_empty() {
+            // Strip the 1-byte KvKind prefix
+            &val[1..]
+        } else {
+            val
+        }
     }
 
     fn key(&self) -> KeySlice<'_> {
