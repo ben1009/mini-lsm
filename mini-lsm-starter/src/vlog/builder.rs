@@ -53,6 +53,16 @@ impl ValueLogWriter {
     ///
     /// Returns the total number of bytes written (header + key + value + padding).
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<usize> {
+        anyhow::ensure!(
+            key.len() <= u16::MAX as usize,
+            "key length {} exceeds u16 capacity",
+            key.len()
+        );
+        anyhow::ensure!(
+            value.len() <= u32::MAX as usize,
+            "value length {} exceeds u32 capacity",
+            value.len()
+        );
         let value_crc32 = crc32fast::hash(value);
 
         let entry_header = VlogEntryHeader {

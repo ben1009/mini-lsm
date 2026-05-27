@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use anyhow::{Result, anyhow};
 use bytes::Buf;
 
-use super::{ALIGNMENT, HEADER_SIZE, ValuePointer, VlogEntry, VlogFileHeader};
+use super::{ALIGNMENT, HEADER_SIZE, ValuePointer, VlogEntry, VlogEntryHeader, VlogFileHeader};
 
 /// Lightweight header-only entry metadata for GC analysis.
 /// Contains the pointer, key, and value length without reading the value payload.
@@ -59,6 +59,15 @@ impl ValueLogReader {
             HEADER_SIZE
         );
 
+        let file_len = file.metadata()?.len();
+        anyhow::ensure!(
+            offset + size as u64 <= file_len,
+            "entry offset {} and size {} exceeds file length {}",
+            offset,
+            size,
+            file_len
+        );
+
         let mut buf = vec![0u8; size];
         file.read_exact(&mut buf)?;
 
@@ -75,30 +84,33 @@ impl ValueLogReader {
         let mut padding = [0u8; 8];
         hdr_bytes.copy_to_slice(&mut padding);
 
-        // Bounds check
+        // Bounds check (overflow-safe)
         anyhow::ensure!(
-            HEADER_SIZE + key_len + value_len <= size,
-            "entry data (header {} + key {} + value {}) exceeds entry size {}",
-            HEADER_SIZE,
+            key_len <= size - HEADER_SIZE,
+            "key length {} exceeds remaining entry size {}",
             key_len,
+            size - HEADER_SIZE
+        );
+        anyhow::ensure!(
+            value_len <= size - HEADER_SIZE - key_len,
+            "value length {} exceeds remaining entry size {}",
             value_len,
-            size
+            size - HEADER_SIZE - key_len
         );
 
         let key = buf[HEADER_SIZE..HEADER_SIZE + key_len].to_vec();
         let value = buf[HEADER_SIZE + key_len..HEADER_SIZE + key_len + value_len].to_vec();
 
         // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
-        let computed_header_crc = {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&value_crc32.to_le_bytes());
-            hasher.update(&(value_len as u32).to_le_bytes());
-            hasher.update(&(key_len as u16).to_le_bytes());
-            hasher.update(&flags.to_le_bytes());
-            hasher.update(&padding);
-            hasher.update(&key);
-            hasher.finalize()
+        let entry_header = VlogEntryHeader {
+            header_crc32,
+            value_crc32,
+            value_len: value_len as u32,
+            key_len: key_len as u16,
+            flags,
+            _padding: padding,
         };
+        let computed_header_crc = entry_header.compute_header_crc(&key);
         anyhow::ensure!(
             computed_header_crc == header_crc32,
             "header CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X} at offset {}",
@@ -165,7 +177,7 @@ impl VlogHeaderIterator {
 }
 
 impl Iterator for VlogHeaderIterator {
-    type Item = VlogEntryMeta;
+    type Item = Result<VlogEntryMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Stop at EOF
@@ -173,54 +185,70 @@ impl Iterator for VlogHeaderIterator {
             return None;
         }
 
-        // Read the 24-byte entry header
-        let mut hdr_buf = [0u8; HEADER_SIZE];
-        if self.reader.seek(SeekFrom::Start(self.offset)).is_err() {
-            return None;
-        }
-        if self.reader.read_exact(&mut hdr_buf).is_err() {
-            return None;
-        }
+        let result = (|| -> Result<VlogEntryMeta> {
+            // Read the 24-byte entry header
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            self.reader.seek(SeekFrom::Start(self.offset))?;
+            self.reader.read_exact(&mut hdr_buf)?;
 
-        let mut hdr_bytes: &[u8] = &hdr_buf;
-        let _header_crc32 = hdr_bytes.get_u32_le();
-        let _value_crc32 = hdr_bytes.get_u32_le();
-        let value_len = hdr_bytes.get_u32_le();
-        let key_len = hdr_bytes.get_u16_le() as usize;
-        let _flags = hdr_bytes.get_u16_le();
-        let _padding = hdr_bytes.get_u64_le(); // 8 bytes
+            let mut hdr_bytes: &[u8] = &hdr_buf;
+            let header_crc32 = hdr_bytes.get_u32_le();
+            let value_crc32 = hdr_bytes.get_u32_le();
+            let value_len = hdr_bytes.get_u32_le();
+            let key_len = hdr_bytes.get_u16_le() as usize;
+            let flags = hdr_bytes.get_u16_le();
+            let mut padding = [0u8; 8];
+            hdr_bytes.copy_to_slice(&mut padding);
 
-        // Compute total entry size with alignment padding
-        let raw_size = HEADER_SIZE + key_len + value_len as usize;
-        let entry_size = raw_size.div_ceil(ALIGNMENT) * ALIGNMENT;
+            // Compute total entry size with alignment padding
+            let raw_size = HEADER_SIZE as u64 + key_len as u64 + value_len as u64;
+            let entry_size = raw_size.div_ceil(ALIGNMENT as u64) * ALIGNMENT as u64;
 
-        // Sanity check: entry must not extend past EOF
-        if self.offset + entry_size as u64 > self.file_size {
-            return None;
-        }
+            anyhow::ensure!(entry_size <= u32::MAX as u64, "entry size exceeds u32::MAX");
+            anyhow::ensure!(
+                self.offset + entry_size <= self.file_size,
+                "entry extends past EOF"
+            );
 
-        // Read only the key bytes (skip the value payload for efficiency)
-        let key_start = self.offset + HEADER_SIZE as u64;
-        if self.reader.seek(SeekFrom::Start(key_start)).is_err() {
-            return None;
-        }
-        let mut key = vec![0u8; key_len];
-        if self.reader.read_exact(&mut key).is_err() {
-            return None;
-        }
+            // Read only the key bytes (skip the value payload for efficiency)
+            let key_start = self.offset + HEADER_SIZE as u64;
+            self.reader.seek(SeekFrom::Start(key_start))?;
+            let mut key = vec![0u8; key_len];
+            self.reader.read_exact(&mut key)?;
 
-        let current_offset = self.offset;
-        self.offset += entry_size as u64;
+            // Validate header CRC32
+            let entry_header = VlogEntryHeader {
+                header_crc32,
+                value_crc32,
+                value_len,
+                key_len: key_len as u16,
+                flags,
+                _padding: padding,
+            };
+            let computed_header_crc = entry_header.compute_header_crc(&key);
+            anyhow::ensure!(
+                computed_header_crc == header_crc32,
+                "header CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X} at offset {}",
+                computed_header_crc,
+                header_crc32,
+                self.offset
+            );
 
-        Some(VlogEntryMeta {
-            ptr: ValuePointer {
-                file_id: self.file_id,
-                offset: current_offset,
-                size: entry_size as u32,
-            },
-            key,
-            value_len,
-            entry_size,
-        })
+            let current_offset = self.offset;
+            self.offset += entry_size;
+
+            Ok(VlogEntryMeta {
+                ptr: ValuePointer {
+                    file_id: self.file_id,
+                    offset: current_offset,
+                    size: entry_size as u32,
+                },
+                key,
+                value_len,
+                entry_size: entry_size as usize,
+            })
+        })();
+
+        Some(result)
     }
 }

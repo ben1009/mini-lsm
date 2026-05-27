@@ -517,7 +517,7 @@ mod tests {
         // Iterate headers
         let reader = ValueLogReader::open(path).unwrap();
         let iter = reader.iter_headers().unwrap().with_file_id(file_id);
-        let meta_list: Vec<_> = iter.collect();
+        let meta_list: Vec<_> = iter.map(|r| r.unwrap()).collect();
 
         assert_eq!(meta_list.len(), entries.len());
         for (i, meta) in meta_list.iter().enumerate() {
