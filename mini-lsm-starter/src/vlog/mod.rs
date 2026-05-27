@@ -242,11 +242,14 @@ pub struct VlogEntry {
 // =============================================================================
 
 /// Tracks which vLog files are referenced by each SST.
+struct VlogReferencesInner {
+    sst_to_vlogs: HashMap<usize, HashSet<u32>>,
+    vlog_to_ssts: HashMap<u32, HashSet<usize>>,
+}
+
+/// Tracks which vLog files are referenced by each SST.
 pub struct VlogReferences {
-    /// SST id -> set of vLog file ids it references.
-    sst_to_vlogs: RwLock<HashMap<usize, HashSet<u32>>>,
-    /// vLog file id -> set of SST ids that reference it.
-    vlog_to_ssts: RwLock<HashMap<u32, HashSet<usize>>>,
+    inner: RwLock<VlogReferencesInner>,
 }
 
 impl Default for VlogReferences {
@@ -258,49 +261,67 @@ impl Default for VlogReferences {
 impl VlogReferences {
     pub fn new() -> Self {
         Self {
-            sst_to_vlogs: RwLock::new(HashMap::new()),
-            vlog_to_ssts: RwLock::new(HashMap::new()),
+            inner: RwLock::new(VlogReferencesInner {
+                sst_to_vlogs: HashMap::new(),
+                vlog_to_ssts: HashMap::new(),
+            }),
         }
     }
 
     /// Register that `sst_id` references the given vLog file ids.
+    /// Replaces any existing references for this `sst_id` to prevent leaks.
     pub fn register(&self, sst_id: usize, vlog_ids: &[u32]) {
+        let mut inner = self.inner.write();
+        // Remove old mappings first to prevent leaks on re-registration.
+        if let Some(old_ids) = inner.sst_to_vlogs.remove(&sst_id) {
+            for vid in old_ids {
+                if let Some(ssts) = inner.vlog_to_ssts.get_mut(&vid) {
+                    ssts.remove(&sst_id);
+                    if ssts.is_empty() {
+                        inner.vlog_to_ssts.remove(&vid);
+                    }
+                }
+            }
+        }
         if vlog_ids.is_empty() {
             return;
         }
-        let mut s2v = self.sst_to_vlogs.write();
-        let mut v2s = self.vlog_to_ssts.write();
-        let set = s2v.entry(sst_id).or_default();
-        for &vid in vlog_ids {
-            set.insert(vid);
-            v2s.entry(vid).or_default().insert(sst_id);
+        let set: HashSet<u32> = vlog_ids.iter().copied().collect();
+        for &vid in &set {
+            inner.vlog_to_ssts.entry(vid).or_default().insert(sst_id);
         }
+        inner.sst_to_vlogs.insert(sst_id, set);
     }
 
     /// Get the set of vLog file ids referenced by `sst_id`.
     pub fn get_sst_references(&self, sst_id: usize) -> Option<Vec<u32>> {
-        let s2v = self.sst_to_vlogs.read();
-        s2v.get(&sst_id).map(|set| set.iter().copied().collect())
+        let inner = self.inner.read();
+        inner
+            .sst_to_vlogs
+            .get(&sst_id)
+            .map(|set| set.iter().copied().collect())
     }
 
     /// Get the set of SST ids that reference `vlog_id`.
     pub fn get_ssts_referencing(&self, vlog_id: u32) -> Option<Vec<usize>> {
-        let v2s = self.vlog_to_ssts.read();
-        v2s.get(&vlog_id).map(|set| set.iter().copied().collect())
+        let inner = self.inner.read();
+        inner
+            .vlog_to_ssts
+            .get(&vlog_id)
+            .map(|set| set.iter().copied().collect())
     }
 
     /// Unregister all references for `sst_id` and return the previously
     /// referenced vLog file ids.
     pub fn unregister(&self, sst_id: usize) -> Vec<u32> {
-        let mut s2v = self.sst_to_vlogs.write();
-        let mut v2s = self.vlog_to_ssts.write();
-        let vlog_ids = s2v.remove(&sst_id);
-        if let Some(ref ids) = vlog_ids {
+        let mut inner = self.inner.write();
+        let vlog_ids = inner.sst_to_vlogs.remove(&sst_id);
+        if let Some(ids) = &vlog_ids {
             for vid in ids {
-                if let Some(ssts) = v2s.get_mut(vid) {
+                if let Some(ssts) = inner.vlog_to_ssts.get_mut(vid) {
                     ssts.remove(&sst_id);
                     if ssts.is_empty() {
-                        v2s.remove(vid);
+                        inner.vlog_to_ssts.remove(vid);
                     }
                 }
             }
@@ -375,7 +396,7 @@ impl ValueLog {
         let path = self.path_of_file(file_id);
         self.readers
             .try_get_with(file_id, || {
-                let reader = ValueLogReader::open(path)?;
+                let reader = ValueLogReader::open(path)?.with_file_id(file_id);
                 Ok::<_, anyhow::Error>(Arc::new(reader))
             })
             .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
@@ -418,13 +439,13 @@ impl ValueLog {
 
     /// Remove a vLog file from disk and the reader cache.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
-        self.readers.invalidate(&file_id);
         let path = self.path_of_file(file_id);
         if let Err(e) = std::fs::remove_file(&path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(e.into());
             }
         }
+        self.readers.invalidate(&file_id);
         Ok(())
     }
 
@@ -447,7 +468,11 @@ impl ValueLog {
         let mut deleted = 0usize;
         let mut first_err = None;
         for file_id in to_process {
-            if self.get_ssts_referencing(file_id).is_none() {
+            if self
+                .get_ssts_referencing(file_id)
+                .unwrap_or_default()
+                .is_empty()
+            {
                 match self.remove_file(file_id) {
                     Ok(()) => deleted += 1,
                     Err(e) => {
