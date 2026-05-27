@@ -361,7 +361,7 @@ fn main() -> Result<()> {
             },
             enable_wal: args.enable_wal,
             serializable: args.serializable,
-            value_separation: Default::default(),
+            value_separation: None,
         },
     )?;
 

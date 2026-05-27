@@ -85,9 +85,9 @@ pub struct LsmStorageOptions {
     pub compaction_options: CompactionOptions,
     pub enable_wal: bool,
     pub serializable: bool,
-    /// Options for key-value separation (vLog). If `enabled` is true, large
-    /// values are stored in a separate Value Log file.
-    pub value_separation: ValueSeparationOptions,
+    /// Options for key-value separation (vLog). If `Some` with `enabled` true, large
+    /// values are stored in a separate Value Log file. Defaults to `None` (disabled).
+    pub value_separation: Option<ValueSeparationOptions>,
 }
 
 impl LsmStorageOptions {
@@ -99,7 +99,7 @@ impl LsmStorageOptions {
             enable_wal: false,
             num_memtable_limit: 50,
             serializable: false,
-            value_separation: ValueSeparationOptions::default(),
+            value_separation: None,
         }
     }
 
@@ -111,7 +111,7 @@ impl LsmStorageOptions {
             enable_wal: false,
             num_memtable_limit: 2,
             serializable: false,
-            value_separation: ValueSeparationOptions::default(),
+            value_separation: None,
         }
     }
 
@@ -123,7 +123,7 @@ impl LsmStorageOptions {
             enable_wal: false,
             num_memtable_limit: 2,
             serializable: false,
-            value_separation: ValueSeparationOptions::default(),
+            value_separation: None,
         }
     }
 }
@@ -423,15 +423,13 @@ impl LsmStorageInner {
         };
 
         // Initialize Value Log if value separation is enabled
-        let vlog = if options.value_separation.enabled {
+        let value_separation = options.value_separation.clone().unwrap_or_default();
+        let vlog = if value_separation.enabled {
             let vlog_path = path.join("vlog");
             if !vlog_path.exists() {
                 fs::create_dir_all(&vlog_path)?;
             }
-            let vlog = Arc::new(ValueLog::open(
-                &vlog_path,
-                options.value_separation.clone(),
-            )?);
+            let vlog = Arc::new(ValueLog::open(&vlog_path, value_separation)?);
             // Register vLog references recovered from manifest records
             for (sst_id, vlog_ids) in &recovered_vlog_refs {
                 vlog.register_sst_references(*sst_id, vlog_ids);
@@ -683,16 +681,14 @@ impl LsmStorageInner {
         // Build SST with optional vLog support
         let (sst, vlog_ids) = if let Some(ref vlog) = self.vlog {
             let vlog_file_id = vlog.next_file_id();
+            let vs_opts = self.options.value_separation.as_ref().unwrap().clone();
             let vlog_builder = crate::vlog::ValueLogBuilder::create(
                 vlog.path_of_file(vlog_file_id),
                 vlog_file_id,
-                self.options.value_separation.clone(),
+                vs_opts.clone(),
             )?;
-            let mut builder = SsTableBuilder::new_with_vlog(
-                self.options.block_size,
-                vlog_builder,
-                self.options.value_separation.clone(),
-            );
+            let mut builder =
+                SsTableBuilder::new_with_vlog(self.options.block_size, vlog_builder, vs_opts);
             memtable_to_flush.flush(&mut builder)?;
             let vlog_ids = builder.vlog_file_ids().to_vec();
             let sst = builder.build(
