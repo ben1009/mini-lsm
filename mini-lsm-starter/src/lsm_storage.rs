@@ -428,9 +428,10 @@ impl LsmStorageInner {
             if !vlog_path.exists() {
                 fs::create_dir_all(&vlog_path)?;
             }
-            let vlog = Arc::new(
-                ValueLog::open(&vlog_path, options.value_separation.clone())?,
-            );
+            let vlog = Arc::new(ValueLog::open(
+                &vlog_path,
+                options.value_separation.clone(),
+            )?);
             // Register vLog references recovered from manifest records
             for (sst_id, vlog_ids) in &recovered_vlog_refs {
                 vlog.register_sst_references(*sst_id, vlog_ids);

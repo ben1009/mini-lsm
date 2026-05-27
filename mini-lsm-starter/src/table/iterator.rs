@@ -65,7 +65,7 @@ impl SsTableIterator {
         let b = self.table.read_block_cached(0)?;
         self.blk_idx = 0;
         self.blk_iter = BlockIterator::create_and_seek_to_first(b);
-        self.deref_cache = UnsafeCell::new(None);
+        *self.deref_cache.get_mut() = None;
 
         Ok(())
     }
@@ -158,9 +158,10 @@ impl StorageIterator for SsTableIterator {
                     }
                 }
                 // Cache miss: dereference from vLog
-                let vlog = self.vlog.as_ref().expect(
-                    "SsTableIterator encountered ValuePointer but no vLog was provided",
-                );
+                let vlog = self
+                    .vlog
+                    .as_ref()
+                    .expect("SsTableIterator encountered ValuePointer but no vLog was provided");
                 let ptr = ValuePointer::try_decode(payload)
                     .expect("SsTableIterator: invalid ValuePointer encoding in block");
                 let bytes = vlog
@@ -169,7 +170,7 @@ impl StorageIterator for SsTableIterator {
                 let val = bytes.to_vec();
                 // Update cache (safe: single-threaded, only written here)
                 let cache_mut = unsafe { &mut *self.deref_cache.get() };
-                *cache_mut = Some((crate::key::Key::from_bytes(bytes), val));
+                *cache_mut = Some((self.blk_iter.key().to_key_vec().into_key_bytes(), val));
                 &cache_mut.as_ref().unwrap().1
             }
             None => {

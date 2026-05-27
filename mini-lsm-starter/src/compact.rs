@@ -335,12 +335,11 @@ impl LsmStorageInner {
 
             self.sync_dir()?;
             // Use CompactionV2 if vLog references exist
-            let manifest_record =
-                if self.vlog.is_some() {
-                    ManifestRecord::CompactionV2(task, new_sst_ids.clone(), compact_vlog_ids)
-                } else {
-                    ManifestRecord::Compaction(task, new_sst_ids.clone())
-                };
+            let manifest_record = if self.vlog.is_some() {
+                ManifestRecord::CompactionV2(task, new_sst_ids.clone(), compact_vlog_ids)
+            } else {
+                ManifestRecord::Compaction(task, new_sst_ids.clone())
+            };
             self.manifest
                 .as_ref()
                 .unwrap()
@@ -407,10 +406,10 @@ impl LsmStorageInner {
             } else {
                 ManifestRecord::Compaction(task.unwrap(), new_sst_ids)
             };
-            self.manifest.as_ref().unwrap().add_record(
-                &_state_lock,
-                manifest_record,
-            )?;
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&_state_lock, manifest_record)?;
 
             rm_sst_ids
         };

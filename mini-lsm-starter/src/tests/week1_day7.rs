@@ -52,7 +52,9 @@ fn test_task2_sst_decode() {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        builder.add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..]).unwrap();
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
+            .unwrap();
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("1.sst");
@@ -70,7 +72,9 @@ fn test_task3_block_key_compression() {
     for idx in 0..num_of_keys() {
         let key = key_of(idx);
         let value = value_of(idx);
-        builder.add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..]).unwrap();
+        builder
+            .add(KeySlice::for_testing_from_slice_no_ts(&key[..]), &value[..])
+            .unwrap();
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("1.sst");
