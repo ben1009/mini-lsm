@@ -24,6 +24,7 @@ pub struct VlogEntryMeta {
 pub struct ValueLogReader {
     file: File,
     path: PathBuf,
+    file_id: u32,
 }
 
 impl ValueLogReader {
@@ -34,7 +35,17 @@ impl ValueLogReader {
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
         file.read_exact(&mut header_buf)?;
         VlogFileHeader::decode(&header_buf)?;
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            file_id: 0,
+        })
+    }
+
+    /// Set the file ID for generated `ValuePointer`s.
+    pub fn with_file_id(mut self, file_id: u32) -> Self {
+        self.file_id = file_id;
+        self
     }
 
     /// Read a single entry at the given offset with the given size.
@@ -63,13 +74,19 @@ impl ValueLogReader {
             HEADER_SIZE
         );
 
-        // Read the 24-byte header first to avoid allocating a huge buffer if
-        // `size` is corrupted, and to prevent double-allocating/copying the
-        // large value payload.
-        let mut hdr_buf = [0u8; HEADER_SIZE];
-        self.file.read_exact_at(&mut hdr_buf, offset)?;
+        // Read the entire entry in a single system call to minimize I/O overhead.
+        let mut buf = vec![0u8; size];
+        self.file.read_exact_at(&mut buf, offset).map_err(|e| {
+            anyhow!(
+                "failed to read entry of size {} at offset {} from {:?}: {}",
+                size,
+                offset,
+                self.path,
+                e
+            )
+        })?;
 
-        let mut hdr_bytes = &hdr_buf[..];
+        let mut hdr_bytes = &buf[..HEADER_SIZE];
         let header_crc32 = hdr_bytes.get_u32_le();
         let value_crc32 = hdr_bytes.get_u32_le();
         let value_len = hdr_bytes.get_u32_le() as usize;
@@ -88,35 +105,11 @@ impl ValueLogReader {
             size
         );
 
-        // OOM safety: `size` originates from the trusted LSM index/manifest,
-        // and `size == expected_size` above catches header corruption.
-        // `read_exact_at` will fail with `UnexpectedEof` if the entry is past EOF.
-
-        // Read key and value directly into their destination vectors to avoid
-        // copying large payloads through an intermediate buffer.
-        let mut key = vec![0u8; key_len];
-        self.file
-            .read_exact_at(&mut key, offset + HEADER_SIZE as u64)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to read key at offset {} from {:?}: {}",
-                    offset + HEADER_SIZE as u64,
-                    self.path,
-                    e
-                )
-            })?;
-
-        let mut value = vec![0u8; value_len];
-        self.file
-            .read_exact_at(&mut value, offset + HEADER_SIZE as u64 + key_len as u64)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to read value at offset {} from {:?}: {}",
-                    offset + HEADER_SIZE as u64 + key_len as u64,
-                    self.path,
-                    e
-                )
-            })?;
+        let key_start = HEADER_SIZE;
+        let key_end = key_start + key_len;
+        let value_end = key_end + value_len;
+        let key = buf[key_start..key_end].to_vec();
+        let value = buf[key_end..value_end].to_vec();
 
         // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
         let entry_header = VlogEntryHeader {
@@ -148,7 +141,7 @@ impl ValueLogReader {
 
         Ok(VlogEntry {
             ptr: ValuePointer {
-                file_id: 0, // caller should fill in the correct file_id
+                file_id: self.file_id,
                 offset,
                 size: size as u32,
             },
@@ -171,7 +164,7 @@ impl ValueLogReader {
             reader: BufReader::new(file),
             offset: VlogFileHeader::SIZE as u64,
             file_size,
-            file_id: 0, // caller can set via `with_file_id()`
+            file_id: self.file_id,
         })
     }
 }
