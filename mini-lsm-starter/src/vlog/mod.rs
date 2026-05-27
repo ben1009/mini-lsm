@@ -4,8 +4,15 @@ pub mod reader;
 pub use builder::ValueLogBuilder;
 pub use reader::{ValueLogReader, VlogEntryMeta};
 
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use anyhow::{Result, anyhow};
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
+use moka::sync::Cache;
+use parking_lot::{Mutex, RwLock};
 
 /// Magic number for vLog file header
 const VLOG_MAGIC: u32 = 0x564C4F47; // "VLOG"
@@ -228,6 +235,228 @@ pub struct VlogEntry {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
     pub size: usize,
+}
+
+// =============================================================================
+// ValueLog Manager (Phase 2 — SSTable Integration)
+// =============================================================================
+
+/// Handle to a cached vLog reader with shared ownership.
+pub struct ValueLogReaderHandle {
+    pub reader: ValueLogReader,
+}
+
+/// Tracks which vLog files are referenced by each SST.
+pub struct VlogReferences {
+    /// SST id -> set of vLog file ids it references.
+    sst_to_vlogs: RwLock<HashMap<usize, HashSet<u32>>>,
+    /// vLog file id -> set of SST ids that reference it.
+    vlog_to_ssts: RwLock<HashMap<u32, HashSet<usize>>>,
+}
+
+impl Default for VlogReferences {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VlogReferences {
+    pub fn new() -> Self {
+        Self {
+            sst_to_vlogs: RwLock::new(HashMap::new()),
+            vlog_to_ssts: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register that `sst_id` references the given vLog file ids.
+    pub fn register(&self, sst_id: usize, vlog_ids: &[u32]) {
+        if vlog_ids.is_empty() {
+            return;
+        }
+        let mut s2v = self.sst_to_vlogs.write();
+        let mut v2s = self.vlog_to_ssts.write();
+        let set = s2v.entry(sst_id).or_default();
+        for &vid in vlog_ids {
+            set.insert(vid);
+            v2s.entry(vid).or_default().insert(sst_id);
+        }
+    }
+
+    /// Get the set of vLog file ids referenced by `sst_id`.
+    pub fn get_sst_references(&self, sst_id: usize) -> Option<Vec<u32>> {
+        let s2v = self.sst_to_vlogs.read();
+        s2v.get(&sst_id).map(|set| set.iter().copied().collect())
+    }
+
+    /// Get the set of SST ids that reference `vlog_id`.
+    pub fn get_ssts_referencing(&self, vlog_id: u32) -> Option<Vec<usize>> {
+        let v2s = self.vlog_to_ssts.read();
+        v2s.get(&vlog_id).map(|set| set.iter().copied().collect())
+    }
+
+    /// Unregister all references for `sst_id` and return the previously
+    /// referenced vLog file ids.
+    pub fn unregister(&self, sst_id: usize) -> Vec<u32> {
+        let mut s2v = self.sst_to_vlogs.write();
+        let mut v2s = self.vlog_to_ssts.write();
+        let vlog_ids = s2v.remove(&sst_id);
+        if let Some(ref ids) = vlog_ids {
+            for vid in ids {
+                if let Some(ssts) = v2s.get_mut(vid) {
+                    ssts.remove(&sst_id);
+                    if ssts.is_empty() {
+                        v2s.remove(vid);
+                    }
+                }
+            }
+        }
+        vlog_ids.map_or_else(Vec::new, |set| set.into_iter().collect())
+    }
+}
+
+/// Manager for the value log file set.
+///
+/// Owns the active writer (for flushing), a cache of open readers, and
+/// reference tracking between SSTs and vLog files.
+pub struct ValueLog {
+    /// Root directory where vLog files are stored.
+    pub path: PathBuf,
+    /// Options controlling key-value separation.
+    pub options: ValueSeparationOptions,
+    /// Monotonically increasing file id for the *next* vLog file to create.
+    next_file_id: AtomicU32,
+    /// Cache of open readers keyed by `file_id`.
+    readers: Cache<u32, Arc<ValueLogReaderHandle>>,
+    /// Tracks which SSTs reference which vLog files.
+    pub references: VlogReferences,
+    /// Pending vLog file ids waiting for GC reclaim (Phase 3).
+    pending_deletions: Mutex<Vec<u32>>,
+}
+
+impl ValueLog {
+    /// Open the vLog manager. Scans `path` for existing `*.vlog` files
+    /// and sets `next_file_id` to one past the highest found id.
+    pub fn open(path: impl AsRef<Path>, options: ValueSeparationOptions) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        std::fs::create_dir_all(&path)?;
+
+        let mut max_id = 0u32;
+        for entry in std::fs::read_dir(&path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".vlog")
+                && let Ok(id) = stem.parse::<u32>()
+            {
+                max_id = max_id.max(id);
+            }
+        }
+
+        let readers = Cache::new(options.max_open_vlog_files as u64);
+
+        Ok(Self {
+            path,
+            options,
+            next_file_id: AtomicU32::new(max_id + 1),
+            readers,
+            references: VlogReferences::new(),
+            pending_deletions: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Return the next vLog file id to use for a new file.
+    pub fn next_file_id(&self) -> u32 {
+        self.next_file_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Full path for a given vLog file id.
+    pub fn path_of_file(&self, file_id: u32) -> PathBuf {
+        self.path.join(format!("{}.vlog", file_id))
+    }
+
+    /// Get a cached reader for `file_id`, opening it on cache miss.
+    pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReaderHandle>> {
+        let path = self.path_of_file(file_id);
+        self.readers
+            .try_get_with(file_id, || {
+                let reader = ValueLogReader::open(path.clone())?;
+                Ok::<_, anyhow::Error>(Arc::new(ValueLogReaderHandle { reader }))
+            })
+            .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
+    }
+
+    /// Read the value at `ptr`, verifying that the stored key matches
+    /// `expected_key`.
+    pub fn read(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
+        let handle = self.get_reader(ptr.file_id)?;
+        let entry = handle.reader.read_entry(ptr.offset, ptr.size)?;
+        if entry.key != expected_key {
+            return Err(anyhow!(
+                "vlog key mismatch: expected {:?}, got {:?}",
+                expected_key,
+                entry.key
+            ));
+        }
+        Ok(Bytes::from(entry.value))
+    }
+
+    /// Register that `sst_id` references the given vLog file ids.
+    pub fn register_sst_references(&self, sst_id: usize, vlog_ids: &[u32]) {
+        self.references.register(sst_id, vlog_ids);
+    }
+
+    /// Get the vLog file ids referenced by `sst_id`.
+    pub fn get_sst_references(&self, sst_id: usize) -> Option<Vec<u32>> {
+        self.references.get_sst_references(sst_id)
+    }
+
+    /// Get the SST ids that reference `vlog_id`.
+    pub fn get_ssts_referencing(&self, vlog_id: u32) -> Option<Vec<usize>> {
+        self.references.get_ssts_referencing(vlog_id)
+    }
+
+    /// Remove all reference tracking for `sst_id`.
+    pub fn unregister_sst_references(&self, sst_id: usize) -> Vec<u32> {
+        self.references.unregister(sst_id)
+    }
+
+    /// Remove a vLog file from disk and the reader cache.
+    pub fn remove_file(&self, file_id: u32) -> Result<()> {
+        self.readers.invalidate(&file_id);
+        let path = self.path_of_file(file_id);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 placeholders (GC)
+    // -----------------------------------------------------------------
+
+    /// Schedule a vLog file for later deletion once all SST references
+    /// are dropped. Called during GC.
+    pub fn schedule_deletion(&self, file_id: u32) {
+        self.pending_deletions.lock().push(file_id);
+    }
+
+    /// Attempt to delete any pending vLog files that are no longer
+    /// referenced by any SST.
+    pub fn reclaim_pending_deletions(&self) -> Result<usize> {
+        let mut pending = self.pending_deletions.lock();
+        let mut remaining = Vec::with_capacity(pending.len());
+        let mut deleted = 0usize;
+        for file_id in pending.drain(..) {
+            if self.get_ssts_referencing(file_id).is_none() {
+                self.remove_file(file_id)?;
+                deleted += 1;
+            } else {
+                remaining.push(file_id);
+            }
+        }
+        *pending = remaining;
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
@@ -608,5 +837,121 @@ mod tests {
             msg.contains("header CRC") || msg.contains("header crc"),
             "expected header CRC error, got: {msg}"
         );
+    }
+
+    // ================================================================
+    // ValueLog Manager tests
+    // ================================================================
+
+    use std::io::Write;
+
+    fn make_test_options() -> ValueSeparationOptions {
+        ValueSeparationOptions {
+            enabled: true,
+            min_value_size: 4,
+            max_value_size: 1 << 20,
+            max_vlog_file_size: 1 << 20,
+            gc_threshold_ratio: 0.5,
+            max_open_vlog_files: 4,
+        }
+    }
+
+    #[test]
+    fn test_vlog_manager_open_scans_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a couple of vLog files out-of-band.
+        for id in [3u32, 7, 12] {
+            let path = dir.path().join(format!("{}.vlog", id));
+            let mut f = std::fs::File::create(&path).unwrap();
+            let mut buf = Vec::new();
+            VlogFileHeader {
+                magic: VLOG_MAGIC,
+                version: 1,
+                reserved: [0u8; 10],
+            }
+            .encode(&mut buf);
+            f.write_all(&buf).unwrap();
+        }
+
+        let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
+        assert_eq!(vlog.next_file_id(), 13); // 12 + 1
+    }
+
+    #[test]
+    fn test_vlog_manager_reader_cache_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
+        let file_id = vlog.next_file_id();
+
+        // Write an entry manually.
+        let key = b"hello";
+        let value = b"world";
+        let path = vlog.path_of_file(file_id);
+        {
+            let mut writer = ValueLogWriter::create(path.clone(), file_id).unwrap();
+            writer.append(key, value).unwrap();
+            writer.close().unwrap();
+        }
+
+        // Read back via manager.
+        let ptr = ValuePointer {
+            file_id,
+            offset: VlogFileHeader::SIZE as u64,
+            size: VlogEntryHeader::compute_entry_size(key.len(), value.len()).unwrap() as u32,
+        };
+        let got = vlog.read(&ptr, key).unwrap();
+        assert_eq!(got.as_ref(), value);
+
+        // Cached reader is returned on second request.
+        let h1 = vlog.get_reader(file_id).unwrap();
+        let h2 = vlog.get_reader(file_id).unwrap();
+        assert!(Arc::ptr_eq(&h1, &h2));
+    }
+
+    #[test]
+    fn test_vlog_manager_reference_tracking() {
+        let refs = VlogReferences::new();
+        refs.register(1, &[10, 20]);
+        refs.register(2, &[20, 30]);
+
+        let mut r1 = refs.get_sst_references(1).unwrap();
+        r1.sort();
+        assert_eq!(r1, vec![10, 20]);
+
+        let mut r20 = refs.get_ssts_referencing(20).unwrap();
+        r20.sort();
+        assert_eq!(r20, vec![1, 2]);
+
+        let mut removed = refs.unregister(1);
+        removed.sort();
+        assert_eq!(removed, vec![10, 20]);
+        assert!(refs.get_sst_references(1).is_none());
+        assert_eq!(refs.get_ssts_referencing(10), None);
+        // SST 2 still references 20.
+        assert_eq!(refs.get_ssts_referencing(20).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn test_vlog_manager_remove_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let vlog = ValueLog::open(dir.path(), make_test_options()).unwrap();
+        let file_id = vlog.next_file_id();
+
+        let path = vlog.path_of_file(file_id);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let mut buf = Vec::new();
+            VlogFileHeader {
+                magic: VLOG_MAGIC,
+                version: 1,
+                reserved: [0u8; 10],
+            }
+            .encode(&mut buf);
+            f.write_all(&buf).unwrap();
+        }
+        assert!(path.exists());
+
+        vlog.remove_file(file_id).unwrap();
+        assert!(!path.exists());
     }
 }
