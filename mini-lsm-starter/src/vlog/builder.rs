@@ -173,9 +173,14 @@ impl ValueLogBuilder {
             value.len(),
             self.options.max_value_size
         );
-        let entry_size = HEADER_SIZE + key.len() + value.len();
+        let entry_size = HEADER_SIZE
+            .checked_add(key.len())
+            .and_then(|s| s.checked_add(value.len()))
+            .context("entry size overflow")?;
         let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
-        let total = entry_size + padding;
+        let total = entry_size
+            .checked_add(padding)
+            .context("total size overflow")?;
         anyhow::ensure!(
             total <= u32::MAX as usize,
             "vLog entry size {} exceeds u32 capacity",

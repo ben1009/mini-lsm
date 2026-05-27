@@ -24,7 +24,6 @@ pub struct VlogEntryMeta {
 pub struct ValueLogReader {
     file: File,
     path: PathBuf,
-    file_size: u64,
 }
 
 impl ValueLogReader {
@@ -35,12 +34,7 @@ impl ValueLogReader {
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
         file.read_exact(&mut header_buf)?;
         VlogFileHeader::decode(&header_buf)?;
-        let file_size = file.metadata()?.len();
-        Ok(Self {
-            file,
-            path,
-            file_size,
-        })
+        Ok(Self { file, path })
     }
 
     /// Read a single entry at the given offset with the given size.
@@ -56,14 +50,6 @@ impl ValueLogReader {
             "entry size {} is smaller than header size {}",
             size,
             HEADER_SIZE
-        );
-
-        anyhow::ensure!(
-            offset + size as u64 <= self.file_size,
-            "entry offset {} and size {} exceeds file length {}",
-            offset,
-            size,
-            self.file_size
         );
 
         let mut buf = vec![0u8; size];
@@ -140,12 +126,13 @@ impl ValueLogReader {
     /// reading only headers + keys (skipping values for efficiency).
     pub fn iter_headers(&self) -> Result<VlogHeaderIterator> {
         // Open an independent file handle so the iterator does not share
-        // the underlying file offset with the Mutex-guarded random reader.
+        // the underlying file offset with the positional reader.
         let file = File::open(&self.path)?;
+        let file_size = file.metadata()?.len();
         Ok(VlogHeaderIterator {
             reader: file,
             offset: VlogFileHeader::SIZE as u64,
-            file_size: self.file_size,
+            file_size,
             file_id: 0, // caller can set via `with_file_id()`
         })
     }
