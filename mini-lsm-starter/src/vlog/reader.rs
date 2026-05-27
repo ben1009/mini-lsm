@@ -45,10 +45,12 @@ impl ValueLogReader {
     /// - Validates `header_crc32` and `value_crc32`
     /// - Returns a `VlogEntry` with ptr, key, value, size
     pub fn read_entry(&self, offset: u64, size: u32) -> Result<VlogEntry> {
+        // Clone the file handle so we don't hold the lock during I/O.
         let mut file = self
             .file
             .lock()
-            .map_err(|e| anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow!("lock poisoned: {}", e))?
+            .try_clone()?;
         file.seek(SeekFrom::Start(offset))?;
 
         let size = size as usize;
@@ -210,9 +212,9 @@ impl Iterator for VlogHeaderIterator {
                 "entry extends past EOF"
             );
 
-            // Read only the key bytes (skip the value payload for efficiency)
-            let key_start = self.offset + HEADER_SIZE as u64;
-            self.reader.seek(SeekFrom::Start(key_start))?;
+            // Read only the key bytes (skip the value payload for efficiency).
+            // The file cursor is already at self.offset + HEADER_SIZE after
+            // reading the entry header, so no extra seek is needed.
             let mut key = vec![0u8; key_len];
             self.reader.read_exact(&mut key)?;
 
@@ -248,6 +250,11 @@ impl Iterator for VlogHeaderIterator {
                 entry_size: entry_size as usize,
             })
         })();
+
+        if result.is_err() {
+            // Prevent infinite loop on corruption / I/O error.
+            self.offset = self.file_size;
+        }
 
         Some(result)
     }
