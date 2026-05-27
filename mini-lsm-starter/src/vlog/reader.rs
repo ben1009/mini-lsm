@@ -88,6 +88,13 @@ impl ValueLogReader {
         );
 
         // Guard against OOM from corrupted pointers before allocating.
+        const MAX_ENTRY_SIZE: usize = 512 * 1024 * 1024;
+        anyhow::ensure!(
+            size <= MAX_ENTRY_SIZE,
+            "entry size {} exceeds maximum allowed size ({})",
+            size,
+            MAX_ENTRY_SIZE
+        );
         let file_len = self.file_len;
         anyhow::ensure!(
             offset
