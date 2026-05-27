@@ -142,6 +142,10 @@ impl<'a> GarbageCollector<'a> {
 
         // Fsync the new vLog before binding pointers into the LSM tree
         writer.close()?;
+        // Sync the directory to ensure the new file's directory entry is durable
+        if let std::result::Result::Ok(dir) = std::fs::File::open(&self.vlog.path) {
+            let _ = dir.sync_all();
+        }
 
         // Phase 2: CAS each key to point to the new location
         let mut cas_failures = 0usize;
