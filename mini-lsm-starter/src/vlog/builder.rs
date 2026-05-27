@@ -85,10 +85,15 @@ impl ValueLogWriter {
         let mut header_buf = Vec::with_capacity(HEADER_SIZE);
         final_header.encode(&mut header_buf);
 
-        // Compute alignment padding
-        let entry_size = HEADER_SIZE + key.len() + value.len();
+        // Compute alignment padding (overflow-safe)
+        let entry_size = HEADER_SIZE
+            .checked_add(key.len())
+            .and_then(|s| s.checked_add(value.len()))
+            .context("entry size overflow")?;
         let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
-        let total = entry_size + padding;
+        let total = entry_size
+            .checked_add(padding)
+            .context("total size overflow")?;
 
         // Write: header + key + value + padding
         self.file.write_all(&header_buf)?;
@@ -175,6 +180,17 @@ impl ValueLogBuilder {
             total <= u32::MAX as usize,
             "vLog entry size {} exceeds u32 capacity",
             total
+        );
+        let new_size = self
+            .writer
+            .size()
+            .checked_add(total as u64)
+            .context("file size overflow")?;
+        anyhow::ensure!(
+            new_size <= self.options.max_vlog_file_size as u64,
+            "vLog file size {} would exceed max_vlog_file_size {}",
+            new_size,
+            self.options.max_vlog_file_size
         );
 
         let written = self.writer.append(key, value)?;

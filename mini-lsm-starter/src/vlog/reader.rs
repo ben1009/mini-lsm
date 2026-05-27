@@ -24,6 +24,7 @@ pub struct VlogEntryMeta {
 pub struct ValueLogReader {
     file: Mutex<File>,
     path: PathBuf,
+    file_size: u64,
 }
 
 impl ValueLogReader {
@@ -34,9 +35,11 @@ impl ValueLogReader {
         let mut header_buf = [0u8; VlogFileHeader::SIZE];
         file.read_exact(&mut header_buf)?;
         VlogFileHeader::decode(&header_buf)?;
+        let file_size = file.metadata()?.len();
         Ok(Self {
             file: Mutex::new(file),
             path,
+            file_size,
         })
     }
 
@@ -64,13 +67,12 @@ impl ValueLogReader {
             HEADER_SIZE
         );
 
-        let file_len = file.metadata()?.len();
         anyhow::ensure!(
-            offset + size as u64 <= file_len,
+            offset + size as u64 <= self.file_size,
             "entry offset {} and size {} exceeds file length {}",
             offset,
             size,
-            file_len
+            self.file_size
         );
 
         let mut buf = vec![0u8; size];
@@ -152,11 +154,10 @@ impl ValueLogReader {
         // Open an independent file handle so the iterator does not share
         // the underlying file offset with the Mutex-guarded random reader.
         let file = File::open(&self.path)?;
-        let file_size = file.metadata()?.len();
         Ok(VlogHeaderIterator {
             reader: file,
             offset: VlogFileHeader::SIZE as u64,
-            file_size,
+            file_size: self.file_size,
             file_id: 0, // caller can set via `with_file_id()`
         })
     }
@@ -208,10 +209,11 @@ impl Iterator for VlogHeaderIterator {
             let entry_size = raw_size.div_ceil(ALIGNMENT as u64) * ALIGNMENT as u64;
 
             anyhow::ensure!(entry_size <= u32::MAX as u64, "entry size exceeds u32::MAX");
-            anyhow::ensure!(
-                self.offset + entry_size <= self.file_size,
-                "entry extends past EOF"
-            );
+            let next_offset = self
+                .offset
+                .checked_add(entry_size)
+                .ok_or_else(|| anyhow!("offset overflow"))?;
+            anyhow::ensure!(next_offset <= self.file_size, "entry extends past EOF");
 
             // Read only the key bytes (skip the value payload for efficiency).
             // The file cursor is already at self.offset + HEADER_SIZE after
@@ -238,7 +240,7 @@ impl Iterator for VlogHeaderIterator {
             );
 
             let current_offset = self.offset;
-            self.offset += entry_size;
+            self.offset = next_offset;
 
             Ok(VlogEntryMeta {
                 ptr: ValuePointer {
