@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -77,30 +77,22 @@ impl ValueLogReader {
             size
         );
 
-        // Read key and value directly into their destination vectors.
-        let mut key = vec![0u8; key_len];
+        // Read key and value together in a single positional read to reduce
+        // system call overhead, then split into separate vectors.
+        let mut kv_buf = vec![0u8; key_len + value_len];
         self.file
-            .read_exact_at(&mut key, offset + HEADER_SIZE as u64)
+            .read_exact_at(&mut kv_buf, offset + HEADER_SIZE as u64)
             .map_err(|e| {
                 anyhow!(
-                    "failed to read key at offset {} from {:?}: {}",
+                    "failed to read key-value payload at offset {} from {:?}: {}",
                     offset + HEADER_SIZE as u64,
                     self.path,
                     e
                 )
             })?;
-
-        let mut value = vec![0u8; value_len];
-        self.file
-            .read_exact_at(&mut value, offset + HEADER_SIZE as u64 + key_len as u64)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to read value at offset {} from {:?}: {}",
-                    offset + HEADER_SIZE as u64 + key_len as u64,
-                    self.path,
-                    e
-                )
-            })?;
+        let (key_slice, value_slice) = kv_buf.split_at(key_len);
+        let key = key_slice.to_vec();
+        let value = value_slice.to_vec();
 
         // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
         let entry_header = VlogEntryHeader {
@@ -145,9 +137,10 @@ impl ValueLogReader {
     /// Return an iterator that yields `VlogEntryMeta` for each entry,
     /// reading only headers + keys (skipping values for efficiency).
     pub fn iter_headers(&self) -> Result<VlogHeaderIterator> {
-        // Open an independent file handle so the iterator does not share
-        // the underlying file offset with the positional reader.
-        let file = File::open(&self.path)?;
+        // Clone the underlying file descriptor so the iterator survives
+        // path renames/unlinks and does not share the file offset with
+        // concurrent positional reads.
+        let file = self.file.try_clone()?;
         let file_size = file.metadata()?.len();
         Ok(VlogHeaderIterator {
             reader: file,
@@ -185,10 +178,9 @@ impl Iterator for VlogHeaderIterator {
         }
 
         let result = (|| -> Result<VlogEntryMeta> {
-            // Read the 24-byte entry header
+            // Read the 24-byte entry header via positional read
             let mut hdr_buf = [0u8; HEADER_SIZE];
-            self.reader.seek(SeekFrom::Start(self.offset))?;
-            self.reader.read_exact(&mut hdr_buf)?;
+            self.reader.read_exact_at(&mut hdr_buf, self.offset)?;
 
             let mut hdr_bytes: &[u8] = &hdr_buf;
             let header_crc32 = hdr_bytes.get_u32_le();
@@ -211,10 +203,9 @@ impl Iterator for VlogHeaderIterator {
             anyhow::ensure!(next_offset <= self.file_size, "entry extends past EOF");
 
             // Read only the key bytes (skip the value payload for efficiency).
-            // The file cursor is already at self.offset + HEADER_SIZE after
-            // reading the entry header, so no extra seek is needed.
             let mut key = vec![0u8; key_len];
-            self.reader.read_exact(&mut key)?;
+            self.reader
+                .read_exact_at(&mut key, self.offset + HEADER_SIZE as u64)?;
 
             // Validate header CRC32
             let entry_header = VlogEntryHeader {

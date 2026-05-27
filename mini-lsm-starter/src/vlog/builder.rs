@@ -172,17 +172,6 @@ impl ValueLogBuilder {
             "vLog entry size {} exceeds u32 capacity",
             total
         );
-        let new_size = self
-            .writer
-            .size()
-            .checked_add(total as u64)
-            .context("file size overflow")?;
-        anyhow::ensure!(
-            new_size <= self.options.max_vlog_file_size as u64,
-            "vLog file size {} would exceed max_vlog_file_size {}",
-            new_size,
-            self.options.max_vlog_file_size
-        );
 
         let written = self.writer.append(key, value)?;
         debug_assert_eq!(written, total);
