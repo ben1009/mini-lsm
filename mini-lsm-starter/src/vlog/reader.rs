@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use bytes::Buf;
 
-use super::{ALIGNMENT, HEADER_SIZE, ValuePointer, VlogEntry, VlogEntryHeader, VlogFileHeader};
+use super::{HEADER_SIZE, ValuePointer, VlogEntry, VlogEntryHeader, VlogFileHeader};
 
 /// Lightweight header-only entry metadata for GC analysis.
 /// Contains the pointer, key, and value length without reading the value payload.
@@ -180,8 +180,8 @@ impl Iterator for VlogHeaderIterator {
             hdr_bytes.copy_to_slice(&mut padding);
 
             // Compute total entry size with alignment padding
-            let raw_size = HEADER_SIZE as u64 + key_len as u64 + value_len as u64;
-            let entry_size = raw_size.div_ceil(ALIGNMENT as u64) * ALIGNMENT as u64;
+            let entry_size = VlogEntryHeader::compute_entry_size(key_len, value_len as usize)
+                .ok_or_else(|| anyhow!("entry size overflow"))? as u64;
 
             anyhow::ensure!(entry_size <= u32::MAX as u64, "entry size exceeds u32::MAX");
             let next_offset = self

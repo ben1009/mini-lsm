@@ -57,7 +57,7 @@ pub struct ValuePointer {
 impl ValuePointer {
     /// Encode to bytes for storage in LSM tree.
     /// Layout (17 bytes): `[tag:1][file_id:4][offset:8][size:4]`
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    pub fn encode(&self, mut buf: impl BufMut) {
         buf.put_u8(VALUE_POINTER_TAG);
         buf.put_u32_le(self.file_id);
         buf.put_u64_le(self.offset);
@@ -149,10 +149,10 @@ pub struct VlogFileHeader {
 impl VlogFileHeader {
     pub const SIZE: usize = 16;
 
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    pub fn encode(&self, mut buf: impl BufMut) {
         buf.put_u32_le(self.magic);
         buf.put_u16_le(self.version);
-        buf.extend_from_slice(&self.reserved);
+        buf.put_slice(&self.reserved);
     }
 
     pub fn decode(mut buf: &[u8]) -> Result<Self> {
@@ -191,13 +191,20 @@ impl VlogEntryHeader {
     }
 
     /// Serialize the header to bytes (24 bytes, little-endian).
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    pub fn encode(&self, mut buf: impl BufMut) {
         buf.put_u32_le(self.header_crc32);
         buf.put_u32_le(self.value_crc32);
         buf.put_u32_le(self.value_len);
         buf.put_u16_le(self.key_len);
         buf.put_u16_le(self.flags);
-        buf.extend_from_slice(&self._padding);
+        buf.put_slice(&self._padding);
+    }
+
+    /// Compute the total entry size including header, key, value, and alignment padding.
+    pub fn compute_entry_size(key_len: usize, value_len: usize) -> Option<usize> {
+        let entry_size = HEADER_SIZE.checked_add(key_len)?.checked_add(value_len)?;
+        let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
+        entry_size.checked_add(padding)
     }
 
     /// Compute the CRC32 over (header_without_header_crc + key_bytes).

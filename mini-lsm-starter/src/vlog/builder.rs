@@ -16,7 +16,6 @@ use crate::vlog::{
 pub struct ValueLogWriter {
     file: BufWriter<File>,
     offset: u64,
-    size: u64,
     file_id: u32,
 }
 
@@ -37,14 +36,13 @@ impl ValueLogWriter {
             version: 1,
             reserved: [0u8; 10],
         };
-        let mut header_buf = Vec::with_capacity(VlogFileHeader::SIZE);
-        header.encode(&mut header_buf);
+        let mut header_buf = [0u8; VlogFileHeader::SIZE];
+        header.encode(&mut header_buf[..]);
         writer.write_all(&header_buf)?;
 
         Ok(Self {
             file: writer,
             offset: VlogFileHeader::SIZE as u64,
-            size: VlogFileHeader::SIZE as u64,
             file_id,
         })
     }
@@ -85,15 +83,10 @@ impl ValueLogWriter {
         let mut header_buf = Vec::with_capacity(HEADER_SIZE);
         final_header.encode(&mut header_buf);
 
-        // Compute alignment padding (overflow-safe)
-        let entry_size = HEADER_SIZE
-            .checked_add(key.len())
-            .and_then(|s| s.checked_add(value.len()))
+        // Compute total entry size with alignment padding (overflow-safe)
+        let total = VlogEntryHeader::compute_entry_size(key.len(), value.len())
             .context("entry size overflow")?;
-        let padding = (ALIGNMENT - (entry_size % ALIGNMENT)) % ALIGNMENT;
-        let total = entry_size
-            .checked_add(padding)
-            .context("total size overflow")?;
+        let padding = total - HEADER_SIZE - key.len() - value.len();
 
         // Write: header + key + value + padding
         self.file.write_all(&header_buf)?;
@@ -104,7 +97,6 @@ impl ValueLogWriter {
         }
 
         self.offset += total as u64;
-        self.size += total as u64;
 
         Ok(total)
     }
@@ -116,7 +108,7 @@ impl ValueLogWriter {
 
     /// Total bytes written so far (equivalent to offset after the file header).
     pub fn size(&self) -> u64 {
-        self.size
+        self.offset
     }
 
     /// The file ID of this vLog file.
