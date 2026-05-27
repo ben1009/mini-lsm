@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Buf;
@@ -28,7 +29,7 @@ pub struct ValueLogReader {
     file: File,
     path: PathBuf,
     file_id: u32,
-    file_len: u64,
+    file_len: AtomicU64,
 }
 
 impl ValueLogReader {
@@ -50,7 +51,7 @@ impl ValueLogReader {
             file,
             path,
             file_id: 0,
-            file_len,
+            file_len: AtomicU64::new(file_len),
         })
     }
 
@@ -95,7 +96,17 @@ impl ValueLogReader {
             size,
             MAX_ENTRY_SIZE
         );
-        let file_len = self.file_len;
+        // Dynamically refresh the cached file length if the read appears to
+        // exceed it, allowing reads on actively-growing vLog files.
+        let mut file_len = self.file_len.load(Ordering::Relaxed);
+        if offset
+            .checked_add(size as u64)
+            .is_none_or(|end| end > file_len)
+        {
+            let new_len = self.file.metadata()?.len();
+            self.file_len.store(new_len, Ordering::Relaxed);
+            file_len = new_len;
+        }
         anyhow::ensure!(
             offset
                 .checked_add(size as u64)
