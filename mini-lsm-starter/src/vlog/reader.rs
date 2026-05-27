@@ -51,6 +51,12 @@ impl ValueLogReader {
             offset
         );
         anyhow::ensure!(
+            offset.is_multiple_of(super::ALIGNMENT as u64),
+            "offset {} is not aligned to {} bytes",
+            offset,
+            super::ALIGNMENT
+        );
+        anyhow::ensure!(
             size >= HEADER_SIZE,
             "entry size {} is smaller than header size {}",
             size,
@@ -82,22 +88,31 @@ impl ValueLogReader {
             size
         );
 
-        // Read key and value together in a single positional read to reduce
-        // system call overhead, then split into separate vectors.
-        let mut kv_buf = vec![0u8; key_len + value_len];
+        // Read key and value directly into their destination vectors to avoid
+        // copying large payloads through an intermediate buffer.
+        let mut key = vec![0u8; key_len];
         self.file
-            .read_exact_at(&mut kv_buf, offset + HEADER_SIZE as u64)
+            .read_exact_at(&mut key, offset + HEADER_SIZE as u64)
             .map_err(|e| {
                 anyhow!(
-                    "failed to read key-value payload at offset {} from {:?}: {}",
+                    "failed to read key at offset {} from {:?}: {}",
                     offset + HEADER_SIZE as u64,
                     self.path,
                     e
                 )
             })?;
-        let (key_slice, value_slice) = kv_buf.split_at(key_len);
-        let key = key_slice.to_vec();
-        let value = value_slice.to_vec();
+
+        let mut value = vec![0u8; value_len];
+        self.file
+            .read_exact_at(&mut value, offset + HEADER_SIZE as u64 + key_len as u64)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to read value at offset {} from {:?}: {}",
+                    offset + HEADER_SIZE as u64 + key_len as u64,
+                    self.path,
+                    e
+                )
+            })?;
 
         // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
         let entry_header = VlogEntryHeader {
