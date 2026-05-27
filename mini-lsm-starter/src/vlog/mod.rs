@@ -340,15 +340,15 @@ impl ValueLog {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)?;
 
-        let mut max_id = 0u32;
+        let mut max_id: Option<u32> = None;
         for entry in std::fs::read_dir(&path)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(stem) = name.strip_suffix(".vlog")
-                && let Ok(id) = stem.parse::<u32>()
-            {
-                max_id = max_id.max(id);
+            if let Some(stem) = name.strip_suffix(".vlog") {
+                if let Ok(id) = stem.parse::<u32>() {
+                    max_id = Some(max_id.map_or(id, |m| std::cmp::max(m, id)));
+                }
             }
         }
 
@@ -357,7 +357,7 @@ impl ValueLog {
         Ok(Self {
             path,
             options,
-            next_file_id: AtomicU32::new(max_id + 1),
+            next_file_id: AtomicU32::new(max_id.map_or(0, |id| id + 1)),
             readers,
             references: VlogReferences::new(),
             pending_deletions: Mutex::new(Vec::new()),
@@ -424,8 +424,10 @@ impl ValueLog {
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
         self.readers.invalidate(&file_id);
         let path = self.path_of_file(file_id);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -444,18 +446,28 @@ impl ValueLog {
     /// referenced by any SST.
     pub fn reclaim_pending_deletions(&self) -> Result<usize> {
         let mut pending = self.pending_deletions.lock();
-        let mut remaining = Vec::with_capacity(pending.len());
+        let to_process: Vec<u32> = std::mem::take(&mut *pending);
+        let mut remaining = Vec::new();
         let mut deleted = 0usize;
-        for file_id in pending.drain(..) {
+        let mut first_err = None;
+        for file_id in to_process {
             if self.get_ssts_referencing(file_id).is_none() {
-                self.remove_file(file_id)?;
-                deleted += 1;
+                match self.remove_file(file_id) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        first_err = Some(e);
+                        remaining.push(file_id);
+                    }
+                }
             } else {
                 remaining.push(file_id);
             }
         }
         *pending = remaining;
-        Ok(deleted)
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(deleted),
+        }
     }
 }
 
