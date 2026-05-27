@@ -241,11 +241,6 @@ pub struct VlogEntry {
 // ValueLog Manager (Phase 2 — SSTable Integration)
 // =============================================================================
 
-/// Handle to a cached vLog reader with shared ownership.
-pub struct ValueLogReaderHandle {
-    pub reader: ValueLogReader,
-}
-
 /// Tracks which vLog files are referenced by each SST.
 pub struct VlogReferences {
     /// SST id -> set of vLog file ids it references.
@@ -326,7 +321,7 @@ pub struct ValueLog {
     /// Monotonically increasing file id for the *next* vLog file to create.
     next_file_id: AtomicU32,
     /// Cache of open readers keyed by `file_id`.
-    readers: Cache<u32, Arc<ValueLogReaderHandle>>,
+    readers: Cache<u32, Arc<ValueLogReader>>,
     /// Tracks which SSTs reference which vLog files.
     pub references: VlogReferences,
     /// Pending vLog file ids waiting for GC reclaim (Phase 3).
@@ -344,10 +339,11 @@ impl ValueLog {
         for entry in std::fs::read_dir(&path)? {
             let entry = entry?;
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(stem) = name.strip_suffix(".vlog") {
-                if let Ok(id) = stem.parse::<u32>() {
-                    max_id = Some(max_id.map_or(id, |m| std::cmp::max(m, id)));
+            if let Some(name) = name.to_str() {
+                if let Some(stem) = name.strip_suffix(".vlog") {
+                    if let Ok(id) = stem.parse::<u32>() {
+                        max_id = Some(max_id.map_or(id, |m| std::cmp::max(m, id)));
+                    }
                 }
             }
         }
@@ -375,12 +371,12 @@ impl ValueLog {
     }
 
     /// Get a cached reader for `file_id`, opening it on cache miss.
-    pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReaderHandle>> {
+    pub fn get_reader(&self, file_id: u32) -> Result<Arc<ValueLogReader>> {
         let path = self.path_of_file(file_id);
         self.readers
             .try_get_with(file_id, || {
-                let reader = ValueLogReader::open(path.clone())?;
-                Ok::<_, anyhow::Error>(Arc::new(ValueLogReaderHandle { reader }))
+                let reader = ValueLogReader::open(path)?;
+                Ok::<_, anyhow::Error>(Arc::new(reader))
             })
             .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
     }
@@ -388,8 +384,8 @@ impl ValueLog {
     /// Read the value at `ptr`, verifying that the stored key matches
     /// `expected_key`.
     pub fn read(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
-        let handle = self.get_reader(ptr.file_id)?;
-        let entry = handle.reader.read_entry(ptr.offset, ptr.size)?;
+        let reader = self.get_reader(ptr.file_id)?;
+        let entry = reader.read_entry(ptr.offset, ptr.size)?;
         if entry.key != expected_key {
             return Err(anyhow!(
                 "vlog key mismatch: expected {:?}, got {:?}",
