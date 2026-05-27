@@ -79,9 +79,9 @@ impl ValueLogWriter {
             ..entry_header
         };
 
-        // Serialize the header
-        let mut header_buf = Vec::with_capacity(HEADER_SIZE);
-        final_header.encode(&mut header_buf);
+        // Serialize the header to a stack-allocated array
+        let mut header_buf = [0u8; HEADER_SIZE];
+        final_header.encode(&mut header_buf[..]);
 
         // Compute total entry size with alignment padding (overflow-safe)
         let total = VlogEntryHeader::compute_entry_size(key.len(), value.len())

@@ -52,11 +52,13 @@ impl ValueLogReader {
             HEADER_SIZE
         );
 
-        let mut buf = vec![0u8; size];
-        self.file.read_exact_at(&mut buf, offset)?;
+        // Read the 24-byte header first to avoid allocating a huge buffer if
+        // `size` is corrupted, and to prevent double-allocating/copying the
+        // large value payload.
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        self.file.read_exact_at(&mut hdr_buf, offset)?;
 
-        // Parse header (first 24 bytes)
-        let mut hdr_bytes = &buf[..HEADER_SIZE];
+        let mut hdr_bytes = &hdr_buf[..];
         let header_crc32 = hdr_bytes.get_u32_le();
         let value_crc32 = hdr_bytes.get_u32_le();
         let value_len = hdr_bytes.get_u32_le() as usize;
@@ -79,8 +81,14 @@ impl ValueLogReader {
             size - HEADER_SIZE - key_len
         );
 
-        let key = buf[HEADER_SIZE..HEADER_SIZE + key_len].to_vec();
-        let value = buf[HEADER_SIZE + key_len..HEADER_SIZE + key_len + value_len].to_vec();
+        // Read key and value directly into their destination vectors.
+        let mut key = vec![0u8; key_len];
+        self.file
+            .read_exact_at(&mut key, offset + HEADER_SIZE as u64)?;
+
+        let mut value = vec![0u8; value_len];
+        self.file
+            .read_exact_at(&mut value, offset + HEADER_SIZE as u64 + key_len as u64)?;
 
         // Validate header CRC32: covers value_crc32 + value_len + key_len + flags + padding + key
         let entry_header = VlogEntryHeader {
