@@ -286,7 +286,7 @@ impl VlogReferences {
         if vlog_ids.is_empty() {
             return;
         }
-        let set: HashSet<u32> = vlog_ids.iter().copied().collect();
+        let set: HashSet<u32> = HashSet::from_iter(vlog_ids.iter().copied());
         for &vid in &set {
             inner.vlog_to_ssts.entry(vid).or_default().insert(sst_id);
         }
@@ -315,9 +315,8 @@ impl VlogReferences {
     /// referenced vLog file ids.
     pub fn unregister(&self, sst_id: usize) -> Vec<u32> {
         let mut inner = self.inner.write();
-        let vlog_ids = inner.sst_to_vlogs.remove(&sst_id);
-        if let Some(ids) = &vlog_ids {
-            for vid in ids {
+        if let Some(vlog_ids) = inner.sst_to_vlogs.remove(&sst_id) {
+            for vid in &vlog_ids {
                 if let Some(ssts) = inner.vlog_to_ssts.get_mut(vid) {
                     ssts.remove(&sst_id);
                     if ssts.is_empty() {
@@ -325,8 +324,10 @@ impl VlogReferences {
                     }
                 }
             }
+            vlog_ids.into_iter().collect()
+        } else {
+            Vec::new()
         }
-        vlog_ids.map_or_else(Vec::new, |set| set.into_iter().collect())
     }
 }
 
@@ -359,11 +360,14 @@ impl ValueLog {
         let mut max_id: Option<u32> = None;
         for entry in std::fs::read_dir(&path)? {
             let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
             let name = entry.file_name();
             if let Some(name) = name.to_str() {
                 if let Some(stem) = name.strip_suffix(".vlog") {
                     if let Ok(id) = stem.parse::<u32>() {
-                        max_id = Some(max_id.map_or(id, |m| std::cmp::max(m, id)));
+                        max_id = Some(max_id.map_or(id, |m| m.max(id)));
                     }
                 }
             }
@@ -462,8 +466,10 @@ impl ValueLog {
     /// Attempt to delete any pending vLog files that are no longer
     /// referenced by any SST.
     pub fn reclaim_pending_deletions(&self) -> Result<usize> {
-        let mut pending = self.pending_deletions.lock();
-        let to_process: Vec<u32> = std::mem::take(&mut *pending);
+        let to_process: Vec<u32> = {
+            let mut pending = self.pending_deletions.lock();
+            std::mem::take(&mut *pending)
+        };
         let mut remaining = Vec::new();
         let mut deleted = 0usize;
         let mut first_err = None;
@@ -484,7 +490,10 @@ impl ValueLog {
                 remaining.push(file_id);
             }
         }
-        *pending = remaining;
+        {
+            let mut pending = self.pending_deletions.lock();
+            *pending = remaining;
+        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(deleted),
