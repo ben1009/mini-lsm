@@ -1753,6 +1753,10 @@ This section documents intentional deviations between the original RFC design an
 
 **Actual implementation:** `get_reader` returns `Result<Arc<ValueLogReader>>`. The reader cache (`moka::sync::Cache`) provides implicit liveness, but `reclaim_pending_deletions` does not check the cache or any explicit refcounts before unlinking — it only verifies that no SSTs reference the file. Explicit per-file refcounts are not implemented.
 
+### Memtable Flushing with Key-Value Separation
+
+**Actual implementation:** When flushing a memtable with vLog enabled, the engine distinguishes between `ValuePointer` and `Inline` entries. `ValuePointer` entries (from GC CAS rewrites) are preserved as-is via `add_raw()` to avoid double-indirection. `Inline` entries have their 1-byte `KvKind` prefix stripped and are processed via `add()`, which may further separate large values into the vLog.
+
 ### WAL Format
 
 **Original design:** WAL stored `(key, value, KvKind)` triples for every write.
