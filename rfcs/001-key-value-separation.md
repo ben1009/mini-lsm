@@ -1543,7 +1543,7 @@ entries for GC CAS rewrites. Recovery proceeds in three phases:
 2. **Manifest replay**: for every `Flush` / `FlushV2` / `Compaction` / `CompactionV2` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
 3. **Orphan vLog cleanup**: scan the data directory for `.vlog` files. Any file not referenced by any SST's vLog reference list **and** not referenced by the WAL-recovered memtable is orphaned and deleted. `NewVlogFile` alone is not enough to keep a file: a crash after file allocation but before `FlushV2`/GC CAS would otherwise leak a fully unreferenced file.
 
-> **Implementation Note:** The actual implementation uses a simpler check during recovery: only vLog files referenced by *active* SSTs (those present in `state.sstables`) are registered via `register_sst_references`. Orphaned files are left on disk (no automatic deletion on startup). Pending deletions are memory-only and lost on restart, which can leak disk space; see [Known Limitations](#known-limitations).
+> **Implementation Note:** The actual implementation uses a simpler check during recovery: only vLog files referenced by *active* SSTs (those present in `state.sstables`) are registered via `register_sst_references`. Orphaned files are left on disk (no automatic deletion on startup). Pending deletions are memory-only and lost on restart, which can leak disk space; see [Known Limitations](#known-limitations). Additionally, during garbage collection the parent directory is synced (`fsync`) after the new vLog file is created and before updating pointers via CAS, ensuring the directory entry is durable and preventing dangling pointers in the event of a crash.
 
 **Flush-time crash safety**: vLog writes are fsynced (batch, once per flush) before the SST is written to disk. If a crash occurs:
 - **Before SST is committed to manifest**: the flush is incomplete — the memtable (rebuilt from WAL) still contains the full values. The partially written vLog and SST files are orphaned.
@@ -1725,7 +1725,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** `PendingDeletion` carried an `obsolete_at_ts: u64` timestamp and `reclaim_pending_deletions` accepted a `watermark_ts: u64` parameter. Files were only deleted after the MVCC watermark advanced past the retirement timestamp.
 
-**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path.
+**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path. To avoid potential deadlocks, the implementation extracts the pending deletions first (using `std::mem::take`) rather than calling operations inside a closure while holding the lock.
 
 ### Background GC Thread Pool
 
