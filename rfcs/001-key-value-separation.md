@@ -597,7 +597,7 @@ pub struct ValueLog {
     manifest: Arc<Manifest>,
 }
 
-> **Implementation Note:** The `lsm_clock` and `Clock` trait described above are not present in the actual implementation. Instead, `pending_deletions` stores only `file_id` (no `obsolete_at_ts`) and relies on SST reference counting plus `reader_count()` to determine when a file is safe to delete. See [Known Limitations](#known-limitations) for details.
+> **Implementation Note:** The `lsm_clock` and `Clock` trait described above are not present in the actual implementation. Instead, `pending_deletions` stores only `file_id` (no `obsolete_at_ts`) and relies solely on SST reference counting (`get_ssts_referencing().is_empty()`) to determine when a file is safe to delete. See [Known Limitations](#known-limitations) for details.
 
 impl ValueLog {
     /// Write a key-value pair to the active vLog file.
@@ -1517,7 +1517,7 @@ pub enum ManifestRecord {
 }
 ```
 
-> **Implementation Note:** Only `GcCompaction` (with `input_vlog_ids` and `output_vlog_ids`) was actually added to the manifest. The `FlushV2`, `CompactionV2`, `NewVlogFile`, and `DeleteVlogFile` variants were designed but not implemented. Recovery currently re-opens SST footers to rebuild the `sst_to_vlogs` index on startup instead of reading it directly from the manifest.
+> **Implementation Note:** `GcCompaction`, `FlushV2`, and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. The `NewVlogFile` and `DeleteVlogFile` variants were designed but not implemented. Recovery reads `FlushV2` and `CompactionV2` records directly from the manifest to rebuild the `sst_to_vlogs` index on startup.
 
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
@@ -1725,7 +1725,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** `PendingDeletion` carried an `obsolete_at_ts: u64` timestamp and `reclaim_pending_deletions` accepted a `watermark_ts: u64` parameter. Files were only deleted after the MVCC watermark advanced past the retirement timestamp.
 
-**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks two conditions: (1) no open reader handles reference the file, and (2) no SSTs reference it (`get_ssts_referencing().is_empty()`). The MVCC watermark check is omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path.
+**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path.
 
 ### Background GC Thread Pool
 
@@ -1737,7 +1737,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** New manifest variants `FlushV2`, `CompactionV2`, `NewVlogFile`, and `DeleteVlogFile` were specified to persist SST→vLog references and vLog file lifecycle.
 
-**Actual implementation:** Only a `GcCompaction(old_file_id, new_file_id)` manifest record was added. SST→vLog references are rebuilt from existing SST footers during recovery (via `register_sst_references`). vLog file IDs are discovered by scanning the `.vlog` directory on startup rather than tracking them in the manifest.
+**Actual implementation:** `GcCompaction`, `FlushV2`, and `CompactionV2` manifest records were implemented. SST→vLog references are recovered directly from `FlushV2` and `CompactionV2` records in the manifest on startup (via `register_sst_references`). vLog file IDs are discovered by scanning the `.vlog` directory on startup rather than tracking them in the manifest.
 
 ### ValueLogStats / Metrics API
 
@@ -1749,7 +1749,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** `get_reader` returned a `ValueLogReaderHandle` RAII guard that incremented/decremented a per-file `AtomicUsize` refcount, preventing deletion while iterators held open handles.
 
-**Actual implementation:** `get_reader` returns a plain `ValueLogReader`. The reader cache (`moka::sync::Cache`) provides implicit liveness, and `reclaim_pending_deletions` checks the cache for active entries before unlinking. Explicit per-file refcounts are not implemented.
+**Actual implementation:** `get_reader` returns a plain `ValueLogReader`. The reader cache (`moka::sync::Cache`) provides implicit liveness, but `reclaim_pending_deletions` does not check the cache or any explicit refcounts before unlinking — it only verifies that no SSTs reference the file. Explicit per-file refcounts are not implemented.
 
 ### WAL Format
 
