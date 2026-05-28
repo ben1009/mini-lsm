@@ -125,73 +125,79 @@ impl<'a> GarbageCollector<'a> {
         // Phase 1: Read live entries and write to a new vLog file
         let new_file_id = self.vlog.next_file_id();
         let new_path = self.vlog.path_of_file(new_file_id);
-        let mut writer = ValueLogWriter::create(new_path, new_file_id)?;
 
-        let mut rewrites: Vec<(Vec<u8>, ValuePointer, ValuePointer)> = Vec::new();
+        // Wrap compaction in a closure so we can clean up the new file on error
+        let compact_res = (|| -> Result<GcResult> {
+            let mut writer = ValueLogWriter::create(new_path.clone(), new_file_id)?;
 
-        for live_ref in &analysis.live_entries {
-            let (key, value) = self.vlog.read_entry(&live_ref.ptr)?;
-            let bytes_written = writer.append(&key, &value)?;
-            let new_ptr = ValuePointer {
-                file_id: new_file_id,
-                offset: writer.offset() - bytes_written as u64,
-                size: bytes_written as u32,
-            };
-            rewrites.push((key, live_ref.ptr, new_ptr));
-        }
+            let mut rewrites: Vec<(Vec<u8>, ValuePointer, ValuePointer)> = Vec::new();
 
-        // Fsync the new vLog before binding pointers into the LSM tree
-        writer.close()?;
-        // Sync the directory to ensure the new file's directory entry is durable
-        if let std::result::Result::Ok(dir) = std::fs::File::open(&self.vlog.path) {
-            let _ = dir.sync_all();
-        }
+            for live_ref in &analysis.live_entries {
+                let (key, value) = self.vlog.read_entry(&live_ref.ptr)?;
+                let bytes_written = writer.append(&key, &value)?;
+                let new_ptr = ValuePointer {
+                    file_id: new_file_id,
+                    offset: writer.offset() - bytes_written as u64,
+                    size: bytes_written as u32,
+                };
+                rewrites.push((key, live_ref.ptr, new_ptr));
+            }
 
-        // Phase 2: CAS each key to point to the new location
-        let mut cas_failures = 0usize;
-        for (key, old_ptr, new_ptr) in &rewrites {
-            let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
-            old_buf.push(KvKind::ValuePointer as u8);
-            old_ptr.encode(&mut old_buf);
+            // Fsync the new vLog before binding pointers into the LSM tree
+            writer.close()?;
+            // Sync the directory to ensure the new file's directory entry is durable
+            if let std::result::Result::Ok(dir) = std::fs::File::open(&self.vlog.path) {
+                let _ = dir.sync_all();
+            }
 
-            let mut new_buf = Vec::with_capacity(ValuePointer::encoded_size());
-            new_ptr.encode(&mut new_buf);
+            // Phase 2: CAS each key to point to the new location
+            let mut cas_failures = 0usize;
+            for (key, old_ptr, new_ptr) in &rewrites {
+                let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
+                old_buf.push(KvKind::ValuePointer as u8);
+                old_ptr.encode(&mut old_buf);
 
-            let swapped = self.inner.compare_and_set_with_kind(
-                key,
-                &old_buf,
-                KvKind::ValuePointer,
-                &new_buf,
-                KvKind::ValuePointer,
-            )?;
-            if !swapped {
-                cas_failures += 1;
-                // CAS failed: a concurrent write changed this key. The new vLog
-                // entry is an orphan — it will be reclaimed by the next GC pass
-                // on the new file. More importantly, the old file may now contain
-                // a live entry from the concurrent write, so we must not delete it.
+                let mut new_buf = Vec::with_capacity(ValuePointer::encoded_size());
+                new_ptr.encode(&mut new_buf);
+
+                let swapped = self.inner.compare_and_set_with_kind(
+                    key,
+                    &old_buf,
+                    KvKind::ValuePointer,
+                    &new_buf,
+                    KvKind::ValuePointer,
+                )?;
+                if !swapped {
+                    cas_failures += 1;
+                }
+            }
+
+            // Always schedule the old file for deletion. Concurrent writes during GC
+            // go to the memtable (not the old vLog), so the old file has no live
+            // entries after the CAS loop completes — even if some CAS operations
+            // failed due to concurrent overwrites.
+            self.vlog.schedule_deletion(analysis.file_id);
+            if cas_failures == rewrites.len() {
+                // All CAS operations failed — the new vLog file is entirely
+                // unreferenced. Schedule it for immediate deletion to avoid leak.
+                self.vlog.schedule_deletion(new_file_id);
+            }
+
+            Ok(GcResult {
+                old_file_id: analysis.file_id,
+                new_file_id,
+                keys_rewritten: rewrites.len() - cas_failures,
+            })
+        })();
+
+        match compact_res {
+            std::result::Result::Ok(res) => Ok(Some(res)),
+            std::result::Result::Err(e) => {
+                // Clean up the orphaned new vLog file on error
+                let _ = std::fs::remove_file(&new_path);
+                Err(e)
             }
         }
-
-        // Sync the LSM writes
-        self.inner.sync()?;
-
-        // Always schedule the old file for deletion. Concurrent writes during GC
-        // go to the memtable (not the old vLog), so the old file has no live
-        // entries after the CAS loop completes — even if some CAS operations
-        // failed due to concurrent overwrites.
-        self.vlog.schedule_deletion(analysis.file_id);
-        if cas_failures == rewrites.len() {
-            // All CAS operations failed — the new vLog file is entirely
-            // unreferenced. Schedule it for immediate deletion to avoid leak.
-            self.vlog.schedule_deletion(new_file_id);
-        }
-
-        Ok(Some(GcResult {
-            old_file_id: analysis.file_id,
-            new_file_id,
-            keys_rewritten: rewrites.len() - cas_failures,
-        }))
     }
 
     /// Run GC on a specific vLog file: analyze and compact if above threshold.

@@ -28,6 +28,7 @@ use ouroboros::self_referencing;
 use crate::iterators::StorageIterator;
 use crate::key::{Key, KeySlice};
 use crate::table::SsTableBuilder;
+use crate::vlog::{KvKind, ValueLog};
 use crate::wal::Wal;
 
 /// A basic mem-table based on crossbeam-skiplist.
@@ -226,12 +227,24 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        self.scan_with_vlog(lower, upper, None)
+    }
+
+    /// Get an iterator over a range of keys, with optional vLog for ValuePointer dereferencing.
+    pub fn scan_with_vlog(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        vlog: Option<Arc<ValueLog>>,
+    ) -> MemTableIterator {
         let vlog_enabled = self.vlog_enabled;
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
             iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
             item: (Bytes::new(), Bytes::new()),
             vlog_enabled,
+            vlog,
+            resolved: Bytes::new(),
         }
         .build();
         iter.next().unwrap();
@@ -318,18 +331,20 @@ pub struct MemTableIterator {
     item: (Bytes, Bytes),
     /// Whether values are kind-prefixed (need to strip prefix in value()).
     vlog_enabled: bool,
+    /// Optional vLog for dereferencing ValuePointer entries during scans.
+    vlog: Option<Arc<ValueLog>>,
+    /// Cached resolved value (stripped of kind prefix, ValuePointers dereferenced).
+    resolved: Bytes,
 }
 
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        let val = self.borrow_item().1.as_ref();
-        if *self.borrow_vlog_enabled() && !val.is_empty() {
-            // Strip the 1-byte KvKind prefix
-            &val[1..]
+        if *self.borrow_vlog_enabled() {
+            self.borrow_resolved().as_ref()
         } else {
-            val
+            self.borrow_item().1.as_ref()
         }
     }
 
@@ -348,8 +363,43 @@ impl StorageIterator for MemTableIterator {
                 .unwrap_or_else(|| (Bytes::from_static(&[]), Bytes::from_static(&[])))
         });
 
-        self.with_mut(|m| *m.item = n);
+        self.with_mut(|m| {
+            *m.item = n;
+            *m.resolved = Self::resolve_item_value(m.vlog, m.vlog_enabled, m.item);
+        });
 
         Ok(())
+    }
+}
+
+impl MemTableIterator {
+    /// Resolve the value for the current item: dereference ValuePointers via vLog,
+    /// strip kind prefix for Inline entries.
+    fn resolve_item_value(
+        vlog: &Option<Arc<ValueLog>>,
+        vlog_enabled: &bool,
+        item: &(Bytes, Bytes),
+    ) -> Bytes {
+        let val = &item.1;
+        if !*vlog_enabled || val.is_empty() {
+            return val.clone();
+        }
+
+        // Not a ValuePointer — strip kind prefix (Inline or unknown)
+        if val[0] != KvKind::ValuePointer as u8 {
+            return val.slice(1..);
+        }
+
+        // ValuePointer — dereference through vLog
+        let Some(vlog) = vlog else {
+            return val.slice(1..);
+        };
+        let Some(ptr) = crate::vlog::ValuePointer::try_decode(&val[1..]) else {
+            return Bytes::new();
+        };
+        match vlog.read(&ptr, &item.0) {
+            std::result::Result::Ok(bytes) => bytes,
+            std::result::Result::Err(_) => Bytes::new(),
+        }
     }
 }

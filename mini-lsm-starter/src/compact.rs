@@ -326,8 +326,7 @@ impl LsmStorageInner {
                 }
                 // Register vLog references for new SSTs
                 for sst in &new_ssts {
-                    let sst_vlog_ids = compact_vlog_ids.to_vec();
-                    vlog.register_sst_references(sst.sst_id(), &sst_vlog_ids);
+                    vlog.register_sst_references(sst.sst_id(), &compact_vlog_ids);
                 }
             }
 

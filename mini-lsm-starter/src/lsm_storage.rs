@@ -503,10 +503,12 @@ impl LsmStorageInner {
             ret.0
         };
 
-        // Register vLog references recovered from manifest records
+        // Register vLog references recovered from manifest records (only for active SSTs)
         if let Some(ref vlog) = vlog {
             for (sst_id, vlog_ids) in &recovered_vlog_refs {
-                vlog.register_sst_references(*sst_id, vlog_ids);
+                if state.sstables.contains_key(sst_id) {
+                    vlog.register_sst_references(*sst_id, vlog_ids);
+                }
             }
         }
 
@@ -545,11 +547,11 @@ impl LsmStorageInner {
         if vlog_enabled {
             // Use get_raw to get kind-prefixed value, then resolve
             if let Some(raw) = state.memtable.get_raw(key) {
-                return self.resolve_vlog_value(&raw);
+                return self.resolve_vlog_value(key, &raw);
             }
             for m in state.imm_memtables.iter() {
                 if let Some(raw) = m.get_raw(key) {
-                    return self.resolve_vlog_value(&raw);
+                    return self.resolve_vlog_value(key, &raw);
                 }
             }
         } else {
@@ -642,9 +644,9 @@ impl LsmStorageInner {
     }
 
     /// Resolve a kind-prefixed value from the memtable.
-    /// If it's a ValuePointer, dereferences through the vLog.
+    /// If it's a ValuePointer, dereferences through the vLog with key verification.
     /// If it's Inline, strips the kind prefix and returns the value.
-    fn resolve_vlog_value(&self, prefixed: &[u8]) -> Result<Option<Bytes>> {
+    fn resolve_vlog_value(&self, key: &[u8], prefixed: &[u8]) -> Result<Option<Bytes>> {
         if prefixed.is_empty() {
             return Ok(None);
         }
@@ -658,11 +660,8 @@ impl LsmStorageInner {
                     )
                 })?;
                 let vlog = self.vlog.as_ref().unwrap();
-                // We don't have the key here, but the vLog read verifies key match
-                // For memtable reads, we need to read without key verification
-                let reader = vlog.get_reader(ptr.file_id)?;
-                let entry = reader.read_entry(ptr.offset, ptr.size)?;
-                Ok(Some(Bytes::from(entry.value)))
+                let bytes = vlog.read(&ptr, key)?;
+                Ok(Some(bytes))
             }
             _ => {
                 // Inline value — strip the kind prefix
@@ -698,6 +697,13 @@ impl LsmStorageInner {
     /// Used by GC to determine if a key still points to a specific vLog entry.
     pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
         let state = self.state.read().clone();
+        self.get_with_kind_inner(&state, key)
+    }
+
+    /// Inner helper that operates on an already-cloned state snapshot.
+    /// Used by both `get_with_kind` (public) and `compare_and_set_with_kind`
+    /// (which holds a write lock and passes the state directly).
+    fn get_with_kind_inner(&self, state: &LsmStorageState, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
         let vlog_enabled = self.vlog.is_some();
 
         // Memtable
@@ -804,7 +810,9 @@ impl LsmStorageInner {
         new_kind: KvKind,
     ) -> Result<bool> {
         let _lock = self.state_lock.lock();
-        let (current_val, current_kind) = self.get_with_kind(key)?;
+        let guard = self.state.write();
+        let state = guard.as_ref().clone();
+        let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
         // Check if current matches expected
         let matches = match (current_kind, old_kind) {
@@ -828,7 +836,6 @@ impl LsmStorageInner {
         prefixed.push(new_kind as u8);
         prefixed.extend_from_slice(new);
 
-        let state = self.state.read();
         state.memtable.put_raw(key, &prefixed)?;
         Ok(true)
     }
@@ -1039,9 +1046,12 @@ impl LsmStorageInner {
         let state = self.state.read().clone();
 
         // memtable
-        let mut m_merge_iterators = vec![Box::new(state.memtable.scan(lower, upper))];
+        let vlog = self.vlog.clone();
+        let mut m_merge_iterators = vec![Box::new(
+            state.memtable.scan_with_vlog(lower, upper, vlog.clone()),
+        )];
         for i in state.imm_memtables.iter() {
-            let it = i.scan(lower, upper);
+            let it = i.scan_with_vlog(lower, upper, vlog.clone());
             m_merge_iterators.push(Box::new(it));
         }
         let m_memo_iter = MergeIterator::create(m_merge_iterators);
