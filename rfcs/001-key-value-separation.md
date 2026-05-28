@@ -658,7 +658,7 @@ impl ValueLog {
 
     /// Register SST -> vLog references when an SST is finalized.
     /// Updates both forward and reverse indexes atomically under one lock.
-    pub fn register_sst_references(&self, sst_id: usize, vlog_ids: HashSet<u32>) {
+    pub fn register_sst_references(&self, sst_id: usize, vlog_ids: &[u32]) {
         let mut refs = self.vlog_refs.write();
         // Unregister any existing references for this SST first to prevent
         // stale entries in the reverse index from leaking.
@@ -679,7 +679,7 @@ impl ValueLog {
     }
 
     /// Get all vLog files referenced by a given SST.
-    pub fn get_sst_references(&self, sst_id: usize) -> Option<HashSet<u32>> {
+    pub fn get_sst_references(&self, sst_id: usize) -> Option<Vec<u32>> {
         self.vlog_refs.read().sst_to_vlogs.get(&sst_id).cloned()
     }
 
@@ -792,7 +792,7 @@ impl ValueLog {
 
     /// Return the filesystem path for a given vLog file ID.
     fn path_of_file(&self, file_id: u32) -> PathBuf {
-        self.path.join(format!("{:05}.vlog", file_id))
+        self.path.join(format!("{}.vlog", file_id))
     }
 
     /// Remove a vLog file from disk and invalidate the cache entry.
@@ -973,7 +973,7 @@ impl GarbageCollector {
     /// `check_liveness` will return `false` for any orphaned entries (they are
     /// not pointed to by any SST), so they are naturally reclaimed by the
     /// standard GC mechanism.
-    pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<()> {
+    pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<Option<GcResult>> {
         if analysis.stale_ratio < self.threshold {
             return Ok(());
         }
@@ -1015,7 +1015,7 @@ impl GarbageCollector {
             new_ptr.encode(&mut buf);
 
             // Atomic rebind: only swap the pointer if the key still resolves
-            // to `old_ptr`. `compare_and_set` performs the get + put under
+            // to `old_ptr`. `compare_and_set_with_kind` performs the get + put under
             // the same MVCC sequence so a concurrent user write cannot be
             // overwritten. Implementations without explicit CAS can serialize
             // GC writes with the write batch lock and re-check `is_entry_live`
@@ -1057,7 +1057,7 @@ impl GarbageCollector {
     /// Used by analyze_file's header-only iterator to avoid reading values.
     fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<bool> {
         match self.lsm.get_with_kind(key)? {
-            Some((value, KvKind::ValuePointer)) => {
+            (Some(value), KvKind::ValuePointer) => {
                 let current_ptr = ValuePointer::decode(&value)?;
                 Ok(current_ptr.file_id == ptr.file_id && current_ptr.offset == ptr.offset)
             }
@@ -1308,7 +1308,7 @@ impl MiniLsm {
     /// Get a value along with its authoritative KvKind metadata.
     /// Returns None if the key is deleted. Used by GC's is_entry_live() to avoid
     /// ambiguous payload-based pointer detection.
-    pub fn get_with_kind(&self, key: &[u8]) -> Result<Option<(Bytes, KvKind)>>;
+    pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)>;
 
     /// Trigger manual garbage collection
     pub fn trigger_gc(&self) -> Result<()>;
@@ -1316,8 +1316,6 @@ impl MiniLsm {
     /// Atomically replace `key` only if the current value equals `old`.
     /// Returns true if the swap succeeded, false if the value changed.
     /// Used by GC to avoid overwriting fresher user writes during re-insertion.
-    pub fn compare_and_set(&self, key: &[u8], old: &[u8], new: &[u8]) -> Result<bool>;
-
     /// Kind-aware CAS: checks both value bytes AND KvKind.
     /// Prevents GC from overwriting an inline user value that happens to be
     /// byte-identical to an encoded ValuePointer (17 bytes starting with 0xFF).
@@ -1494,7 +1492,7 @@ pub enum ManifestRecord {
 
     /// Flush with vLog references. Named fields so serde_json can deserialize
     /// even when the `vlogs` key is absent from old manifests.
-    FlushV2 { sst_id: usize, #[serde(default)] vlogs: Vec<u32> },
+    FlushV2(usize, Vec<u32>),
 
     NewMemtable(usize),
 
@@ -1508,7 +1506,7 @@ pub enum ManifestRecord {
     // variants unchanged and introduce new V2 variants with named fields.
     // The recovery code should accept both old and new variants.
     Compaction(CompactionTask, Vec<usize>),
-    CompactionV2 { task: CompactionTask, output_ssts: Vec<(usize, Vec<u32>)> },
+    CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
 
     /// vLog file lifecycle. `NewVlogFile` records that a file ID was allocated
     /// so future rotations do not reuse it; it is not a liveness root by itself.
@@ -1517,7 +1515,7 @@ pub enum ManifestRecord {
 }
 ```
 
-> **Implementation Note:** `FlushV2` and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. `GcCompaction` records GC events but is a no-op during recovery (references are updated via CAS + flush). The `NewVlogFile` and `DeleteVlogFile` variants were designed but not implemented. Recovery reads `FlushV2` and `CompactionV2` records directly from the manifest to rebuild the `sst_to_vlogs` index on startup.
+> **Implementation Note:** `FlushV2` and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. `GcCompaction` records GC events but is a no-op during recovery (references are updated via CAS + flush). The `NewVlogFile` and `DeleteVlogFile` variants are declared in the enum but never written to the manifest. Recovery reads `FlushV2` and `CompactionV2` records directly from the manifest to rebuild the `sst_to_vlogs` index on startup.
 
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
@@ -1543,7 +1541,7 @@ entries for GC CAS rewrites. Recovery proceeds in three phases:
 2. **Manifest replay**: for every `Flush` / `FlushV2` / `Compaction` / `CompactionV2` record, call `register_sst_references(sst_id, vlog_ids)` to populate both `sst_to_vlogs` and `vlog_to_ssts` indexes.
 3. **Orphan vLog cleanup**: scan the data directory for `.vlog` files. Any file not referenced by any SST's vLog reference list **and** not referenced by the WAL-recovered memtable is orphaned and deleted. `NewVlogFile` alone is not enough to keep a file: a crash after file allocation but before `FlushV2`/GC CAS would otherwise leak a fully unreferenced file.
 
-> **Implementation Note:** The actual implementation uses a simpler check during recovery: only vLog files referenced by *active* SSTs (those present in `state.sstables`) are registered via `register_sst_references`. Orphaned files are left on disk (no automatic deletion on startup). Pending deletions are memory-only and lost on restart, which can leak disk space; see [Known Limitations](#known-limitations). Additionally, during garbage collection the parent directory is synced (`fsync`) after the new vLog file is created and before updating pointers via CAS, ensuring the directory entry is durable and preventing dangling pointers in the event of a crash.
+> **Implementation Note:** The actual implementation uses a simpler check during recovery: only vLog files referenced by *active* SSTs (those present in `state.sstables`) are registered via `register_sst_references`. Orphaned files are left on disk (no automatic deletion on startup). Pending deletions are memory-only and lost on restart, which can leak disk space; see [Known Limitations](#known-limitations). Additionally, during garbage collection the parent directory is synced (`fsync`) after the new vLog file is created and before updating pointers via CAS, ensuring the directory entry is durable and preventing dangling pointers in the event of a crash. Note that the `sync_all()` result is swallowed with `let _ =` (best-effort).
 
 **Flush-time crash safety**: vLog writes are fsynced (batch, once per flush) before the SST is written to disk. If a crash occurs:
 - **Before SST is committed to manifest**: the flush is incomplete — the memtable (rebuilt from WAL) still contains the full values. The partially written vLog and SST files are orphaned.
@@ -1769,7 +1767,7 @@ This section documents intentional deviations between the original RFC design an
 
 3. **GC CAS is not batched** — Each live entry is rewritten as an independent `compare_and_set_with_kind` call. This is correct but adds per-call lock overhead. A future optimization can batch CAS calls under a single lock acquisition.
 
-4. **Synchronous GC blocks compaction** — `post_compaction_gc` runs on the compaction thread. Under heavy GC load (many files above threshold), compaction latency increases.
+4. **Synchronous GC increases compaction latency** — `post_compaction_gc` runs on the compaction thread. Under heavy GC load (many files above threshold), compaction latency increases.
 
 ## Future Work
 
