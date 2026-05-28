@@ -537,7 +537,13 @@ fn test_gc_100_percent_dead() {
 fn test_gc_preserves_live_values() {
     // Write values, overwrite some, compact, GC — live values should survive
     let dir = tempfile::tempdir().unwrap();
-    let options = options_with_vlog_and_compaction(256, 1 << 20);
+    let mut options = options_with_vlog_and_compaction(256, 1 << 20);
+    // Prevent background compaction from racing with our manual force_full_compaction.
+    // With 2 L0 SSTs and trigger=2, the background thread can compact them before
+    // the test does, causing "No such file or directory" when removing old SSTs.
+    if let CompactionOptions::Leveled(ref mut opts) = options.compaction_options {
+        opts.level0_file_num_compaction_trigger = 100;
+    }
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // Write large values
