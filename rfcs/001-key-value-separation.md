@@ -1741,7 +1741,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** New manifest variants `FlushV2`, `CompactionV2`, `NewVlogFile`, and `DeleteVlogFile` were specified to persist SST→vLog references and vLog file lifecycle.
 
-**Actual implementation:** `GcCompaction`, `FlushV2`, and `CompactionV2` manifest records were implemented. SST→vLog references are recovered directly from `FlushV2` and `CompactionV2` records in the manifest on startup (via `register_sst_references`). vLog file IDs are discovered by scanning the `.vlog` directory on startup rather than tracking them in the manifest.
+**Actual implementation:** `GcCompaction`, `FlushV2`, and `CompactionV2` manifest records were implemented. SST→vLog references are recovered directly from `FlushV2` and `CompactionV2` records in the manifest on startup (via `register_sst_references`). vLog file IDs are discovered by scanning the `vlog` subdirectory on startup rather than tracking them in the manifest.
 
 ### ValueLogStats / Metrics API
 
