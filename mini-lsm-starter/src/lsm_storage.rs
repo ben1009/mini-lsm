@@ -844,6 +844,55 @@ impl LsmStorageInner {
         Ok(true)
     }
 
+    /// Batch CAS: atomically compare-and-swap multiple entries under a single
+    /// lock acquisition. Returns a Vec<bool> indicating success per entry.
+    ///
+    /// Each entry is `(key, old_value, old_kind, new_value, new_kind)`.
+    pub(crate) fn compare_and_set_batch_with_kind(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)],
+    ) -> Result<Vec<bool>> {
+        let _lock = self.state_lock.lock();
+        let guard = self.state.write();
+        let state = guard.as_ref().clone();
+
+        let mut results = Vec::with_capacity(entries.len());
+        let mut writes: Vec<(KeySlice, Vec<u8>)> = Vec::new();
+
+        for (key, old, old_kind, new, new_kind) in entries {
+            let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
+
+            let matches = match (current_kind, *old_kind) {
+                (KvKind::Inline, KvKind::Inline) => match current_val {
+                    Some(ref v) => v.as_ref() == old.as_slice(),
+                    None => old.is_empty(),
+                },
+                (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
+                    Some(ref v) => v.as_ref() == old.as_slice(),
+                    None => false,
+                },
+                _ => false,
+            };
+
+            if matches {
+                let mut prefixed = Vec::with_capacity(1 + new.len());
+                prefixed.push(*new_kind as u8);
+                prefixed.extend_from_slice(new);
+                writes.push((KeySlice::from_slice(key), prefixed));
+                results.push(true);
+            } else {
+                results.push(false);
+            }
+        }
+
+        // Write all matched entries to the memtable in one call
+        let raw_refs: Vec<(KeySlice, &[u8])> =
+            writes.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+        state.memtable.put_raw_batch(&raw_refs)?;
+
+        Ok(results)
+    }
+
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let mut data = vec![];

@@ -150,8 +150,9 @@ impl<'a> GarbageCollector<'a> {
                 let _ = dir.sync_all();
             }
 
-            // Phase 2: CAS each key to point to the new location
-            let mut cas_failures = 0usize;
+            // Phase 2: Batch CAS all keys under a single lock acquisition
+            let mut batch: Vec<(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)> =
+                Vec::with_capacity(rewrites.len());
             for (key, old_ptr, new_ptr) in &rewrites {
                 let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
                 old_buf.push(KvKind::ValuePointer as u8);
@@ -160,17 +161,16 @@ impl<'a> GarbageCollector<'a> {
                 let mut new_buf = Vec::with_capacity(ValuePointer::encoded_size());
                 new_ptr.encode(&mut new_buf);
 
-                let swapped = self.inner.compare_and_set_with_kind(
-                    key,
-                    &old_buf,
+                batch.push((
+                    key.clone(),
+                    old_buf,
                     KvKind::ValuePointer,
-                    &new_buf,
+                    new_buf,
                     KvKind::ValuePointer,
-                )?;
-                if !swapped {
-                    cas_failures += 1;
-                }
+                ));
             }
+            let cas_results = self.inner.compare_and_set_batch_with_kind(&batch)?;
+            let cas_failures = cas_results.iter().filter(|&&r| !r).count();
 
             // Always schedule the old file for deletion. Concurrent writes during GC
             // go to the memtable (not the old vLog), so the old file has no live
