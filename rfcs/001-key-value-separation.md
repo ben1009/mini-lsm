@@ -1721,11 +1721,15 @@ Rolling back after enabling key-value separation requires care:
 
 This section documents intentional deviations between the original RFC design and the merged implementation (PR #79).
 
+### Deterministic GC Order
+
+**Actual implementation:** When iterating over vLog files for garbage collection, file IDs are collected into a `HashSet` and then sorted (via `sort_unstable`) before processing. This ensures a deterministic GC order and prioritizes older files (lower IDs), which typically have higher stale ratios.
+
 ### Deferred Deletion Simplification
 
 **Original design:** `PendingDeletion` carried an `obsolete_at_ts: u64` timestamp and `reclaim_pending_deletions` accepted a `watermark_ts: u64` parameter. Files were only deleted after the MVCC watermark advanced past the retirement timestamp.
 
-**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path. To avoid potential deadlocks, the implementation extracts the pending deletions first (using `std::mem::take`) rather than calling operations inside a closure while holding the lock.
+**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path. To avoid potential deadlocks, the implementation extracts the pending deletions first (using `std::mem::take`) rather than calling operations inside a closure while holding the lock. Additionally, the old vLog file is always safely scheduled for deletion after the CAS loop regardless of whether individual CAS operations succeeded or failed, because concurrent writes during GC go to the active vLog/memtable, not the old vLog file.
 
 ### Background GC Thread Pool
 
