@@ -1805,7 +1805,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** A `ValueLogStats` struct and `vlog_stats()` public API were specified for runtime observability.
 
-**Actual implementation:** No metrics API is exposed. Internal GC results (`GcResult`) are returned from `compact_file` but are not accumulated into global counters.
+**Actual implementation:** `ValueLogStats` struct and `MiniLsm::vlog_stats()` API are implemented. Atomic counters on `ValueLog` accumulate GC metrics (entries rewritten, bytes written, files processed). File count and total bytes are computed on-demand by scanning the vLog directory.
 
 ### Reader Refcounting
 
@@ -1829,7 +1829,7 @@ This section documents intentional deviations between the original RFC design an
 
 2. ~~**No automatic reclamation after post-compaction GC**~~ — Fixed. `post_compaction_gc` now calls `reclaim_pending_deletions()` after processing all input vLog files. Files still referenced by compaction-output SSTs are safely pushed back to the pending queue.
 
-3. **GC CAS is not batched** — Each live entry is rewritten as an independent `compare_and_set_with_kind` call. This is correct but adds per-call lock overhead. A future optimization can batch CAS calls under a single lock acquisition.
+3. ~~**GC CAS is not batched**~~ — Fixed. `compare_and_set_batch_with_kind` batches all live entries under a single `state_lock` acquisition, with a two-phase lookup-then-write protocol.
 
 4. **Synchronous GC increases compaction latency** — `post_compaction_gc` runs on the compaction thread. Under heavy GC load (many files above threshold), compaction latency increases.
 
@@ -1855,13 +1855,13 @@ This section documents intentional deviations between the original RFC design an
 
 ### Concrete (near-term)
 
-6. **Batch GC CAS**: Batch `compare_and_set_with_kind` calls for live entries during GC to reduce atomic operation overhead and contention with user writes
+6. ~~**Batch GC CAS**~~: Done. `compare_and_set_batch_with_kind` batches all CAS operations under a single lock acquisition (PR #82).
 7. **Lock-free vLog writer**: Replace the `active_writer` Mutex with a lock-free append buffer, dedicated writer thread with request channel, or multiple active vLog files to improve write concurrency
 8. **Pre-created vLog rotation**: Prepare the next vLog file in the background so rotation doesn't block the writer with synchronous file creation
 9. **Remove VALUE_POINTER_TAG**: If the 1-byte tag overhead becomes a bottleneck, remove it and rely solely on KvKind for classification (encoded size drops from 17 to 16 bytes)
 10. ~~**Persist pending deletions**~~: Done. Instead of persisting the queue, `cleanup_orphan_vlog_files()` runs on startup and deletes any `.vlog` file not referenced by an active SST — simpler and handles all orphan scenarios.
 11. ~~**Reclaim after post-compaction GC**~~: Done. `post_compaction_gc` now calls `reclaim_pending_deletions()` after processing all input vLog files.
-12. **ValueLogStats API**: Expose `vlog_stats()` for runtime observability of vLog space usage, GC progress, and read latency
+12. ~~**ValueLogStats API**~~: Done. `ValueLogStats` struct with file count, total bytes, and cumulative GC counters. Exposed via `MiniLsm::vlog_stats()`.
 
 ## References
 

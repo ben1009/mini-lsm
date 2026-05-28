@@ -9,7 +9,7 @@ pub use reader::{ValueLogReader, VlogEntryMeta};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 use bytes::{Buf, BufMut, Bytes};
@@ -145,6 +145,21 @@ impl Default for ValueSeparationOptions {
             max_open_vlog_files: 64,
         }
     }
+}
+
+/// Runtime statistics for value log monitoring.
+#[derive(Clone, Debug)]
+pub struct ValueLogStats {
+    /// Total bytes across all vLog files on disk.
+    pub vlog_total_bytes: u64,
+    /// Number of vLog files on disk.
+    pub vlog_file_count: u32,
+    /// Cumulative entries rewritten by GC since startup.
+    pub gc_entries_rewritten: u64,
+    /// Cumulative bytes written by GC since startup.
+    pub gc_bytes_rewritten: u64,
+    /// Cumulative vLog files processed by GC since startup.
+    pub gc_files_processed: u64,
 }
 
 /// Value log file header (first 16 bytes of each vLog file).
@@ -358,6 +373,12 @@ pub struct ValueLog {
     /// Per-file GC locks to prevent concurrent GC on the same file.
     /// Shared across all GarbageCollector instances.
     gc_locks: Mutex<HashSet<u32>>,
+    /// Cumulative entries rewritten by GC since startup.
+    gc_entries_rewritten: AtomicU64,
+    /// Cumulative bytes written by GC since startup.
+    gc_bytes_rewritten: AtomicU64,
+    /// Cumulative vLog files processed by GC since startup.
+    gc_files_processed: AtomicU64,
 }
 
 impl ValueLog {
@@ -397,6 +418,9 @@ impl ValueLog {
             references: VlogReferences::new(),
             pending_deletions: Mutex::new(Vec::new()),
             gc_locks: Mutex::new(HashSet::new()),
+            gc_entries_rewritten: AtomicU64::new(0),
+            gc_bytes_rewritten: AtomicU64::new(0),
+            gc_files_processed: AtomicU64::new(0),
         })
     }
 
@@ -579,6 +603,42 @@ impl ValueLog {
             }
         }
         Ok(deleted)
+    }
+
+    /// Record the result of a GC compaction for stats tracking.
+    pub fn record_gc_result(&self, keys_rewritten: usize, bytes_written: u64) {
+        self.gc_entries_rewritten
+            .fetch_add(keys_rewritten as u64, Ordering::Relaxed);
+        self.gc_bytes_rewritten
+            .fetch_add(bytes_written, Ordering::Relaxed);
+        self.gc_files_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Collect runtime statistics about the value log.
+    /// File count and total bytes are computed on-demand by scanning the directory.
+    pub fn stats(&self) -> Result<ValueLogStats> {
+        let mut vlog_total_bytes: u64 = 0;
+        let mut vlog_file_count: u32 = 0;
+        for entry in std::fs::read_dir(&self.path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            if let Some(name) = name.to_str()
+                && name.ends_with(".vlog")
+            {
+                vlog_file_count += 1;
+                vlog_total_bytes += entry.metadata()?.len();
+            }
+        }
+        Ok(ValueLogStats {
+            vlog_total_bytes,
+            vlog_file_count,
+            gc_entries_rewritten: self.gc_entries_rewritten.load(Ordering::Relaxed),
+            gc_bytes_rewritten: self.gc_bytes_rewritten.load(Ordering::Relaxed),
+            gc_files_processed: self.gc_files_processed.load(Ordering::Relaxed),
+        })
     }
 }
 
