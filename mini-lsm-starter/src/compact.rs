@@ -387,7 +387,7 @@ impl LsmStorageInner {
         let vlog2 = vlog.clone();
 
         if let Some(weak) = weak {
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 for &file_id in &ids {
                     // Upgrade inside the loop — if the engine is shutting down,
                     // stop GC early and drop the strong ref after each file.
@@ -418,6 +418,7 @@ impl LsmStorageInner {
                     eprintln!("vLog reclaim error: {}", e);
                 }
             });
+            self.gc_handles.lock().push(handle);
         } else {
             // Fallback to synchronous GC if weak_self is not set
             let gc = GarbageCollector::new(&vlog2, self, vlog2.options.gc_threshold_ratio);

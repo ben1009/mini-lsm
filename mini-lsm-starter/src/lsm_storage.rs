@@ -161,6 +161,8 @@ pub(crate) struct LsmStorageInner {
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
     /// Allows background threads (e.g., async GC) to obtain a strong reference.
     pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
+    /// Handles for background GC threads, joined during close().
+    pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
@@ -192,6 +194,11 @@ impl MiniLsm {
         self.compaction_notifier.send(()).ok();
         if let Some(f) = self.compaction_thread.lock().take() {
             f.join().map_err(|e| anyhow!("{:?}", e))?;
+        }
+        // Join all background GC threads before proceeding
+        let handles: Vec<_> = self.inner.gc_handles.lock().drain(..).collect();
+        for h in handles {
+            let _ = h.join();
         }
         if self.inner.options.enable_wal {
             self.inner.sync()?;
@@ -551,6 +558,7 @@ impl LsmStorageInner {
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
             weak_self: std::sync::OnceLock::new(),
+            gc_handles: Mutex::new(Vec::new()),
         };
         storage.sync_dir()?;
 
