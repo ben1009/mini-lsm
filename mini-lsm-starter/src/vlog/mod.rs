@@ -629,8 +629,9 @@ impl ValueLog {
                 continue;
             }
             let name = entry.file_name();
-            if let Some(name) = name.to_str()
-                && name.ends_with(".vlog")
+            if let Some(name_str) = name.to_str()
+                && let Some(stem) = name_str.strip_suffix(".vlog")
+                && stem.parse::<u32>().is_ok()
             {
                 if let Ok(meta) = entry.metadata() {
                     vlog_file_count += 1;
