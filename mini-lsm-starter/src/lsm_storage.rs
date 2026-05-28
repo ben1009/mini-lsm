@@ -158,6 +158,11 @@ pub(crate) struct LsmStorageInner {
     pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
     /// Value Log manager for key-value separation. `None` if value separation is disabled.
     pub(crate) vlog: Option<Arc<ValueLog>>,
+    /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
+    /// Allows background threads (e.g., async GC) to obtain a strong reference.
+    pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
+    /// Handles for background GC threads, joined during close().
+    pub(crate) gc_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
@@ -190,6 +195,11 @@ impl MiniLsm {
         if let Some(f) = self.compaction_thread.lock().take() {
             f.join().map_err(|e| anyhow!("{:?}", e))?;
         }
+        // Join all background GC threads before proceeding
+        let handles = std::mem::take(&mut *self.inner.gc_handles.lock());
+        for h in handles {
+            let _ = h.join();
+        }
         if self.inner.options.enable_wal {
             self.inner.sync()?;
             self.inner.sync_dir()?;
@@ -218,6 +228,9 @@ impl MiniLsm {
     /// not exist.
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
         let inner = Arc::new(LsmStorageInner::open(path, options)?);
+        // Set the weak self-reference so background threads (e.g., async GC) can
+        // obtain a strong reference to the engine.
+        let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let (tx1, rx) = crossbeam_channel::unbounded();
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
         let (tx2, rx) = crossbeam_channel::unbounded();
@@ -544,6 +557,8 @@ impl LsmStorageInner {
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
+            weak_self: std::sync::OnceLock::new(),
+            gc_handles: Mutex::new(Vec::new()),
         };
         storage.sync_dir()?;
 

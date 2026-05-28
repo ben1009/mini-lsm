@@ -1831,7 +1831,7 @@ This section documents intentional deviations between the original RFC design an
 
 3. ~~**GC CAS is not batched**~~ — Fixed. `compare_and_set_batch_with_kind` batches all live entries under a single `state_lock` acquisition, with a two-phase lookup-then-write protocol.
 
-4. **Synchronous GC increases compaction latency** — `post_compaction_gc` runs on the compaction thread. Under heavy GC load (many files above threshold), compaction latency increases.
+4. ~~**Synchronous GC increases compaction latency**~~ — Fixed. `post_compaction_gc` now spawns a background thread via a `Weak<LsmStorageInner>` self-reference, so compaction returns immediately while GC runs asynchronously.
 
 ## Future Work
 
