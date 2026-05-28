@@ -802,6 +802,26 @@ impl LsmStorageInner {
     }
 
     /// Atomic compare-and-swap with kind checking.
+    /// Check whether the current value+kind matches the expected (old, old_kind).
+    fn values_match(
+        current_val: &Option<Bytes>,
+        current_kind: KvKind,
+        old: &[u8],
+        old_kind: KvKind,
+    ) -> bool {
+        match (current_kind, old_kind) {
+            (KvKind::Inline, KvKind::Inline) => match current_val {
+                Some(v) => v.as_ref() == old,
+                None => old.is_empty(),
+            },
+            (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
+                Some(v) => v.as_ref() == old,
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Acquires state_lock, does a full LSM lookup, and conditionally writes
     /// the new value to the memtable if the current value matches (old, old_kind).
     /// Returns true if the swap succeeded.
@@ -818,24 +838,10 @@ impl LsmStorageInner {
         let state = guard.as_ref().clone();
         let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
-        // Check if current matches expected
-        let matches = match (current_kind, old_kind) {
-            (KvKind::Inline, KvKind::Inline) => match current_val {
-                Some(ref v) => v.as_ref() == old,
-                None => old.is_empty(),
-            },
-            (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
-                Some(ref v) => v.as_ref() == old,
-                None => false,
-            },
-            _ => false,
-        };
-
-        if !matches {
+        if !Self::values_match(&current_val, current_kind, old, old_kind) {
             return Ok(false);
         }
 
-        // Encode new value with kind prefix and write to memtable
         let mut prefixed = Vec::with_capacity(1 + new.len());
         prefixed.push(new_kind as u8);
         prefixed.extend_from_slice(new);
@@ -848,6 +854,10 @@ impl LsmStorageInner {
     /// lock acquisition. Returns a Vec<bool> indicating success per entry.
     ///
     /// Each entry is `(key, old_value, old_kind, new_value, new_kind)`.
+    ///
+    /// NOTE: If the batch contains duplicate keys that both match, all report
+    /// success but only the last value is stored. The GC use case never produces
+    /// duplicate keys (vLog entries are unique per key).
     pub(crate) fn compare_and_set_batch_with_kind(
         &self,
         entries: &[(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)],
@@ -857,24 +867,12 @@ impl LsmStorageInner {
         let state = guard.as_ref().clone();
 
         let mut results = Vec::with_capacity(entries.len());
-        let mut writes: Vec<(KeySlice, Vec<u8>)> = Vec::new();
+        let mut writes: Vec<(KeySlice, Vec<u8>)> = Vec::with_capacity(entries.len());
 
         for (key, old, old_kind, new, new_kind) in entries {
             let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
-            let matches = match (current_kind, *old_kind) {
-                (KvKind::Inline, KvKind::Inline) => match current_val {
-                    Some(ref v) => v.as_ref() == old.as_slice(),
-                    None => old.is_empty(),
-                },
-                (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
-                    Some(ref v) => v.as_ref() == old.as_slice(),
-                    None => false,
-                },
-                _ => false,
-            };
-
-            if matches {
+            if Self::values_match(&current_val, current_kind, old, *old_kind) {
                 let mut prefixed = Vec::with_capacity(1 + new.len());
                 prefixed.push(*new_kind as u8);
                 prefixed.extend_from_slice(new);
@@ -885,10 +883,11 @@ impl LsmStorageInner {
             }
         }
 
-        // Write all matched entries to the memtable in one call
-        let raw_refs: Vec<(KeySlice, &[u8])> =
-            writes.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-        state.memtable.put_raw_batch(&raw_refs)?;
+        if !writes.is_empty() {
+            let raw_refs: Vec<(KeySlice, &[u8])> =
+                writes.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            state.memtable.put_raw_batch(&raw_refs)?;
+        }
 
         Ok(results)
     }
