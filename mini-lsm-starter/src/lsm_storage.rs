@@ -802,6 +802,26 @@ impl LsmStorageInner {
     }
 
     /// Atomic compare-and-swap with kind checking.
+    /// Check whether the current value+kind matches the expected (old, old_kind).
+    fn values_match(
+        current_val: &Option<Bytes>,
+        current_kind: KvKind,
+        old: &[u8],
+        old_kind: KvKind,
+    ) -> bool {
+        match (current_kind, old_kind) {
+            (KvKind::Inline, KvKind::Inline) => match current_val {
+                Some(v) => v.as_ref() == old,
+                None => old.is_empty(),
+            },
+            (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
+                Some(v) => v.as_ref() == old,
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Acquires state_lock, does a full LSM lookup, and conditionally writes
     /// the new value to the memtable if the current value matches (old, old_kind).
     /// Returns true if the swap succeeded.
@@ -818,30 +838,100 @@ impl LsmStorageInner {
         let state = guard.as_ref().clone();
         let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
 
-        // Check if current matches expected
-        let matches = match (current_kind, old_kind) {
-            (KvKind::Inline, KvKind::Inline) => match current_val {
-                Some(ref v) => v.as_ref() == old,
-                None => old.is_empty(),
-            },
-            (KvKind::ValuePointer, KvKind::ValuePointer) => match current_val {
-                Some(ref v) => v.as_ref() == old,
-                None => false,
-            },
-            _ => false,
-        };
-
-        if !matches {
+        if !Self::values_match(&current_val, current_kind, old, old_kind) {
             return Ok(false);
         }
 
-        // Encode new value with kind prefix and write to memtable
         let mut prefixed = Vec::with_capacity(1 + new.len());
         prefixed.push(new_kind as u8);
         prefixed.extend_from_slice(new);
 
         state.memtable.put_raw(key, &prefixed)?;
         Ok(true)
+    }
+
+    /// Batch CAS: atomically compare-and-swap multiple entries under a single
+    /// `state_lock` acquisition. Returns a Vec<bool> indicating success per entry.
+    ///
+    /// Each entry is `(key, old_value, old_kind, new_value, new_kind)`.
+    ///
+    /// Uses optimistic two-phase concurrency control:
+    /// - Phase 1 (read lock): perform all LSM lookups to identify matching candidates.
+    ///   Concurrent reads are not blocked during this phase.
+    /// - Phase 2 (write lock): re-verify matched candidates and write to memtable.
+    ///   Only matched entries are re-checked, so the exclusive lock hold is minimal.
+    ///
+    /// NOTE: If the batch contains duplicate keys that both match, all report
+    /// success but only the last value is stored. The GC use case never produces
+    /// duplicate keys (vLog entries are unique per key).
+    pub(crate) fn compare_and_set_batch_with_kind(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)],
+    ) -> Result<Vec<bool>> {
+        let _lock = self.state_lock.lock();
+
+        // Phase 1: Lookups under read lock — concurrent reads not blocked
+        let mut candidates = Vec::with_capacity(entries.len());
+        {
+            let state = self.state.read().as_ref().clone();
+            for (key, old, old_kind, _, _) in entries {
+                let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
+                candidates.push(Self::values_match(
+                    &current_val,
+                    current_kind,
+                    old,
+                    *old_kind,
+                ));
+            }
+        }
+
+        // Phase 2: Re-verify matched candidates and write under exclusive lock.
+        // Since `state_lock` is held, no flush or compaction can run, and the
+        // memtable cannot be frozen. Any concurrent write between Phase 1 and
+        // Phase 2 must have gone to `state.memtable`. Therefore, we only need
+        // to check the memtable for newer values — no disk I/O required.
+        let guard = self.state.write();
+        let state = guard.as_ref().clone();
+        let vlog_enabled = self.vlog.is_some();
+
+        let mut results = vec![false; entries.len()];
+        let mut writes: Vec<(KeySlice, Vec<u8>)> = Vec::with_capacity(entries.len());
+
+        for (i, (key, old, old_kind, new, new_kind)) in entries.iter().enumerate() {
+            if !candidates[i] {
+                continue;
+            }
+
+            // Re-verify: only check the memtable for a newer value.
+            // If the key is not in the memtable, no concurrent write changed
+            // it since Phase 1, so the Phase 1 match still holds.
+            let mut still_matches = true;
+            if vlog_enabled {
+                if let Some(raw) = state.memtable.get_raw(key) {
+                    let (current_val, current_kind) = Self::parse_value_kind(&raw);
+                    still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
+                }
+            } else if let Some(v) = state.memtable.get(key) {
+                let current_val = if v.is_empty() { None } else { Some(v) };
+                still_matches = Self::values_match(&current_val, KvKind::Inline, old, *old_kind);
+            }
+
+            if still_matches {
+                let mut prefixed = Vec::with_capacity(1 + new.len());
+                prefixed.push(*new_kind as u8);
+                prefixed.extend_from_slice(new);
+                writes.push((KeySlice::from_slice(key), prefixed));
+                results[i] = true;
+            }
+        }
+
+        if !writes.is_empty() {
+            let raw_refs: Vec<(KeySlice, &[u8])> =
+                writes.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            state.memtable.put_raw_batch(&raw_refs)?;
+        }
+
+        Ok(results)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.

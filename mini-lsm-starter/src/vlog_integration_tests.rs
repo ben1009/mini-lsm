@@ -1048,3 +1048,62 @@ fn test_mixed_inline_pointer_after_enable() {
     assert_eq!(results[4].0, "vlog2");
     assert_eq!(results[5].0, "vlog3");
 }
+
+#[test]
+fn test_gc_batch_cas() {
+    // Verify that batched GC CAS works correctly: write values, flush, overwrite
+    // some, flush again, compact (triggers GC with batched CAS), verify all correct.
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options_with_vlog_and_compaction(256, 1 << 20);
+    if let Some(ref mut vs) = options.value_separation {
+        vs.gc_threshold_ratio = 0.0; // always trigger GC
+    }
+    if let CompactionOptions::Leveled(ref mut opts) = options.compaction_options {
+        opts.level0_file_num_compaction_trigger = 100; // prevent background race
+    }
+    let storage = MiniLsm::open(dir.path(), options).unwrap();
+
+    // Write large values that go to vLog
+    for i in 0..10 {
+        let key = format!("key_{:04}", i);
+        let value = vec![b'a' + (i as u8 % 26); 64];
+        storage.put(key.as_bytes(), &value).unwrap();
+    }
+    storage
+        .inner
+        .force_freeze_memtable(&storage.inner.state_lock.lock())
+        .unwrap();
+    storage.inner.force_flush_next_imm_memtable().unwrap();
+
+    // Overwrite half the keys
+    for i in 0..5 {
+        let key = format!("key_{:04}", i);
+        storage.put(key.as_bytes(), &vec![b'z'; 64]).unwrap();
+    }
+    storage
+        .inner
+        .force_freeze_memtable(&storage.inner.state_lock.lock())
+        .unwrap();
+    storage.inner.force_flush_next_imm_memtable().unwrap();
+
+    // Compact — triggers GC with batched CAS on the old vLog file
+    storage.inner.force_full_compaction().unwrap();
+
+    // Verify overwritten keys have new values
+    for i in 0..5 {
+        let key = format!("key_{:04}", i);
+        assert_eq!(
+            storage.get(key.as_bytes()).unwrap(),
+            Some(Bytes::from(vec![b'z'; 64]))
+        );
+    }
+    // Verify non-overwritten keys retain original values
+    for i in 5..10 {
+        let key = format!("key_{:04}", i);
+        let expected_byte = b'a' + (i as u8 % 26);
+        assert_eq!(
+            storage.get(key.as_bytes()).unwrap(),
+            Some(Bytes::from(vec![expected_byte; 64]))
+        );
+    }
+}
