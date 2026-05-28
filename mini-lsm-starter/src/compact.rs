@@ -375,37 +375,44 @@ impl LsmStorageInner {
     }
 
     /// Run GC on vLog files that were referenced by compacted SSTs.
+    /// Spawns a background thread so compaction is not blocked by GC I/O.
     fn post_compaction_gc(&self, input_vlog_ids: &[u32]) {
         let Some(ref vlog) = self.vlog else { return };
-        let gc = GarbageCollector::new(vlog, self, vlog.options.gc_threshold_ratio);
-        for &file_id in input_vlog_ids {
-            match gc.gc_file(file_id) {
-                std::result::Result::Ok(Some(result)) => {
-                    if let Some(ref manifest) = self.manifest {
-                        let _ = manifest.add_record(
-                            &self.state_lock.lock(),
-                            ManifestRecord::GcCompaction(
-                                result.old_file_id,
-                                result.new_file_id,
-                                result.keys_rewritten,
-                            ),
-                        );
+        let vlog = vlog.clone();
+        let ids: Vec<u32> = input_vlog_ids.to_vec();
+
+        // Try to obtain a strong reference to self for the background thread.
+        // If the engine is shutting down (weak ref dead), skip GC silently.
+        let Some(inner) = self.weak_self.upgrade() else {
+            return;
+        };
+
+        std::thread::spawn(move || {
+            let gc = GarbageCollector::new(&vlog, &inner, vlog.options.gc_threshold_ratio);
+            for &file_id in &ids {
+                match gc.gc_file(file_id) {
+                    std::result::Result::Ok(Some(result)) => {
+                        if let Some(ref manifest) = inner.manifest {
+                            let _ = manifest.add_record(
+                                &inner.state_lock.lock(),
+                                ManifestRecord::GcCompaction(
+                                    result.old_file_id,
+                                    result.new_file_id,
+                                    result.keys_rewritten,
+                                ),
+                            );
+                        }
+                    }
+                    std::result::Result::Ok(None) => {}
+                    std::result::Result::Err(e) => {
+                        eprintln!("GC error for vlog file {}: {}", file_id, e);
                     }
                 }
-                std::result::Result::Ok(None) => {}
-                std::result::Result::Err(e) => {
-                    eprintln!("GC error for vlog file {}: {}", file_id, e);
-                }
             }
-        }
-        // Reclaim vLog files that were retired by previous GC rounds and are
-        // no longer referenced by any SST. This is safe because
-        // reclaim_pending_deletions checks get_ssts_referencing() — files
-        // still referenced by compaction-output SSTs (which carry the same
-        // vlog IDs as the old SSTs) will be pushed back to the pending queue.
-        if let Err(e) = vlog.reclaim_pending_deletions() {
-            eprintln!("vLog reclaim error: {}", e);
-        }
+            if let Err(e) = vlog.reclaim_pending_deletions() {
+                eprintln!("vLog reclaim error: {}", e);
+            }
+        });
     }
 
     fn trigger_compaction(&self) -> Result<()> {
