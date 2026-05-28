@@ -615,7 +615,10 @@ impl ValueLog {
     }
 
     /// Collect runtime statistics about the value log.
-    /// File count and total bytes are computed on-demand by scanning the directory.
+    ///
+    /// File count and total bytes are computed on-demand by scanning the
+    /// directory. This performs synchronous disk I/O — avoid calling in hot
+    /// paths or tight metrics collection loops.
     pub fn stats(&self) -> Result<ValueLogStats> {
         let mut vlog_total_bytes: u64 = 0;
         let mut vlog_file_count: u32 = 0;
