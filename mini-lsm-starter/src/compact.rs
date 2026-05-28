@@ -376,26 +376,57 @@ impl LsmStorageInner {
 
     /// Run GC on vLog files that were referenced by compacted SSTs.
     /// Spawns a background thread so compaction is not blocked by GC I/O.
+    /// Falls back to synchronous GC if `weak_self` is not initialized.
     fn post_compaction_gc(&self, input_vlog_ids: &[u32]) {
         let Some(ref vlog) = self.vlog else { return };
         let vlog = vlog.clone();
-        let ids: Vec<u32> = input_vlog_ids.to_vec();
+        let mut ids: Vec<u32> = input_vlog_ids.to_vec();
+        ids.sort_unstable();
 
         let weak = self.weak_self.get().cloned();
+        let vlog2 = vlog.clone();
 
-        std::thread::spawn(move || {
-            // Upgrade inside the thread — if the engine is shutting down and
-            // the Arc has been dropped, skip GC silently.
-            let Some(inner) = weak.and_then(|w| w.upgrade()) else {
-                return;
-            };
-            let gc = GarbageCollector::new(&vlog, &inner, vlog.options.gc_threshold_ratio);
+        if let Some(weak) = weak {
+            std::thread::spawn(move || {
+                for &file_id in &ids {
+                    // Upgrade inside the loop — if the engine is shutting down,
+                    // stop GC early and drop the strong ref after each file.
+                    let Some(inner) = weak.upgrade() else {
+                        break;
+                    };
+                    let gc = GarbageCollector::new(&vlog, &inner, vlog.options.gc_threshold_ratio);
+                    match gc.gc_file(file_id) {
+                        std::result::Result::Ok(Some(result)) => {
+                            if let Some(ref manifest) = inner.manifest {
+                                let _ = manifest.add_record(
+                                    &inner.state_lock.lock(),
+                                    ManifestRecord::GcCompaction(
+                                        result.old_file_id,
+                                        result.new_file_id,
+                                        result.keys_rewritten,
+                                    ),
+                                );
+                            }
+                        }
+                        std::result::Result::Ok(None) => {}
+                        std::result::Result::Err(e) => {
+                            eprintln!("GC error for vlog file {}: {}", file_id, e);
+                        }
+                    }
+                }
+                if let Err(e) = vlog.reclaim_pending_deletions() {
+                    eprintln!("vLog reclaim error: {}", e);
+                }
+            });
+        } else {
+            // Fallback to synchronous GC if weak_self is not set
+            let gc = GarbageCollector::new(&vlog2, self, vlog2.options.gc_threshold_ratio);
             for &file_id in &ids {
                 match gc.gc_file(file_id) {
                     std::result::Result::Ok(Some(result)) => {
-                        if let Some(ref manifest) = inner.manifest {
+                        if let Some(ref manifest) = self.manifest {
                             let _ = manifest.add_record(
-                                &inner.state_lock.lock(),
+                                &self.state_lock.lock(),
                                 ManifestRecord::GcCompaction(
                                     result.old_file_id,
                                     result.new_file_id,
@@ -410,10 +441,10 @@ impl LsmStorageInner {
                     }
                 }
             }
-            if let Err(e) = vlog.reclaim_pending_deletions() {
+            if let Err(e) = vlog2.reclaim_pending_deletions() {
                 eprintln!("vLog reclaim error: {}", e);
             }
-        });
+        }
     }
 
     fn trigger_compaction(&self) -> Result<()> {
