@@ -555,9 +555,15 @@ impl ValueLog {
                 continue;
             }
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else { continue };
-            let Some(stem) = name_str.strip_suffix(".vlog") else { continue };
-            let Ok(file_id) = stem.parse::<u32>() else { continue };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name_str.strip_suffix(".vlog") else {
+                continue;
+            };
+            let Ok(file_id) = stem.parse::<u32>() else {
+                continue;
+            };
             if self
                 .get_ssts_referencing(file_id)
                 .unwrap_or_default()
