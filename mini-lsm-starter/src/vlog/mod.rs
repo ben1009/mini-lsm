@@ -542,12 +542,11 @@ impl ValueLog {
         }
     }
 
-    /// Remove vLog files on disk that are not referenced by any SST.
-    /// Called during startup after SST→vLog references are rebuilt from the
-    /// manifest, ensuring files retired by a previous GC (whose pending-
-    /// deletion queue was lost on restart) and files from incomplete flushes
-    /// or GC runs are cleaned up.
-    pub fn cleanup_orphan_vlog_files(&self) -> Result<usize> {
+    /// Remove vLog files on disk that are not referenced by any SST or
+    /// active memtable. `preserve` contains vLog file IDs referenced by
+    /// unflushed memtable entries (rebuilt from the WAL during crash recovery)
+    /// that must not be deleted even though no SST references them yet.
+    pub fn cleanup_orphan_vlog_files(&self, preserve: &HashSet<u32>) -> Result<usize> {
         let mut orphans = Vec::new();
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
@@ -564,10 +563,11 @@ impl ValueLog {
             let Ok(file_id) = stem.parse::<u32>() else {
                 continue;
             };
-            if self
-                .get_ssts_referencing(file_id)
-                .unwrap_or_default()
-                .is_empty()
+            if !preserve.contains(&file_id)
+                && self
+                    .get_ssts_referencing(file_id)
+                    .unwrap_or_default()
+                    .is_empty()
             {
                 orphans.push(file_id);
             }

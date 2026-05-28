@@ -28,7 +28,7 @@ use ouroboros::self_referencing;
 use crate::iterators::StorageIterator;
 use crate::key::{Key, KeySlice};
 use crate::table::SsTableBuilder;
-use crate::vlog::{KvKind, ValueLog};
+use crate::vlog::{KvKind, ValueLog, ValuePointer};
 use crate::wal::Wal;
 
 /// A basic mem-table based on crossbeam-skiplist.
@@ -150,6 +150,25 @@ impl MemTable {
     /// Get the raw value (with kind prefix if vlog_enabled) by key.
     pub fn get_raw(&self, key: &[u8]) -> Option<Bytes> {
         self.map.get(key).map(|x| x.value().clone())
+    }
+
+    /// Collect vLog file IDs referenced by ValuePointer entries in this memtable.
+    /// Used during startup to prevent orphan cleanup from deleting vLog files
+    /// that are still needed by unflushed memtable entries.
+    pub fn collect_vlog_file_ids(&self) -> std::collections::HashSet<u32> {
+        let mut ids = std::collections::HashSet::new();
+        if !self.vlog_enabled {
+            return ids;
+        }
+        for entry in self.map.iter() {
+            let val = entry.value();
+            if val.len() > 1 && val[0] == KvKind::ValuePointer as u8 {
+                if let Some(ptr) = ValuePointer::try_decode(&val[1..]) {
+                    ids.insert(ptr.file_id);
+                }
+            }
+        }
+        ids
     }
 
     /// Put a key-value pair into the mem-table.

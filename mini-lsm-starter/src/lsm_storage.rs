@@ -512,7 +512,14 @@ impl LsmStorageInner {
             }
             // Clean up orphaned vLog files left by a crash during GC or flush.
             // Safe here because all active SST references are now registered.
-            if let Err(e) = vlog.cleanup_orphan_vlog_files() {
+            // Collect vLog IDs from memtable entries first — a crash after GC
+            // CAS but before flush leaves ValuePointer entries in the WAL-
+            // recovered memtable that reference vLog files with no SST refs.
+            let mut active_vlog_ids = state.memtable.collect_vlog_file_ids();
+            for imm in &state.imm_memtables {
+                active_vlog_ids.extend(imm.collect_vlog_file_ids());
+            }
+            if let Err(e) = vlog.cleanup_orphan_vlog_files(&active_vlog_ids) {
                 eprintln!("vLog orphan cleanup error: {}", e);
             }
         }
