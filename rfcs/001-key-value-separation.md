@@ -1749,7 +1749,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** `get_reader` returned a `ValueLogReaderHandle` RAII guard that incremented/decremented a per-file `AtomicUsize` refcount, preventing deletion while iterators held open handles.
 
-**Actual implementation:** `get_reader` returns a plain `ValueLogReader`. The reader cache (`moka::sync::Cache`) provides implicit liveness, but `reclaim_pending_deletions` does not check the cache or any explicit refcounts before unlinking — it only verifies that no SSTs reference the file. Explicit per-file refcounts are not implemented.
+**Actual implementation:** `get_reader` returns `Result<Arc<ValueLogReader>>`. The reader cache (`moka::sync::Cache`) provides implicit liveness, but `reclaim_pending_deletions` does not check the cache or any explicit refcounts before unlinking — it only verifies that no SSTs reference the file. Explicit per-file refcounts are not implemented.
 
 ### WAL Format
 
