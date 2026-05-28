@@ -196,7 +196,7 @@ impl MiniLsm {
             f.join().map_err(|e| anyhow!("{:?}", e))?;
         }
         // Join all background GC threads before proceeding
-        let handles: Vec<_> = self.inner.gc_handles.lock().drain(..).collect();
+        let handles = std::mem::take(&mut *self.inner.gc_handles.lock());
         for h in handles {
             let _ = h.join();
         }

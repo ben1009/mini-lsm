@@ -418,7 +418,12 @@ impl LsmStorageInner {
                     eprintln!("vLog reclaim error: {}", e);
                 }
             });
-            self.gc_handles.lock().push(handle);
+            {
+                let mut handles = std::mem::take(&mut *self.gc_handles.lock());
+                handles.retain(|h| !h.is_finished());
+                handles.push(handle);
+                *self.gc_handles.lock() = handles;
+            }
         } else {
             // Fallback to synchronous GC if weak_self is not set
             let gc = GarbageCollector::new(&vlog2, self, vlog2.options.gc_threshold_ratio);
