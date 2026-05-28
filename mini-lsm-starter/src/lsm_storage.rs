@@ -318,6 +318,14 @@ impl MiniLsm {
 
         Ok(count)
     }
+
+    /// Get runtime statistics about the value log.
+    pub fn vlog_stats(&self) -> Result<crate::vlog::ValueLogStats> {
+        let Some(ref vlog) = self.inner.vlog else {
+            return Err(anyhow::anyhow!("value separation is not enabled"));
+        };
+        vlog.stats()
+    }
 }
 
 impl LsmStorageInner {

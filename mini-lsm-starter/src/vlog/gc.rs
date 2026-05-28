@@ -27,6 +27,7 @@ pub struct GcResult {
     pub old_file_id: u32,
     pub new_file_id: u32,
     pub keys_rewritten: usize,
+    pub bytes_written: u64,
 }
 
 /// Garbage collector for vLog files.
@@ -115,10 +116,12 @@ impl<'a> GarbageCollector<'a> {
         if analysis.live_entries.is_empty() {
             // All entries are dead — just schedule deletion
             self.vlog.schedule_deletion(analysis.file_id);
+            self.vlog.record_gc_result(0, 0);
             return Ok(Some(GcResult {
                 old_file_id: analysis.file_id,
                 new_file_id: u32::MAX, // sentinel: no new file was created
                 keys_rewritten: 0,
+                bytes_written: 0,
             }));
         }
 
@@ -144,6 +147,7 @@ impl<'a> GarbageCollector<'a> {
             }
 
             // Fsync the new vLog before binding pointers into the LSM tree
+            let total_bytes = writer.offset();
             writer.close()?;
             // Sync the directory to ensure the new file's directory entry is durable
             if let std::result::Result::Ok(dir) = std::fs::File::open(&self.vlog.path) {
@@ -187,11 +191,16 @@ impl<'a> GarbageCollector<'a> {
                 old_file_id: analysis.file_id,
                 new_file_id,
                 keys_rewritten: rewrites.len() - cas_failures,
+                bytes_written: total_bytes,
             })
         })();
 
         match compact_res {
-            std::result::Result::Ok(res) => Ok(Some(res)),
+            std::result::Result::Ok(res) => {
+                self.vlog
+                    .record_gc_result(res.keys_rewritten, res.bytes_written);
+                Ok(Some(res))
+            }
             std::result::Result::Err(e) => {
                 // Clean up the orphaned new vLog file on error
                 let _ = std::fs::remove_file(&new_path);

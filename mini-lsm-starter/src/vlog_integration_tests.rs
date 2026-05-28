@@ -1112,3 +1112,71 @@ fn test_gc_batch_cas() {
         );
     }
 }
+
+#[test]
+fn test_vlog_stats_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options_with_vlog_enabled(256, 1 << 20);
+    if let Some(ref mut vs) = options.value_separation {
+        vs.gc_threshold_ratio = 0.0; // Always trigger GC
+    }
+    let storage = MiniLsm::open(dir.path(), options).unwrap();
+
+    // Stats before any writes
+    let stats = storage.vlog_stats().unwrap();
+    assert_eq!(stats.vlog_file_count, 0);
+    assert_eq!(stats.vlog_total_bytes, 0);
+    assert_eq!(stats.gc_entries_rewritten, 0);
+    assert_eq!(stats.gc_files_processed, 0);
+
+    // Write and flush to create vLog files
+    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
+    storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+    storage
+        .inner
+        .force_freeze_memtable(&storage.inner.state_lock.lock())
+        .unwrap();
+    storage.inner.force_flush_next_imm_memtable().unwrap();
+
+    let stats = storage.vlog_stats().unwrap();
+    assert!(
+        stats.vlog_file_count >= 1,
+        "should have at least 1 vLog file"
+    );
+    assert!(
+        stats.vlog_total_bytes > 0,
+        "vLog files should have nonzero size"
+    );
+
+    // Overwrite keys to create stale entries, flush, then compact
+    storage.put(b"key1", &vec![b'c'; 64]).unwrap();
+    storage.put(b"key2", &vec![b'd'; 64]).unwrap();
+    storage
+        .inner
+        .force_freeze_memtable(&storage.inner.state_lock.lock())
+        .unwrap();
+    storage.inner.force_flush_next_imm_memtable().unwrap();
+    storage.inner.force_full_compaction().unwrap();
+
+    // Trigger GC — should process files and rewrite entries
+    let gc_count = storage.trigger_gc().unwrap();
+    assert!(gc_count > 0, "GC should have processed at least 1 file");
+
+    let stats = storage.vlog_stats().unwrap();
+    assert!(
+        stats.gc_files_processed > 0,
+        "gc_files_processed should be > 0"
+    );
+    // gc_entries_rewritten may be 0 if all entries were dead (100% dead optimization)
+    // but gc_bytes_rewritten should reflect the file scan
+
+    // Values should still be correct
+    assert_eq!(
+        storage.get(b"key1").unwrap(),
+        Some(Bytes::from(vec![b'c'; 64]))
+    );
+    assert_eq!(
+        storage.get(b"key2").unwrap(),
+        Some(Bytes::from(vec![b'd'; 64]))
+    );
+}
