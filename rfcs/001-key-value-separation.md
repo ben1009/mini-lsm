@@ -975,7 +975,7 @@ impl GarbageCollector {
     /// standard GC mechanism.
     pub fn compact_file(&self, analysis: &GcAnalysis) -> Result<Option<GcResult>> {
         if analysis.stale_ratio < self.threshold {
-            return Ok(());
+            return Ok(None);
         }
 
         // Create new vLog file with live entries
@@ -1010,6 +1010,7 @@ impl GarbageCollector {
         writer.close()?;
 
         // Phase 2: CAS each live key to point at the new vLog location.
+        let mut cas_failures = 0;
         for (key, old_ptr, new_ptr) in &rewrites {
             let mut buf = Vec::with_capacity(ValuePointer::encoded_size());
             new_ptr.encode(&mut buf);
@@ -1029,7 +1030,8 @@ impl GarbageCollector {
                 &expected_buf, KvKind::ValuePointer,
                 &buf, KvKind::ValuePointer,
             )? {
-                continue; // A concurrent user write changed the value — skip this entry
+                cas_failures += 1; // A concurrent user write changed the value — skip this entry
+                continue;
             }
         }
 
@@ -1043,7 +1045,11 @@ impl GarbageCollector {
         // section 7.1 for the watermark/refcount-based reclamation contract.
         self.vlog.schedule_deletion(analysis.file_id)?;
 
-        Ok(())
+        Ok(Some(GcResult {
+            old_file_id: analysis.file_id,
+            new_file_id,
+            keys_rewritten: rewrites.len() - cas_failures,
+        }))
     }
 
     /// Check if a vLog entry is still referenced by the LSM tree.
@@ -1490,8 +1496,8 @@ pub enum ManifestRecord {
     /// Flush of a memtable to L0. Original variant kept for backward compat.
     Flush(usize),
 
-    /// Flush with vLog references. Named fields so serde_json can deserialize
-    /// even when the `vlogs` key is absent from old manifests.
+    /// Flush with vLog references. Tuple variant containing the SST ID and the
+    /// list of referenced vLog file IDs.
     FlushV2(usize, Vec<u32>),
 
     NewMemtable(usize),
@@ -1499,11 +1505,8 @@ pub enum ManifestRecord {
     /// Compaction output. For each output SST, record the set of vLog files
     /// it references so the SST → vLog map is reconstructable from the
     /// manifest alone.
-    // NOTE: The manifest uses serde_json, and #[serde(default)] on a tuple
-    // variant field does NOT work with serde_json (it cannot deserialize a
-    // single-element JSON array into a two-element Rust tuple). To preserve
-    // backward compatibility with existing manifests, keep the original
-    // variants unchanged and introduce new V2 variants with named fields.
+    // NOTE: To preserve backward compatibility with existing manifests, keep
+    // the original variants unchanged and introduce new V2 tuple variants.
     // The recovery code should accept both old and new variants.
     Compaction(CompactionTask, Vec<usize>),
     CompactionV2(CompactionTask, Vec<usize>, Vec<u32>),
