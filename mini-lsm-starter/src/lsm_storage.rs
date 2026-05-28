@@ -851,9 +851,15 @@ impl LsmStorageInner {
     }
 
     /// Batch CAS: atomically compare-and-swap multiple entries under a single
-    /// lock acquisition. Returns a Vec<bool> indicating success per entry.
+    /// `state_lock` acquisition. Returns a Vec<bool> indicating success per entry.
     ///
     /// Each entry is `(key, old_value, old_kind, new_value, new_kind)`.
+    ///
+    /// Uses optimistic two-phase concurrency control:
+    /// - Phase 1 (read lock): perform all LSM lookups to identify matching candidates.
+    ///   Concurrent reads are not blocked during this phase.
+    /// - Phase 2 (write lock): re-verify matched candidates and write to memtable.
+    ///   Only matched entries are re-checked, so the exclusive lock hold is minimal.
     ///
     /// NOTE: If the batch contains duplicate keys that both match, all report
     /// success but only the last value is stored. The GC use case never produces
@@ -863,23 +869,42 @@ impl LsmStorageInner {
         entries: &[(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)],
     ) -> Result<Vec<bool>> {
         let _lock = self.state_lock.lock();
+
+        // Phase 1: Lookups under read lock — concurrent reads not blocked
+        let mut candidates = Vec::with_capacity(entries.len());
+        {
+            let state = self.state.read().as_ref().clone();
+            for (key, old, old_kind, _, _) in entries {
+                let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
+                candidates.push(Self::values_match(
+                    &current_val,
+                    current_kind,
+                    old,
+                    *old_kind,
+                ));
+            }
+        }
+
+        // Phase 2: Re-verify matched candidates and write under exclusive lock
         let guard = self.state.write();
         let state = guard.as_ref().clone();
 
-        let mut results = Vec::with_capacity(entries.len());
+        let mut results = vec![false; entries.len()];
         let mut writes: Vec<(KeySlice, Vec<u8>)> = Vec::with_capacity(entries.len());
 
-        for (key, old, old_kind, new, new_kind) in entries {
-            let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
+        for (i, (key, old, old_kind, new, new_kind)) in entries.iter().enumerate() {
+            if !candidates[i] {
+                continue;
+            }
 
+            // Re-verify under write lock to ensure atomicity
+            let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
             if Self::values_match(&current_val, current_kind, old, *old_kind) {
                 let mut prefixed = Vec::with_capacity(1 + new.len());
                 prefixed.push(*new_kind as u8);
                 prefixed.extend_from_slice(new);
                 writes.push((KeySlice::from_slice(key), prefixed));
-                results.push(true);
-            } else {
-                results.push(false);
+                results[i] = true;
             }
         }
 
