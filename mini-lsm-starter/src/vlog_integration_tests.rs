@@ -867,8 +867,7 @@ fn test_crash_recovery_after_partial_flush() {
 
 #[test]
 fn test_orphan_vlog_cleanup_on_startup() {
-    // Manually create an orphan .vlog file and verify the engine handles it gracefully.
-    // The orphan file should not affect normal operations.
+    // Manually create an orphan .vlog file and verify it is deleted on startup.
     let dir = tempfile::tempdir().unwrap();
     let options = options_with_vlog_enabled(256, 1 << 20);
 
@@ -890,9 +889,15 @@ fn test_orphan_vlog_cleanup_on_startup() {
     std::fs::write(&orphan_path, b"orphan data that should not be read").unwrap();
     assert!(orphan_path.exists());
 
-    // Reopen — the engine should start successfully despite the orphan file
+    // Reopen — the orphan should be cleaned up on startup
     {
         let storage = MiniLsm::open(dir.path(), options).unwrap();
+
+        // Orphan file should be deleted
+        assert!(
+            !orphan_path.exists(),
+            "orphan vLog file should be deleted on startup"
+        );
 
         // Original data should still be readable
         assert_eq!(

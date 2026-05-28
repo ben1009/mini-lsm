@@ -541,6 +541,45 @@ impl ValueLog {
             None => Ok(deleted),
         }
     }
+
+    /// Remove vLog files on disk that are not referenced by any SST or
+    /// active memtable. `preserve` contains vLog file IDs referenced by
+    /// unflushed memtable entries (rebuilt from the WAL during crash recovery)
+    /// that must not be deleted even though no SST references them yet.
+    pub fn cleanup_orphan_vlog_files(&self, preserve: &HashSet<u32>) -> Result<usize> {
+        let mut orphans = Vec::new();
+        for entry in std::fs::read_dir(&self.path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name_str.strip_suffix(".vlog") else {
+                continue;
+            };
+            let Ok(file_id) = stem.parse::<u32>() else {
+                continue;
+            };
+            if !preserve.contains(&file_id)
+                && self
+                    .get_ssts_referencing(file_id)
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                orphans.push(file_id);
+            }
+        }
+        let mut deleted = 0;
+        for file_id in orphans {
+            if self.remove_file(file_id).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]

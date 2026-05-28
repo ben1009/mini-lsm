@@ -1825,9 +1825,9 @@ This section documents intentional deviations between the original RFC design an
 
 ## Known Limitations
 
-1. **Pending deletions lost on restart** — `schedule_deletion` only records pending files in memory. A restart between scheduling and reclamation loses the deletion intent, potentially leaking orphaned vLog files on disk.
+1. ~~**Pending deletions lost on restart**~~ — Fixed. On startup, after SST→vLog references are rebuilt from the manifest, `cleanup_orphan_vlog_files()` scans the `vlog/` directory and deletes any `.vlog` file not referenced by an active SST. This covers all orphan scenarios: pending deletions lost on restart, incomplete flushes, and incomplete GC runs.
 
-2. **No automatic reclamation after post-compaction GC** — `post_compaction_gc` schedules old files for deletion but does not call `reclaim_pending_deletions()` afterwards. Files remain on disk until `trigger_gc()` is invoked manually.
+2. ~~**No automatic reclamation after post-compaction GC**~~ — Fixed. `post_compaction_gc` now calls `reclaim_pending_deletions()` after processing all input vLog files. Files still referenced by compaction-output SSTs are safely pushed back to the pending queue.
 
 3. **GC CAS is not batched** — Each live entry is rewritten as an independent `compare_and_set_with_kind` call. This is correct but adds per-call lock overhead. A future optimization can batch CAS calls under a single lock acquisition.
 
@@ -1859,8 +1859,8 @@ This section documents intentional deviations between the original RFC design an
 7. **Lock-free vLog writer**: Replace the `active_writer` Mutex with a lock-free append buffer, dedicated writer thread with request channel, or multiple active vLog files to improve write concurrency
 8. **Pre-created vLog rotation**: Prepare the next vLog file in the background so rotation doesn't block the writer with synchronous file creation
 9. **Remove VALUE_POINTER_TAG**: If the 1-byte tag overhead becomes a bottleneck, remove it and rely solely on KvKind for classification (encoded size drops from 17 to 16 bytes)
-10. **Persist pending deletions**: Write the pending-deletion queue to disk (e.g., a `.vlog_pending_deletions` file) so orphaned files are not leaked across restarts
-11. **Reclaim after post-compaction GC**: Call `reclaim_pending_deletions()` automatically after `post_compaction_gc` completes so workloads relying on automatic compaction-triggered GC do not leave eligible files on disk indefinitely
+10. ~~**Persist pending deletions**~~: Done. Instead of persisting the queue, `cleanup_orphan_vlog_files()` runs on startup and deletes any `.vlog` file not referenced by an active SST — simpler and handles all orphan scenarios.
+11. ~~**Reclaim after post-compaction GC**~~: Done. `post_compaction_gc` now calls `reclaim_pending_deletions()` after processing all input vLog files.
 12. **ValueLogStats API**: Expose `vlog_stats()` for runtime observability of vLog space usage, GC progress, and read latency
 
 ## References

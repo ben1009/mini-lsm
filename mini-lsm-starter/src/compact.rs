@@ -398,10 +398,14 @@ impl LsmStorageInner {
                 }
             }
         }
-        // Note: do NOT call reclaim_pending_deletions here.
-        // GC CAS writes go to the memtable, so old vLog files may still be
-        // referenced by unflushed memtable entries. Deletion must wait until
-        // those entries are flushed to SSTs and the references are updated.
+        // Reclaim vLog files that were retired by previous GC rounds and are
+        // no longer referenced by any SST. This is safe because
+        // reclaim_pending_deletions checks get_ssts_referencing() — files
+        // still referenced by compaction-output SSTs (which carry the same
+        // vlog IDs as the old SSTs) will be pushed back to the pending queue.
+        if let Err(e) = vlog.reclaim_pending_deletions() {
+            eprintln!("vLog reclaim error: {}", e);
+        }
     }
 
     fn trigger_compaction(&self) -> Result<()> {
