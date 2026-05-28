@@ -885,9 +885,14 @@ impl LsmStorageInner {
             }
         }
 
-        // Phase 2: Re-verify matched candidates and write under exclusive lock
+        // Phase 2: Re-verify matched candidates and write under exclusive lock.
+        // Since `state_lock` is held, no flush or compaction can run, and the
+        // memtable cannot be frozen. Any concurrent write between Phase 1 and
+        // Phase 2 must have gone to `state.memtable`. Therefore, we only need
+        // to check the memtable for newer values — no disk I/O required.
         let guard = self.state.write();
         let state = guard.as_ref().clone();
+        let vlog_enabled = self.vlog.is_some();
 
         let mut results = vec![false; entries.len()];
         let mut writes: Vec<(KeySlice, Vec<u8>)> = Vec::with_capacity(entries.len());
@@ -897,9 +902,23 @@ impl LsmStorageInner {
                 continue;
             }
 
-            // Re-verify under write lock to ensure atomicity
-            let (current_val, current_kind) = self.get_with_kind_inner(&state, key)?;
-            if Self::values_match(&current_val, current_kind, old, *old_kind) {
+            // Re-verify: only check the memtable for a newer value.
+            // If the key is not in the memtable, no concurrent write changed
+            // it since Phase 1, so the Phase 1 match still holds.
+            let mut still_matches = true;
+            if vlog_enabled {
+                if let Some(raw) = state.memtable.get_raw(key) {
+                    let (current_val, current_kind) = Self::parse_value_kind(&raw);
+                    still_matches =
+                        Self::values_match(&current_val, current_kind, old, *old_kind);
+                }
+            } else if let Some(v) = state.memtable.get(key) {
+                let current_val = if v.is_empty() { None } else { Some(v) };
+                still_matches =
+                    Self::values_match(&current_val, KvKind::Inline, old, *old_kind);
+            }
+
+            if still_matches {
                 let mut prefixed = Vec::with_capacity(1 + new.len());
                 prefixed.push(*new_kind as u8);
                 prefixed.extend_from_slice(new);
