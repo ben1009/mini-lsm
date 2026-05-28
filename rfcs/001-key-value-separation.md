@@ -596,9 +596,11 @@ pub struct ValueLog {
     /// records during file rotation and deletion.
     manifest: Arc<Manifest>,
 }
+```
 
 > **Implementation Note:** The `lsm_clock` and `Clock` trait described above are not present in the actual implementation. Instead, `pending_deletions` stores only `file_id` (no `obsolete_at_ts`) and relies solely on SST reference counting (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`) to determine when a file is safe to delete. See [Known Limitations](#known-limitations) for details.
 
+```rust
 impl ValueLog {
     /// Write a key-value pair to the active vLog file.
     /// Returns a ValuePointer that can be stored in the LSM tree.
@@ -672,10 +674,14 @@ impl ValueLog {
                 }
             }
         }
-        for vlog_id in &vlog_ids {
-            refs.vlog_to_ssts.entry(*vlog_id).or_default().insert(sst_id);
+        if vlog_ids.is_empty() {
+            return;
         }
-        refs.sst_to_vlogs.insert(sst_id, vlog_ids);
+        let set: HashSet<u32> = HashSet::from_iter(vlog_ids.iter().copied());
+        for &vlog_id in &set {
+            refs.vlog_to_ssts.entry(vlog_id).or_default().insert(sst_id);
+        }
+        refs.sst_to_vlogs.insert(sst_id, set);
     }
 
     /// Get all vLog files referenced by a given SST.
@@ -685,18 +691,18 @@ impl ValueLog {
 
     /// Get all SSTs that reference a given vLog file.
     /// Uses the reverse index for O(1) lookup.
-    pub fn get_ssts_referencing(&self, vlog_id: u32) -> Vec<usize> {
+    pub fn get_ssts_referencing(&self, vlog_id: u32) -> Option<Vec<usize>> {
         self.vlog_refs
             .read()
             .vlog_to_ssts
             .get(&vlog_id)
             .map(|ssts| ssts.iter().copied().collect())
-            .unwrap_or_default()
     }
 
     /// Remove all vLog references for a deleted SST.
     /// Updates both indexes atomically under one lock.
-    pub fn unregister_sst_references(&self, sst_id: usize) {
+    /// Returns the vLog file IDs that were referenced by the removed SST.
+    pub fn unregister_sst_references(&self, sst_id: usize) -> Vec<u32> {
         let mut refs = self.vlog_refs.write();
         if let Some(vlog_ids) = refs.sst_to_vlogs.remove(&sst_id) {
             for vlog_id in vlog_ids {
@@ -895,19 +901,16 @@ pub struct GcAnalysis {
 }
 
 /// Garbage collector for reclaiming space in value logs.
-pub struct GarbageCollector {
-    vlog: Arc<ValueLog>,
-    lsm: Arc<MiniLsm>,
+pub struct GarbageCollector<'a> {
+    vlog: &'a Arc<ValueLog>,
+    inner: &'a LsmStorageInner,
     threshold: f64,
-    /// Per-file GC locks: prevents two GC tasks from compacting the same file.
-    /// Keyed by vLog file ID.
-    gc_locks: Mutex<HashSet<u32>>,
 }
 
-impl GarbageCollector {
+impl<'a> GarbageCollector<'a> {
     /// Create a new garbage collector.
-    pub fn new(vlog: Arc<ValueLog>, lsm: Arc<MiniLsm>, threshold: f64) -> Self {
-        Self { vlog, lsm, threshold, gc_locks: Mutex::new(HashSet::new()) }
+    pub fn new(vlog: &'a Arc<ValueLog>, inner: &'a LsmStorageInner, threshold: f64) -> Self {
+        Self { vlog, inner, threshold }
     }
 
     /// Try to acquire the GC lock for a file. Returns false if another GC task
@@ -1025,7 +1028,7 @@ impl GarbageCollector {
             old_ptr.encode(&mut expected_buf);
             // Kind-aware CAS: ensures we don't overwrite an inline user value
             // that happens to be byte-identical to the old pointer encoding.
-            if !self.lsm.compare_and_set_with_kind(
+            if !self.inner.compare_and_set_with_kind(
                 key,
                 &expected_buf, KvKind::ValuePointer,
                 &buf, KvKind::ValuePointer,
@@ -1038,7 +1041,7 @@ impl GarbageCollector {
         // Ensure LSM writes are durable before scheduling the old file for reclamation.
         // This sync() is what makes the CAS results crash-safe — without it, a crash
         // after schedule_deletion could lose the new pointers.
-        self.lsm.sync()?;
+        self.inner.sync()?;
 
         // Defer deletion until all active snapshots/iterators referencing the
         // old file have been released. See `ValueLog::schedule_deletion` and
@@ -1062,15 +1065,23 @@ impl GarbageCollector {
     /// Liveness check using only key + pointer (no value needed).
     /// Used by analyze_file's header-only iterator to avoid reading values.
     fn check_liveness(&self, key: &[u8], ptr: &ValuePointer) -> Result<bool> {
-        match self.lsm.get_with_kind(key)? {
-            (Some(value), KvKind::ValuePointer) => {
-                let current_ptr = ValuePointer::decode(&value)?;
-                Ok(current_ptr.file_id == ptr.file_id && current_ptr.offset == ptr.offset)
+        let (current_val, current_kind) = self.inner.get_with_kind(key)?;
+        match current_kind {
+            KvKind::ValuePointer => {
+                if let Some(value) = current_val
+                    && let Some(current_ptr) = ValuePointer::try_decode(&value[1..])
+                {
+                    return Ok(current_ptr.file_id == ptr.file_id
+                        && current_ptr.offset == ptr.offset
+                        && current_ptr.size == ptr.size);
+                }
+                Ok(false)
             }
             _ => Ok(false), // Key deleted, or value is now inline — entry is stale
         }
     }
 }
+```
 
 ### 7.1 Stale Pointer Handling
 
@@ -1094,7 +1105,6 @@ Production systems use one of the following approaches to safely reclaim old vLo
 - **Reference Counting**: Track open readers per vLog file. Delete when count reaches zero.
 - **Watermark-Based Reclamation**: Record the current MVCC watermark (minimum active snapshot timestamp) before GC. Only delete files after all snapshots older than that watermark have been released. This integrates naturally with Mini-LSM's Week 3 MVCC design.
 - **Epoch-Based Reclamation**: Similar to watermark, but using monotonic epoch counters for non-MVCC systems.
-```
 
 ### 8. Integration with Compaction
 
@@ -1307,7 +1317,7 @@ pub struct LsmStorageOptions {
 ### New Storage Methods
 
 ```rust
-impl MiniLsm {
+impl LsmStorageInner {
     /// Get statistics about value log usage
     pub fn vlog_stats(&self) -> ValueLogStats;
 
@@ -1316,8 +1326,9 @@ impl MiniLsm {
     /// ambiguous payload-based pointer detection.
     pub(crate) fn get_with_kind(&self, key: &[u8]) -> Result<(Option<Bytes>, KvKind)>;
 
-    /// Trigger manual garbage collection
-    pub fn trigger_gc(&self) -> Result<()>;
+    /// Trigger manual garbage collection.
+    /// Returns the number of files that were GC'd.
+    pub fn trigger_gc(&self) -> Result<usize>;
 
     /// Atomically replace `key` only if the current value equals `old`.
     /// Returns true if the swap succeeded, false if the value changed.
@@ -1325,7 +1336,7 @@ impl MiniLsm {
     /// Kind-aware CAS: checks both value bytes AND KvKind.
     /// Prevents GC from overwriting an inline user value that happens to be
     /// byte-identical to an encoded ValuePointer (17 bytes starting with 0xFF).
-    pub fn compare_and_set_with_kind(
+    pub(crate) fn compare_and_set_with_kind(
         &self, key: &[u8], old: &[u8], old_kind: KvKind, new: &[u8], new_kind: KvKind,
     ) -> Result<bool>;
 }
