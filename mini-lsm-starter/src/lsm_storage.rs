@@ -510,6 +510,11 @@ impl LsmStorageInner {
                     vlog.register_sst_references(*sst_id, vlog_ids);
                 }
             }
+            // Clean up orphaned vLog files left by a crash during GC or flush.
+            // Safe here because all active SST references are now registered.
+            if let Err(e) = vlog.cleanup_orphan_vlog_files() {
+                eprintln!("vLog orphan cleanup error: {}", e);
+            }
         }
 
         let storage = Self {

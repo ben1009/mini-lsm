@@ -541,6 +541,39 @@ impl ValueLog {
             None => Ok(deleted),
         }
     }
+
+    /// Remove vLog files on disk that are not referenced by any SST.
+    /// Called during startup after SST→vLog references are rebuilt from the
+    /// manifest, ensuring files retired by a previous GC (whose pending-
+    /// deletion queue was lost on restart) and files from incomplete flushes
+    /// or GC runs are cleaned up.
+    pub fn cleanup_orphan_vlog_files(&self) -> Result<usize> {
+        let mut orphans = Vec::new();
+        for entry in std::fs::read_dir(&self.path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else { continue };
+            let Some(stem) = name_str.strip_suffix(".vlog") else { continue };
+            let Ok(file_id) = stem.parse::<u32>() else { continue };
+            if self
+                .get_ssts_referencing(file_id)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                orphans.push(file_id);
+            }
+        }
+        let mut deleted = 0;
+        for file_id in orphans {
+            if self.remove_file(file_id).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
