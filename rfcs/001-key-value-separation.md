@@ -597,7 +597,7 @@ pub struct ValueLog {
     manifest: Arc<Manifest>,
 }
 
-> **Implementation Note:** The `lsm_clock` and `Clock` trait described above are not present in the actual implementation. Instead, `pending_deletions` stores only `file_id` (no `obsolete_at_ts`) and relies solely on SST reference counting (`get_ssts_referencing().is_empty()`) to determine when a file is safe to delete. See [Known Limitations](#known-limitations) for details.
+> **Implementation Note:** The `lsm_clock` and `Clock` trait described above are not present in the actual implementation. Instead, `pending_deletions` stores only `file_id` (no `obsolete_at_ts`) and relies solely on SST reference counting (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`) to determine when a file is safe to delete. See [Known Limitations](#known-limitations) for details.
 
 impl ValueLog {
     /// Write a key-value pair to the active vLog file.
@@ -1517,7 +1517,7 @@ pub enum ManifestRecord {
 }
 ```
 
-> **Implementation Note:** `GcCompaction`, `FlushV2`, and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. The `NewVlogFile` and `DeleteVlogFile` variants were designed but not implemented. Recovery reads `FlushV2` and `CompactionV2` records directly from the manifest to rebuild the `sst_to_vlogs` index on startup.
+> **Implementation Note:** `FlushV2` and `CompactionV2` manifest records were implemented and are used to persist and recover SST-to-vLog references. `GcCompaction` records GC events but is a no-op during recovery (references are updated via CAS + flush). The `NewVlogFile` and `DeleteVlogFile` variants were designed but not implemented. Recovery reads `FlushV2` and `CompactionV2` records directly from the manifest to rebuild the `sst_to_vlogs` index on startup.
 
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
@@ -1725,7 +1725,7 @@ This section documents intentional deviations between the original RFC design an
 
 **Original design:** `PendingDeletion` carried an `obsolete_at_ts: u64` timestamp and `reclaim_pending_deletions` accepted a `watermark_ts: u64` parameter. Files were only deleted after the MVCC watermark advanced past the retirement timestamp.
 
-**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path.
+**Actual implementation:** `PendingDeletion` stores only `file_id: u32`. `reclaim_pending_deletions()` checks only whether any SSTs reference the file (`get_ssts_referencing(file_id).unwrap_or_default().is_empty()`). The MVCC watermark check and explicit reader-refcount checks are omitted because the starter crate does not use MVCC timestamps for snapshot isolation in the vLog reclamation path.
 
 ### Background GC Thread Pool
 
