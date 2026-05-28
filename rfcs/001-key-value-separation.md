@@ -1,8 +1,13 @@
 # RFC: Key-Value Separation for Mini-LSM
 
-**Status**: Implemented (Phases 1–3)  
-**Author**: Mini-LSM Contributors  
-**Created**: 2026-03-08  
+**Status**: Implemented (Phases 1–3)
+**Author**: Mini-LSM Contributors
+**Created**: 2026-03-08
+
+> **Note:** The code blocks in this RFC reflect the original design and may differ
+> from the actual implementation. Where significant deviations exist, inline
+> **Implementation Notes** document the differences. When in doubt, refer to the
+> source code in `mini-lsm-starter/src/` as the authoritative reference.  
 **Last Updated**: 2026-05-28  
 **Target Version**: Post-Week 3  
 **Tracking Issue**: N/A (design RFC, tracked via implementation tasks)
@@ -842,6 +847,24 @@ impl ValueLog {
 }
 ```
 
+> **Implementation Note:** The `ValueLog` struct and methods above differ significantly from
+> the actual implementation:
+> - **No `active_writer` field or `write()` method.** The flush path uses a per-flush
+>   `ValueLogBuilder` owned by `SsTableBuilder`, not a shared writer on `ValueLog`.
+>   GC creates a `ValueLogWriter` directly in `compact_file`.
+> - **No `manifest` field.** `NewVlogFile`/`DeleteVlogFile` manifest records are declared
+>   but never written. vLog file IDs are discovered by scanning the `vlog/` directory on startup.
+> - **No `reader_refcounts` or `ValueLogReaderHandle` RAII guard.** `get_reader` returns
+>   `Result<Arc<ValueLogReader>>` directly; the `moka` cache provides implicit liveness.
+> - **No `lsm_clock` / `Clock` trait.** `PendingDeletion` stores only `file_id: u32`.
+>   `schedule_deletion` returns `()` (not `Result<()>`). `reclaim_pending_deletions` checks
+>   only `get_ssts_referencing(file_id).unwrap_or_default().is_empty()` with no watermark.
+> - **`gc_locks` lives on `ValueLog`**, not on `GarbageCollector`. The actual struct has
+>   `gc_locks: Mutex<HashSet<u32>>` with `try_acquire_gc_lock`/`release_gc_lock` methods.
+> - **`references` field** (not `vlog_refs`): the actual field is `references: VlogReferences`.
+> - **No `ptr.size` validation in `read()`.** The actual `read()` goes straight to
+>   `get_reader` and `read_entry` without bounds checking.
+
 ### 7. Garbage Collection
 
 > **Note**: GC uses `compare_and_set_with_kind` for atomic pointer rebinding.
@@ -1064,6 +1087,26 @@ impl<'a> GarbageCollector<'a> {
 }
 ```
 
+> **Implementation Note:** The GC code above differs from the actual implementation:
+> - **`gc_locks` is on `ValueLog`**, not `GarbageCollector`. The actual `compact_file`
+>   calls `self.vlog.try_acquire_gc_lock(file_id)` (not `self.gc_locks`).
+> - **CAS encodes old pointer WITH `KvKind::ValuePointer` prefix.** The actual code
+>   pushes `KvKind::ValuePointer as u8` before encoding the old pointer, because
+>   `get_with_kind` returns raw kind-prefixed bytes. Without the prefix, every CAS
+>   would fail.
+> - **No `self.inner.sync()` before `schedule_deletion`.** Each CAS operation already
+>   syncs the WAL via `put_raw_batch`. The redundant sync was removed.
+> - **Old file is always scheduled for deletion** after the CAS loop, regardless of
+>   individual CAS failures (concurrent writes go to memtable, not old vLog).
+> - **All-CAS-failures cleanup:** when all CAS operations fail, the new vLog file is
+>   also scheduled for deletion (entirely unreferenced).
+> - **Error recovery:** on error during compaction, the new vLog file is deleted via
+>   `std::fs::remove_file` to prevent orphans.
+> - **100%-dead optimization:** when `live_entries.is_empty()`, skips creating a new
+>   file and directly schedules deletion of the old file.
+> - **`GarbageCollector` borrows** `&'a Arc<ValueLog>` and `&'a LsmStorageInner`
+>   (not owned `Arc<MiniLsm>`).
+
 ### 7.1 Stale Pointer Handling
 
 Because SSTs are immutable, old SSTs continue to contain pointers to the old vLog file even after GC moves values to a new file. This is handled naturally by the LSM tree's tiered structure:
@@ -1164,6 +1207,17 @@ impl CompactionController {
 > **Important**: `unregister_sst_references(sst_id)` removes the SST's entry from the
 > `sst_to_vlogs` mapping. This must be called whenever an SST is deleted (compaction,
 > manual removal) to prevent leaked references that block vLog space reclamation.
+
+> **Implementation Note:** The compaction code above differs from the actual implementation:
+> - **`post_compaction_gc` is on `LsmStorageInner`**, not `CompactionController`.
+>   `CompactionController` is an enum with no `gc_pool` field. GC runs synchronously
+>   on the calling thread (no `rayon` thread pool).
+> - **Compaction does NOT re-separate values.** The actual code creates builders with
+>   `SsTableBuilder::new(self.options.block_size)` (vLog disabled). Values pass through
+>   via `add_raw()`, preserving their existing kind prefix. No `ValueLogBuilder` is
+>   created during compaction.
+> - **`unregister_sst_references` returns `Vec<u32>`** (not `()`), giving the caller
+>   the list of vLog file IDs that were referenced by the removed SST.
 
 ## Implementation Plan
 
@@ -1280,7 +1334,7 @@ pub struct LsmStorageOptions {
     // ... existing fields ...
     
     /// Options for key-value separation
-    pub value_separation: ValueSeparationOptions,
+    pub value_separation: Option<ValueSeparationOptions>,
 }
 ```
 
@@ -1443,14 +1497,16 @@ fn test_gc_100_percent_dead() {
 }
 ```
 
-> **Implementation Note:** Of the tests listed above, only `test_gc_100_percent_dead`
-> is implemented (`vlog_integration_tests.rs`). The remaining tests (`test_gc_with_concurrent_writes`,
-> `test_crash_recovery_after_partial_flush`, `test_orphan_vlog_cleanup_on_startup`,
-> `test_range_scan_deduplication`, `test_mixed_inline_pointer_after_enable`) are
-> proposed but not yet written. The test snippets use simplified APIs that differ
-> from the actual signatures (e.g., `MiniLsm::open` takes `impl AsRef<Path>`, not
-> `&TempDir`; `value_separation` is `Option<ValueSeparationOptions>`, not
-> `ValueSeparationOptions` directly).
+> **Implementation Note:** Of the tests listed above, `test_gc_100_percent_dead` is
+> implemented (`vlog_integration_tests.rs`). Additional GC tests exist:
+> `test_gc_preserves_live_values`, `test_gc_below_threshold`, `test_trigger_gc_api`,
+> `test_gc_multiple_files`, and `test_gc_analyze_file`. The remaining proposed tests
+> (`test_gc_with_concurrent_writes`, `test_crash_recovery_after_partial_flush`,
+> `test_orphan_vlog_cleanup_on_startup`, `test_range_scan_deduplication`,
+> `test_mixed_inline_pointer_after_enable`) are not yet written. The test snippets
+> use simplified APIs that differ from the actual signatures (e.g., `MiniLsm::open`
+> takes `impl AsRef<Path>`, not `&TempDir`; `value_separation` is
+> `Option<ValueSeparationOptions>`, not `ValueSeparationOptions` directly).
 
 ## Compatibility and Migration
 
@@ -1520,12 +1576,14 @@ pub enum ManifestRecord {
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
 vlog_ids)` to populate **both** `sst_to_vlogs` and `vlog_to_ssts` indexes.
-Old `Flush(usize)` and `Compaction(usize, Vec<usize>)` records are treated as
+Old `Flush(usize)` and `Compaction(CompactionTask, Vec<usize>)` records are treated as
 having an empty vLog set.
 
-`NewVlogFile` records participate in ID allocation and crash recovery, but not
-data liveness. A vLog file is live only if it is referenced by an SST reference
-set or by a WAL-recovered memtable entry with `KvKind::ValuePointer`.
+`NewVlogFile` and `DeleteVlogFile` are declared in the enum but not written
+to the manifest in the actual implementation. vLog file IDs are discovered by
+scanning the `vlog/` directory on startup. A vLog file is live only if it is
+referenced by an SST reference set or by a WAL-recovered memtable entry with
+`KvKind::ValuePointer`.
 
 ## Crash Recovery
 
@@ -1557,16 +1615,9 @@ non-separated LSM tree. GC CAS rewrites store the encoded `ValuePointer` with
 without payload sniffing. Value separation for normal user writes still happens
 **during flush** (memtable → SST), not during the put path:
 
-- **Write path (put)**: `max_value_size` validation → value + `KvKind::Inline` → WAL → **WAL fsync** → memtable.
-  Values exceeding `max_value_size` are rejected at `put`/`write_batch` time with
-  an error, preventing background flush failures. This validation is cheap (one
-  length check) and adds no latency.
-
-  > **Implementation Note:** In the actual codebase, `max_value_size` validation is
-  > performed in `ValueLogBuilder::add` during flush (not at `put`/`write_batch` time).
-  > The `put` path writes the full value to the WAL and memtable without a length check.
-  > Oversized values are rejected at flush time, which means a background flush can fail
-  > if a value exceeds the limit.
+- **Write path (put)**: value + `KvKind::Inline` → WAL → **WAL fsync** → memtable.
+  `max_value_size` validation is deferred to flush time (in `ValueLogBuilder::add`),
+  not performed at `put`/`write_batch` time.
 - **GC CAS path**: encoded `ValuePointer` + `KvKind::ValuePointer` → WAL → memtable
 - **Flush path**: scan memtable → for each entry with `value.len() >= min_value_size`:
   1. append value to vLog buffer (in-memory)
@@ -1831,8 +1882,8 @@ data/
 ├── 00002.sst
 ├── ...
 ├── vlog/           # NEW: Value log directory
-│   ├── 00001.vlog
-│   └── 00002.vlog
+│   ├── 0.vlog      # Not zero-padded (format: "{id}.vlog")
+│   └── 1.vlog
 └── 00001.wal
 ```
 
