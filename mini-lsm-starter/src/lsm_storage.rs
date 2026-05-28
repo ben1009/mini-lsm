@@ -703,7 +703,11 @@ impl LsmStorageInner {
     /// Inner helper that operates on an already-cloned state snapshot.
     /// Used by both `get_with_kind` (public) and `compare_and_set_with_kind`
     /// (which holds a write lock and passes the state directly).
-    fn get_with_kind_inner(&self, state: &LsmStorageState, key: &[u8]) -> Result<(Option<Bytes>, KvKind)> {
+    fn get_with_kind_inner(
+        &self,
+        state: &LsmStorageState,
+        key: &[u8],
+    ) -> Result<(Option<Bytes>, KvKind)> {
         let vlog_enabled = self.vlog.is_some();
 
         // Memtable
@@ -1047,9 +1051,11 @@ impl LsmStorageInner {
 
         // memtable
         let vlog = self.vlog.clone();
-        let mut m_merge_iterators = vec![Box::new(
-            state.memtable.scan_with_vlog(lower, upper, vlog.clone()),
-        )];
+        let mut m_merge_iterators = vec![Box::new(state.memtable.scan_with_vlog(
+            lower,
+            upper,
+            vlog.clone(),
+        ))];
         for i in state.imm_memtables.iter() {
             let it = i.scan_with_vlog(lower, upper, vlog.clone());
             m_merge_iterators.push(Box::new(it));
