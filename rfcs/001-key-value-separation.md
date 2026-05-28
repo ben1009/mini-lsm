@@ -1856,8 +1856,8 @@ This section documents intentional deviations between the original RFC design an
 ### Concrete (near-term)
 
 6. ~~**Batch GC CAS**~~: Done. `compare_and_set_batch_with_kind` batches all CAS operations under a single lock acquisition (PR #82).
-7. **Lock-free vLog writer**: Replace the `active_writer` Mutex with a lock-free append buffer, dedicated writer thread with request channel, or multiple active vLog files to improve write concurrency
-8. **Pre-created vLog rotation**: Prepare the next vLog file in the background so rotation doesn't block the writer with synchronous file creation
+7. ~~**Lock-free vLog writer**~~: N/A. The implementation uses per-flush `ValueLogBuilder` and per-GC `ValueLogWriter` — no shared `active_writer` mutex exists.
+8. ~~**Pre-created vLog rotation**~~: N/A. Same reason — per-flush/per-GC writers avoid the rotation-blocking concern entirely.
 9. **Remove VALUE_POINTER_TAG**: If the 1-byte tag overhead becomes a bottleneck, remove it and rely solely on KvKind for classification (encoded size drops from 17 to 16 bytes)
 10. ~~**Persist pending deletions**~~: Done. Instead of persisting the queue, `cleanup_orphan_vlog_files()` runs on startup and deletes any `.vlog` file not referenced by an active SST — simpler and handles all orphan scenarios.
 11. ~~**Reclaim after post-compaction GC**~~: Done. `post_compaction_gc` now calls `reclaim_pending_deletions()` after processing all input vLog files.
