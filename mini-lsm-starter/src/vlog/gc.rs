@@ -94,12 +94,12 @@ impl<'a> GarbageCollector<'a> {
 
         match current_kind {
             KvKind::ValuePointer => {
-                if let Some(ref val) = current_val {
-                    if let Some(current_ptr) = ValuePointer::try_decode(&val[1..]) {
-                        return Ok(current_ptr.file_id == ptr.file_id
-                            && current_ptr.offset == ptr.offset
-                            && current_ptr.size == ptr.size);
-                    }
+                if let Some(ref val) = current_val
+                    && let Some(current_ptr) = ValuePointer::try_decode(&val[1..])
+                {
+                    return Ok(current_ptr.file_id == ptr.file_id
+                        && current_ptr.offset == ptr.offset
+                        && current_ptr.size == ptr.size);
                 }
                 Ok(false)
             }

@@ -379,12 +379,11 @@ impl ValueLog {
                 continue;
             }
             let name = entry.file_name();
-            if let Some(name) = name.to_str() {
-                if let Some(stem) = name.strip_suffix(".vlog") {
-                    if let Ok(id) = stem.parse::<u32>() {
-                        max_id = Some(max_id.map_or(id, |m| m.max(id)));
-                    }
-                }
+            if let Some(name) = name.to_str()
+                && let Some(stem) = name.strip_suffix(".vlog")
+                && let Ok(id) = stem.parse::<u32>()
+            {
+                max_id = Some(max_id.map_or(id, |m| m.max(id)));
             }
         }
 
@@ -468,10 +467,10 @@ impl ValueLog {
     /// Remove a vLog file from disk and the reader cache.
     pub fn remove_file(&self, file_id: u32) -> Result<()> {
         let path = self.path_of_file(file_id);
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e.into());
-            }
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
         }
         self.readers.invalidate(&file_id);
         Ok(())
