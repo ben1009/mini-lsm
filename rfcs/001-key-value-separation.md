@@ -1767,8 +1767,6 @@ This section documents intentional deviations between the original RFC design an
 
 4. **Synchronous GC blocks compaction** — `post_compaction_gc` runs on the compaction thread. Under heavy GC load (many files above threshold), compaction latency increases.
 
-5. **No vLog file header** — `.vlog` files do not include the `VlogFileHeader` (magic + version) specified in the file format section. Files are identified by extension only.
-
 ## Future Work
 
 ### Exploratory (no near-term plan)
