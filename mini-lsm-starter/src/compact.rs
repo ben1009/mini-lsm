@@ -381,13 +381,14 @@ impl LsmStorageInner {
         let vlog = vlog.clone();
         let ids: Vec<u32> = input_vlog_ids.to_vec();
 
-        // Try to obtain a strong reference to self for the background thread.
-        // If the engine is shutting down (weak ref dead), skip GC silently.
-        let Some(inner) = self.weak_self.upgrade() else {
-            return;
-        };
+        let weak = self.weak_self.get().cloned();
 
         std::thread::spawn(move || {
+            // Upgrade inside the thread — if the engine is shutting down and
+            // the Arc has been dropped, skip GC silently.
+            let Some(inner) = weak.and_then(|w| w.upgrade()) else {
+                return;
+            };
             let gc = GarbageCollector::new(&vlog, &inner, vlog.options.gc_threshold_ratio);
             for &file_id in &ids {
                 match gc.gc_file(file_id) {

@@ -160,7 +160,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) vlog: Option<Arc<ValueLog>>,
     /// Weak reference to the owning `Arc<LsmStorageInner>`, set after construction.
     /// Allows background threads (e.g., async GC) to obtain a strong reference.
-    pub(crate) weak_self: std::sync::Weak<Self>,
+    pub(crate) weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
@@ -222,14 +222,8 @@ impl MiniLsm {
     pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Arc<Self>> {
         let inner = Arc::new(LsmStorageInner::open(path, options)?);
         // Set the weak self-reference so background threads (e.g., async GC) can
-        // obtain a strong reference to the engine. We write through a raw pointer
-        // because Arc::get_mut requires weak_count == 0, but we need the Weak to
-        // exist before the Arc is shared. This is safe: strong_count == 1 and no
-        // other thread has access to `inner` yet.
-        unsafe {
-            let ptr = Arc::as_ptr(&inner) as *mut LsmStorageInner;
-            (*ptr).weak_self = Arc::downgrade(&inner);
-        }
+        // obtain a strong reference to the engine.
+        let _ = inner.weak_self.set(Arc::downgrade(&inner));
         let (tx1, rx) = crossbeam_channel::unbounded();
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
         let (tx2, rx) = crossbeam_channel::unbounded();
@@ -556,7 +550,7 @@ impl LsmStorageInner {
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             vlog,
-            weak_self: std::sync::Weak::new(),
+            weak_self: std::sync::OnceLock::new(),
         };
         storage.sync_dir()?;
 
