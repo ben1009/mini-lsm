@@ -735,7 +735,11 @@ fn test_gc_with_concurrent_writes() {
     // Write values, flush, then concurrently overwrite keys while triggering GC.
     // Verify: overwritten keys retain new values, non-overwritten keys are readable.
     let dir = tempfile::tempdir().unwrap();
-    let options = options_with_vlog_and_compaction(256, 1 << 20);
+    let mut options = options_with_vlog_and_compaction(256, 1 << 20);
+    // Ensure GC actually triggers during the test
+    if let Some(ref mut vs) = options.value_separation {
+        vs.gc_threshold_ratio = 0.0;
+    }
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // Write large values that go to vLog
@@ -936,10 +940,7 @@ fn test_range_scan_deduplication() {
 
     let mut results = vec![];
     while scan.is_valid() {
-        results.push((
-            scan.key().to_vec(),
-            Bytes::copy_from_slice(scan.value()),
-        ));
+        results.push((scan.key().to_vec(), Bytes::copy_from_slice(scan.value())));
         scan.next().unwrap();
     }
 
