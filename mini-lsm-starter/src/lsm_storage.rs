@@ -909,13 +909,11 @@ impl LsmStorageInner {
             if vlog_enabled {
                 if let Some(raw) = state.memtable.get_raw(key) {
                     let (current_val, current_kind) = Self::parse_value_kind(&raw);
-                    still_matches =
-                        Self::values_match(&current_val, current_kind, old, *old_kind);
+                    still_matches = Self::values_match(&current_val, current_kind, old, *old_kind);
                 }
             } else if let Some(v) = state.memtable.get(key) {
                 let current_val = if v.is_empty() { None } else { Some(v) };
-                still_matches =
-                    Self::values_match(&current_val, KvKind::Inline, old, *old_kind);
+                still_matches = Self::values_match(&current_val, KvKind::Inline, old, *old_kind);
             }
 
             if still_matches {
