@@ -116,6 +116,7 @@ impl<'a> GarbageCollector<'a> {
         if analysis.live_entries.is_empty() {
             // All entries are dead — just schedule deletion
             self.vlog.schedule_deletion(analysis.file_id);
+            self.vlog.record_gc_result(0, 0);
             return Ok(Some(GcResult {
                 old_file_id: analysis.file_id,
                 new_file_id: u32::MAX, // sentinel: no new file was created
