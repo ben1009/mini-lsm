@@ -25,10 +25,6 @@ const HEADER_SIZE: usize = 24;
 /// Alignment boundary for vLog entries
 const ALIGNMENT: usize = 8;
 
-/// Magic tag byte that prefixes every encoded `ValuePointer`.
-/// Retained as a cheap corruption/desync detector alongside KvKind.
-const VALUE_POINTER_TAG: u8 = 0xFF;
-
 /// Per-entry value-kind stored with every key-value entry: in the memtable, WAL,
 /// and SST block metadata. This is the authoritative source of truth for
 /// distinguishing inline values from vLog pointers.
@@ -37,7 +33,7 @@ const VALUE_POINTER_TAG: u8 = 0xFF;
 pub enum KvKind {
     /// The value is stored inline in the SST block.
     Inline = 0,
-    /// The value is a 17-byte encoded `ValuePointer` that references the vLog.
+    /// The value is a 16-byte encoded `ValuePointer` that references the vLog.
     ValuePointer = 1,
 }
 
@@ -65,9 +61,8 @@ pub struct ValuePointer {
 
 impl ValuePointer {
     /// Encode to bytes for storage in LSM tree.
-    /// Layout (17 bytes): `[tag:1][file_id:4][offset:8][size:4]`
+    /// Layout (16 bytes): `[file_id:4][offset:8][size:4]`
     pub fn encode(&self, mut buf: impl BufMut) {
-        buf.put_u8(VALUE_POINTER_TAG);
         buf.put_u32_le(self.file_id);
         buf.put_u64_le(self.offset);
         buf.put_u32_le(self.size);
@@ -82,14 +77,6 @@ impl ValuePointer {
                 Self::encoded_size()
             ));
         }
-        let tag = buf.get_u8();
-        if tag != VALUE_POINTER_TAG {
-            return Err(anyhow!(
-                "ValuePointer tag mismatch: expected 0x{:02X}, got 0x{:02X}",
-                VALUE_POINTER_TAG,
-                tag
-            ));
-        }
         Ok(Self {
             file_id: buf.get_u32_le(),
             offset: buf.get_u64_le(),
@@ -97,13 +84,14 @@ impl ValuePointer {
         })
     }
 
-    /// Try to decode from bytes. Returns `None` if the buffer is too short or
-    /// does not start with the `VALUE_POINTER_TAG` byte.
+    /// Try to decode from bytes. Returns `None` if the buffer is too short.
+    /// Callers must check `KvKind` before calling — `KvKind` is the authoritative
+    /// classifier, not payload inspection.
     pub fn try_decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::encoded_size() || buf[0] != VALUE_POINTER_TAG {
+        if buf.len() < Self::encoded_size() {
             return None;
         }
-        let mut b = &buf[1..];
+        let mut b = buf;
         Some(Self {
             file_id: b.get_u32_le(),
             offset: b.get_u64_le(),
@@ -111,9 +99,9 @@ impl ValuePointer {
         })
     }
 
-    /// Total encoded size: 17 bytes (1-byte tag + 4 + 8 + 4)
+    /// Total encoded size: 16 bytes (4 + 8 + 4)
     pub const fn encoded_size() -> usize {
-        1 + 4 + 8 + 4
+        4 + 8 + 4
     }
 }
 
@@ -685,8 +673,7 @@ mod tests {
             let mut buf = Vec::new();
             ptr.encode(&mut buf);
             assert_eq!(buf.len(), ValuePointer::encoded_size());
-            assert_eq!(buf.len(), 17);
-            assert_eq!(buf[0], VALUE_POINTER_TAG);
+            assert_eq!(buf.len(), 16);
 
             let decoded = ValuePointer::decode(&buf).unwrap();
             assert_eq!(*ptr, decoded);
@@ -715,19 +702,10 @@ mod tests {
         // Valid data
         assert_eq!(ValuePointer::try_decode(&buf), Some(ptr));
 
-        // Short buffer (< 17 bytes)
+        // Short buffer (< 16 bytes)
         for len in 0..ValuePointer::encoded_size() {
             assert_eq!(ValuePointer::try_decode(&buf[..len]), None);
         }
-
-        // Correct length but wrong tag byte
-        let mut bad_tag = buf.clone();
-        bad_tag[0] = 0x00;
-        assert_eq!(ValuePointer::try_decode(&bad_tag), None);
-
-        let mut bad_tag2 = buf.clone();
-        bad_tag2[0] = 0xFE;
-        assert_eq!(ValuePointer::try_decode(&bad_tag2), None);
     }
 
     // ---------------------------------------------------------------
