@@ -621,15 +621,21 @@ impl ValueLog {
         let mut vlog_file_count: u32 = 0;
         for entry in std::fs::read_dir(&self.path)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            // GC may delete files concurrently — skip entries that vanish
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
                 continue;
             }
             let name = entry.file_name();
             if let Some(name) = name.to_str()
                 && name.ends_with(".vlog")
             {
-                vlog_file_count += 1;
-                vlog_total_bytes += entry.metadata()?.len();
+                if let Ok(meta) = entry.metadata() {
+                    vlog_file_count += 1;
+                    vlog_total_bytes += meta.len();
+                }
             }
         }
         Ok(ValueLogStats {
