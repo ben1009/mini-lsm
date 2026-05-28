@@ -420,95 +420,76 @@ pub struct SsTableBuilder {
 
 impl SsTableBuilder {
     /// Add a key-value pair to the builder.
-    /// `input_kind`: pass `Some(KvKind)` during compaction (from source SST metadata),
-    /// or `None` for new writes (memtable flush) — the builder decides automatically.
     ///
-    /// When `input_kind` is `None` (flush path), this method writes large values
-    /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
-    /// fsynced before the SST entry is written, so every pointer is durable.
-    /// Backward-compatible wrapper: defaults to `input_kind = None` (flush path).
+    /// If vLog separation is enabled and the value is large enough, the value is
+    /// written to the vLog and a `ValuePointer` (with a `KvKind::ValuePointer`
+    /// prefix byte) is stored in the SST. Otherwise the value is stored inline
+    /// (with a `KvKind::Inline` prefix byte). The vLog is fsynced before the SST
+    /// file is written, so every pointer is durable.
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
-        self.add_with_kind(key, value, None)
-    }
-
-    /// Add a key-value pair to the builder with an explicit KvKind.
-    /// `input_kind`: pass `Some(KvKind)` during compaction (from source SST metadata),
-    /// or `None` for new writes (memtable flush) — the builder decides automatically.
-    ///
-    /// When `input_kind` is `None` (flush path), this method writes large values
-    /// to the vLog and stores only the `ValuePointer` in the SST. The vLog is
-    /// fsynced before the SST file is written, so every pointer is durable.
-    pub fn add_with_kind(&mut self, key: KeySlice, value: &[u8], input_kind: Option<KvKind>) -> Result<()> {
         if self.first_key.is_empty() {
-            self.first_key.set_from_slice(key);
+            self.first_key = key.to_key_vec().into_inner();
         }
-
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
-        // Local buffer for encoded ValuePointer — declared here so its slice
-        // reference can be used in the `value_to_store` binding below without
-        // borrow checker conflicts with self.finish_block().
-        let mut local_buf = Vec::new();
-
-        // Determine value-to-store and KvKind.
-        //
-        // During compaction the caller passes `input_kind` from the source SST's
-        // block metadata, so classification is authoritative — no payload sniffing.
-        // During flush `input_kind` is None and we decide here: large values are
-        // written to the vLog (with fsync), and only the ValuePointer is stored
-        // in the SST.
-        let (value_to_store, kind) = if let Some(k) = input_kind {
-            // Compaction path: trust the caller's authoritative metadata.
-            if k == KvKind::ValuePointer {
-                let vptr = ValuePointer::decode(value)
-                    .expect("failed to decode ValuePointer during compaction — metadata is authoritative");
-                self.referenced_vlogs.insert(vptr.file_id);
-            }
-            (value, k)
-        } else if self.should_separate_value(key, value) {
-            let vptr = self.write_to_vlog(key, value)?;
-            // Encode into a local Vec — avoids borrow checker conflict with
-            // self.finish_block() below. The buffer is small (17 bytes) and
-            // only allocated on the separation path, so the cost is negligible.
-            local_buf.reserve(ValuePointer::encoded_size());
-            vptr.encode(&mut local_buf);
-            (local_buf.as_slice(), KvKind::ValuePointer)
+        if self.vlog_options.enabled
+            && value.len() >= self.vlog_options.min_value_size
+            && !value.is_empty()
+        {
+            // Flush path: large value → vLog, store pointer in SST.
+            let vlog = self.vlog_builder.as_mut().expect("vLog builder required");
+            let ptr = vlog.add(key.raw_ref(), value)?;
+            let mut buf = [0u8; 1 + ValuePointer::encoded_size()];
+            buf[0] = KvKind::ValuePointer as u8;
+            ptr.encode(&mut &mut buf[1..]);
+            self.add_inner(key, &buf)?;
         } else {
-            (value, KvKind::Inline)
-        };
-
-        // Each block entry now carries (key, value, KvKind) so that the
-        // reader can classify the value without guessing from the payload.
-        // add_with_kind returns true if the entry fit in the current block.
-        if self.builder.add_with_kind(key, value_to_store, kind) {
-            self.last_key.set_from_slice(key);
-            return Ok(());
+            // Store inline: [KvKind::Inline][value]
+            let total_len = 1 + value.len();
+            if total_len <= 256 {
+                let mut buf = [0u8; 256];
+                buf[0] = KvKind::Inline as u8;
+                buf[1..total_len].copy_from_slice(value);
+                self.add_inner(key, &buf[..total_len])?;
+            } else {
+                let mut buf = Vec::with_capacity(total_len);
+                buf.push(KvKind::Inline as u8);
+                buf.extend_from_slice(value);
+                self.add_inner(key, &buf)?;
+            }
         }
-
-        self.finish_block();
-        self.first_key.set_from_slice(key);
-        assert!(self.builder.add_with_kind(key, value_to_store, kind));
-        self.last_key.set_from_slice(key);
         Ok(())
     }
 
-    /// Write a key-value pair to the active vLog builder and return a pointer.
-    fn write_to_vlog(&mut self, key: KeySlice, value: &[u8]) -> Result<ValuePointer> {
-        let ptr = self.vlog_builder.as_mut().unwrap().add(key.raw_ref(), value)?;
-        self.referenced_vlogs.insert(ptr.file_id);
-        Ok(ptr)
+    /// Add a key-value pair with a raw (already kind-prefixed) value.
+    /// Used during compaction to preserve existing `ValuePointer` entries
+    /// without re-writing them to the vLog.
+    pub fn add_raw(&mut self, key: KeySlice, raw_value: &[u8]) -> Result<()> {
+        if raw_value.len() > 1
+            && raw_value[0] == KvKind::ValuePointer as u8
+            && let Some(ptr) = ValuePointer::try_decode(&raw_value[1..])
+            && !self.referenced_vlog_ids.contains(&ptr.file_id)
+        {
+            self.referenced_vlog_ids.push(ptr.file_id);
+        }
+        self.add_inner(key, raw_value)
     }
 
-    fn should_separate_value(&self, key: KeySlice, value: &[u8]) -> bool {
-        match &self.vlog_options {
-            Some(opts) if opts.enabled => {
-                // Keys stored in vLog must fit in the u16 key_len field
-                value.len() >= opts.min_value_size
-                    && value.len() <= opts.max_value_size
-                    && key.raw_ref().len() <= u16::MAX as usize
-            }
-            _ => false,
+    fn add_inner(&mut self, key: KeySlice, value: &[u8]) -> Result<()> {
+        if self.first_key.is_empty() {
+            self.first_key = key.to_key_vec().into_inner();
         }
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+
+        if self.builder.add(key, value) {
+            self.last_key = key.to_key_vec().into_inner();
+            return Ok(());
+        }
+        self.finish_block();
+        self.first_key = key.to_key_vec().into_inner();
+        assert!(self.builder.add(key, value));
+        self.last_key = key.to_key_vec().into_inner();
+        Ok(())
     }
 }
 ```
@@ -1171,20 +1152,9 @@ impl CompactionController {
         }
 
         // Clean up vLog references for input SSTs that are being replaced.
-        // DEFERRED: Do NOT unregister immediately here. Active snapshots or
-        // long-running iterators may still hold Arc<SsTable> references to
-        // these input SSTs. If we unregister now and GC runs, it could see
-        // get_ssts_referencing().is_empty() and delete the vLog file while
-        // those iterators still need it.
-        //
-        // Instead, defer unregistration to SsTable::drop (or a drop token/
-        // callback). This guarantees a vLog file is never physically deleted
-        // while any snapshot or iterator holds a reference to an SST that
-        // points to it.
-        //
-        // for sst_id in input_ssts {
-        //     vlog.unregister_sst_references(*sst_id);
-        // }
+        for sst_id in input_ssts {
+            vlog.unregister_sst_references(*sst_id);
+        }
 
         Ok(())
     }
@@ -1363,8 +1333,9 @@ This means:
   single write batch). This simplifies correctness but adds per-call lock
   overhead. A future optimization (item 6 in Future Work) can batch CAS calls
   under a single lock acquisition.
-- **WAL entry**: each successful CAS appends a `(key, encoded_ptr, KvKind::ValuePointer)`
-  entry to the WAL, ensuring post-CAS state survives crash recovery.
+- **WAL entry**: when a WAL is present, each successful CAS appends a
+  `(key, encoded_ptr, KvKind::ValuePointer)` entry to the WAL, ensuring
+  post-CAS state survives crash recovery.
 
 ## Testing Strategy
 
@@ -1472,6 +1443,15 @@ fn test_gc_100_percent_dead() {
 }
 ```
 
+> **Implementation Note:** Of the tests listed above, only `test_gc_100_percent_dead`
+> is implemented (`vlog_integration_tests.rs`). The remaining tests (`test_gc_with_concurrent_writes`,
+> `test_crash_recovery_after_partial_flush`, `test_orphan_vlog_cleanup_on_startup`,
+> `test_range_scan_deduplication`, `test_mixed_inline_pointer_after_enable`) are
+> proposed but not yet written. The test snippets use simplified APIs that differ
+> from the actual signatures (e.g., `MiniLsm::open` takes `impl AsRef<Path>`, not
+> `&TempDir`; `value_separation` is `Option<ValueSeparationOptions>`, not
+> `ValueSeparationOptions` directly).
+
 ## Compatibility and Migration
 
 ### Forward Compatibility
@@ -1493,6 +1473,12 @@ pub struct SsTableFooter {
     pub vlog_file_ids: Vec<u32>,
 }
 ```
+
+> **Implementation Note:** The `SsTableFooter`, `format_version` field, and version-mismatch
+> rejection logic described above are **not implemented**. The actual codebase does not embed
+> a footer struct or version field in SST files. SST-to-vLog references are tracked entirely
+> through the manifest (`FlushV2`/`CompactionV2` records) and the in-memory `sst_to_vlogs`
+> map. This section remains as a design proposal for future format evolution.
 
 ### Manifest Changes
 
@@ -1534,13 +1520,8 @@ pub enum ManifestRecord {
 Recovery walks the manifest as before; for every `Flush` / `FlushV2` /
 `Compaction` / `CompactionV2` record it calls `register_sst_references(sst_id,
 vlog_ids)` to populate **both** `sst_to_vlogs` and `vlog_to_ssts` indexes.
-Additionally, for compaction records, it extracts the input SST IDs from the
-`CompactionTask` and calls `unregister_sst_references` for each, preventing
-reference leaks that would block vLog garbage collection.
 Old `Flush(usize)` and `Compaction(usize, Vec<usize>)` records are treated as
-having an empty vLog set. SSTable footers still embed the vLog reference list
-as a redundant copy, used by `fsck`-style consistency checks and by older
-snapshots whose manifest record predates this format.
+having an empty vLog set.
 
 `NewVlogFile` records participate in ID allocation and crash recovery, but not
 data liveness. A vLog file is live only if it is referenced by an SST reference
@@ -1580,6 +1561,12 @@ without payload sniffing. Value separation for normal user writes still happens
   Values exceeding `max_value_size` are rejected at `put`/`write_batch` time with
   an error, preventing background flush failures. This validation is cheap (one
   length check) and adds no latency.
+
+  > **Implementation Note:** In the actual codebase, `max_value_size` validation is
+  > performed in `ValueLogBuilder::add` during flush (not at `put`/`write_batch` time).
+  > The `put` path writes the full value to the WAL and memtable without a length check.
+  > Oversized values are rejected at flush time, which means a background flush can fail
+  > if a value exceeds the limit.
 - **GC CAS path**: encoded `ValuePointer` + `KvKind::ValuePointer` → WAL → memtable
 - **Flush path**: scan memtable → for each entry with `value.len() >= min_value_size`:
   1. append value to vLog buffer (in-memory)
@@ -1623,7 +1610,7 @@ handles any files that were written but never referenced.
 | Operation | Latency Impact | Notes |
 |-----------|---------------|-------|
 | Small value (< threshold) | None | Stored inline, same as non-separated |
-| Large value | None | Full value goes to WAL + memtable, no vLog on write path |
+| Large value | None (same as non-separated baseline) | Full value goes to WAL + memtable, no vLog on write path |
 | Flush (background) | +1 fsync per flush (batch) | vLog fsync once before SST write; does not block put path |
 
 ### Read Path
@@ -1647,9 +1634,15 @@ handles any files that were written but never referenced.
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | vLog file corruption | Data loss | CRC32 checksums + validation |
-| GC overhead | Latency spikes | Background GC + rate limiting |
+| GC overhead | Latency spikes | Synchronous GC (rate limiting is future work) |
 | Space amplification | Temporary bloat | Configurable GC threshold |
-| Recovery complexity | Longer startup | vLog index + incremental recovery |
+| Recovery complexity | Longer startup | Manifest-based recovery (vLog index is future work) |
+
+> **Implementation Note:** Background GC with rate limiting and a `gc_pool` thread pool
+> are not implemented. GC runs synchronously in `trigger_gc()` and `post_compaction_gc()`.
+> The vLog index (`vlog_index/`) is also not implemented; recovery rebuilds SST-to-vLog
+> references from manifest records (`FlushV2`/`CompactionV2`). See the GC Rate Limiting
+> section for the planned design.
 
 ## Observability and Metrics
 
@@ -1670,6 +1663,11 @@ The following metrics should be exposed via `ValueLogStats` for monitoring:
 | `cas_success` / `cas_failure` | counters | GC CAS outcomes (useful for contention tuning) |
 
 ## GC Rate Limiting
+
+> **Implementation Note:** The rate limiting controls described below (I/O budget,
+> concurrency cap, back-pressure, `gc_pool` thread pool) are **not implemented**.
+> GC runs synchronously in the calling thread. This section describes the planned
+> design for production use.
 
 Background GC should not starve foreground I/O. The following controls bound GC
 resource usage:
@@ -1699,17 +1697,14 @@ Key-value separation is **opt-in** and backward-compatible:
    not break reads — the engine continues to resolve `ValuePointer` entries from
    existing SSTs. New writes go inline. GC continues to run on existing vLog
    files until they are fully reclaimed.
-3. **Format version**: the `SsTableFooter::format_version` field is bumped from
-   1 to 2 when vLog references are present. Readers that understand version 1
-   will reject version 2 SSTs with a clear error. Upgrading the binary is
-   required before enabling separation.
+3. **Format version**: (not implemented — see Format Versioning section).
+   SST-to-vLog references are tracked via the manifest, not SST footers.
 4. **Manifest compatibility**: `FlushV2` and `CompactionV2` are new enum variants
-   that old binaries **cannot** deserialize — serde will reject unknown variants
-   even with `#[serde(default)]` on the fields. This makes V2 manifest records
-   a **downgrade-incompatible** change. New readers handle both old and new
-   variants. Downgrading to an old binary after V2 records have been written
-   requires either (a) rewriting the manifest with only V1 variants, or (b)
-   using the rollback procedure below.
+   that old binaries are expected to fail to deserialize — serde will reject
+   unknown variants. New readers handle both old and new variants. Downgrading
+   to an old binary after V2 records have been written requires either (a)
+   rewriting the manifest with only V1 variants, or (b) using the rollback
+   procedure below. This has not been verified with an automated test.
 
 ### Rollback
 
@@ -1835,12 +1830,16 @@ data/
 ├── 00001.sst
 ├── 00002.sst
 ├── ...
-├── 00001.vlog      # NEW: Value log files
-├── 00002.vlog
-├── 00001.wal
-└── vlog_index/     # NEW: Optional vLog index
-    └── 00001.idx
+├── vlog/           # NEW: Value log directory
+│   ├── 00001.vlog
+│   └── 00002.vlog
+└── 00001.wal
 ```
+
+> **Implementation Note:** The `vlog_index/` directory and `.idx` files described in
+> earlier drafts are not implemented. SST-to-vLog references are tracked entirely
+> through the manifest (`FlushV2`/`CompactionV2` records) and the in-memory
+> `sst_to_vlogs` map. vLog files are stored in a `vlog/` subdirectory (not `.vlog`).
 
 ## Appendix B: Configuration Examples
 
