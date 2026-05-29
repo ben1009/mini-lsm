@@ -100,11 +100,7 @@ fn dir_size(path: &Path, extension: &str) -> u64 {
     };
     entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == extension)
-        })
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == extension))
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum()
@@ -149,59 +145,51 @@ fn bench_write_throughput(c: &mut Criterion) {
     for value_size in [1024, 4096, 16384, 65536] {
         let label = format!("{}kb", value_size / 1024);
 
-        group.bench_with_input(
-            BenchmarkId::new("inline", &label),
-            &value_size,
-            |b, &vs| {
-                b.iter_batched(
-                    || {
-                        let dir = tempfile::tempdir().unwrap();
-                        let options = make_options(false, 1024);
-                        let lsm = MiniLsm::open(dir.path(), options).unwrap();
-                        (dir, lsm, 0usize)
-                    },
-                    |(dir, lsm, mut i)| {
-                        let value = vec![0xABu8; vs];
-                        for _ in 0..1000 {
-                            let key = format!("key{:08}", i);
-                            lsm.put(key.as_bytes(), &value).unwrap();
-                            i += 1;
-                        }
-                        black_box(i);
-                        drop(lsm);
-                        drop(dir);
-                    },
-                    criterion::BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("inline", &label), &value_size, |b, &vs| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = make_options(false, 1024);
+                    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+                    (dir, lsm, 0usize)
+                },
+                |(dir, lsm, mut i)| {
+                    let value = vec![0xABu8; vs];
+                    for _ in 0..1000 {
+                        let key = format!("key{:08}", i);
+                        lsm.put(key.as_bytes(), &value).unwrap();
+                        i += 1;
+                    }
+                    black_box(i);
+                    drop(lsm);
+                    drop(dir);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("vlog", &label),
-            &value_size,
-            |b, &vs| {
-                b.iter_batched(
-                    || {
-                        let dir = tempfile::tempdir().unwrap();
-                        let options = make_options(true, 16);
-                        let lsm = MiniLsm::open(dir.path(), options).unwrap();
-                        (dir, lsm, 0usize)
-                    },
-                    |(dir, lsm, mut i)| {
-                        let value = vec![0xABu8; vs];
-                        for _ in 0..1000 {
-                            let key = format!("key{:08}", i);
-                            lsm.put(key.as_bytes(), &value).unwrap();
-                            i += 1;
-                        }
-                        black_box(i);
-                        drop(lsm);
-                        drop(dir);
-                    },
-                    criterion::BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("vlog", &label), &value_size, |b, &vs| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let options = make_options(true, 16);
+                    let lsm = MiniLsm::open(dir.path(), options).unwrap();
+                    (dir, lsm, 0usize)
+                },
+                |(dir, lsm, mut i)| {
+                    let value = vec![0xABu8; vs];
+                    for _ in 0..1000 {
+                        let key = format!("key{:08}", i);
+                        lsm.put(key.as_bytes(), &value).unwrap();
+                        i += 1;
+                    }
+                    black_box(i);
+                    drop(lsm);
+                    drop(dir);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
     }
 
     group.finish();
@@ -230,10 +218,7 @@ fn bench_compaction(c: &mut Criterion) {
                 |(dir, lsm)| {
                     lsm.force_full_compaction().unwrap();
                     let sst_bytes = dir_size(dir.path(), "sst");
-                    let vlog_bytes = lsm
-                        .vlog_stats()
-                        .map(|s| s.vlog_total_bytes)
-                        .unwrap_or(0);
+                    let vlog_bytes = lsm.vlog_stats().map(|s| s.vlog_total_bytes).unwrap_or(0);
                     eprintln!(
                         "[{label}] post-compaction SST={sst_bytes} vLog={vlog_bytes} total={}",
                         sst_bytes + vlog_bytes
@@ -327,7 +312,8 @@ fn measure_write_amplification(vlog_enabled: bool, min_value_size: usize) {
     let value_size = 16384;
     let key_size = 12; // "key" + 8 digits
 
-    let (dir, lsm) = setup_instance_with_data(vlog_enabled, min_value_size, num_entries, value_size, true);
+    let (dir, lsm) =
+        setup_instance_with_data(vlog_enabled, min_value_size, num_entries, value_size, true);
 
     // Measure SST size before compaction (data is in L0 SSTs).
     let sst_before = dir_size(dir.path(), "sst") as f64;
