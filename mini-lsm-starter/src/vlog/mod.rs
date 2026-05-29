@@ -120,6 +120,8 @@ pub struct ValueSeparationOptions {
     pub gc_threshold_ratio: f64,
     /// Maximum number of vLog files to keep open
     pub max_open_vlog_files: usize,
+    /// Maximum number of entries in the value cache. 0 disables caching.
+    pub max_value_cache_entries: u64,
 }
 
 impl Default for ValueSeparationOptions {
@@ -131,6 +133,7 @@ impl Default for ValueSeparationOptions {
             max_vlog_file_size: 64 << 20,
             gc_threshold_ratio: 0.5,
             max_open_vlog_files: 64,
+            max_value_cache_entries: 0,
         }
     }
 }
@@ -148,6 +151,10 @@ pub struct ValueLogStats {
     pub gc_bytes_rewritten: u64,
     /// Cumulative vLog files processed by GC since startup.
     pub gc_files_processed: u64,
+    /// Cumulative value cache hits since startup.
+    pub cache_hits: u64,
+    /// Cumulative value cache misses since startup.
+    pub cache_misses: u64,
 }
 
 /// Value log file header (first 16 bytes of each vLog file).
@@ -354,6 +361,9 @@ pub struct ValueLog {
     next_file_id: AtomicU32,
     /// Cache of open readers keyed by `file_id`.
     readers: Cache<u32, Arc<ValueLogReader>>,
+    /// Cache of vLog values keyed by `(file_id, offset)`.
+    /// Avoids repeated `pread` syscalls for hot keys.
+    value_cache: Cache<(u32, u64), Bytes>,
     /// Tracks which SSTs reference which vLog files.
     pub references: VlogReferences,
     /// Pending vLog files waiting for GC reclaim.
@@ -367,6 +377,10 @@ pub struct ValueLog {
     gc_bytes_rewritten: AtomicU64,
     /// Cumulative vLog files processed by GC since startup.
     gc_files_processed: AtomicU64,
+    /// Cumulative value cache hits since startup.
+    cache_hits: AtomicU64,
+    /// Cumulative value cache misses since startup.
+    cache_misses: AtomicU64,
 }
 
 impl ValueLog {
@@ -397,18 +411,22 @@ impl ValueLog {
         }
 
         let readers = Cache::new(options.max_open_vlog_files as u64);
+        let value_cache = Cache::new(options.max_value_cache_entries.max(1));
 
         Ok(Self {
             path,
             options,
             next_file_id: AtomicU32::new(max_id.map_or(0, |id| id + 1)),
             readers,
+            value_cache,
             references: VlogReferences::new(),
             pending_deletions: Mutex::new(Vec::new()),
             gc_locks: Mutex::new(HashSet::new()),
             gc_entries_rewritten: AtomicU64::new(0),
             gc_bytes_rewritten: AtomicU64::new(0),
             gc_files_processed: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         })
     }
 
@@ -434,18 +452,40 @@ impl ValueLog {
     }
 
     /// Read the value at `ptr`, verifying that the stored key matches
-    /// `expected_key`.
+    /// `expected_key`. Returns from the value cache on hit; on miss, reads
+    /// from disk and inserts into the cache.
     pub fn read(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
-        let reader = self.get_reader(ptr.file_id)?;
-        let entry = reader.read_entry(ptr.offset, ptr.size)?;
-        if entry.key != expected_key {
-            return Err(anyhow!(
-                "vlog key mismatch: expected {:?}, got {:?}",
-                expected_key,
-                entry.key
-            ));
+        if self.options.max_value_cache_entries > 0 {
+            let cache_key = (ptr.file_id, ptr.offset);
+            if let Some(cached) = self.value_cache.get(&cache_key) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached);
+            }
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            let reader = self.get_reader(ptr.file_id)?;
+            let entry = reader.read_entry(ptr.offset, ptr.size)?;
+            if entry.key != expected_key {
+                return Err(anyhow!(
+                    "vlog key mismatch: expected {:?}, got {:?}",
+                    expected_key,
+                    entry.key
+                ));
+            }
+            let value = Bytes::from(entry.value);
+            self.value_cache.insert(cache_key, value.clone());
+            Ok(value)
+        } else {
+            let reader = self.get_reader(ptr.file_id)?;
+            let entry = reader.read_entry(ptr.offset, ptr.size)?;
+            if entry.key != expected_key {
+                return Err(anyhow!(
+                    "vlog key mismatch: expected {:?}, got {:?}",
+                    expected_key,
+                    entry.key
+                ));
+            }
+            Ok(Bytes::from(entry.value))
         }
-        Ok(Bytes::from(entry.value))
     }
 
     /// Read a full vLog entry (key, value) at the given pointer.
@@ -485,6 +525,10 @@ impl ValueLog {
             return Err(e.into());
         }
         self.readers.invalidate(&file_id);
+        // Invalidate all cached values from this file.
+        let _ = self
+            .value_cache
+            .invalidate_entries_if(move |k, _| k.0 == file_id);
         Ok(())
     }
 
@@ -636,6 +680,8 @@ impl ValueLog {
             gc_entries_rewritten: self.gc_entries_rewritten.load(Ordering::Relaxed),
             gc_bytes_rewritten: self.gc_bytes_rewritten.load(Ordering::Relaxed),
             gc_files_processed: self.gc_files_processed.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
         })
     }
 }
@@ -1024,6 +1070,7 @@ mod tests {
             max_vlog_file_size: 1 << 20,
             gc_threshold_ratio: 0.5,
             max_open_vlog_files: 4,
+            max_value_cache_entries: 0,
         }
     }
 
