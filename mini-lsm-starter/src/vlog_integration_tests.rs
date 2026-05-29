@@ -34,8 +34,10 @@ fn options_with_vlog_and_compaction(
         block_size,
         target_sst_size,
         num_memtable_limit: 2,
+        // High trigger prevents background compaction from racing with manual
+        // force_full_compaction() calls in tests.
         compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
-            level0_file_num_compaction_trigger: 2,
+            level0_file_num_compaction_trigger: 100,
             max_levels: 3,
             base_level_size_mb: 1,
             level_size_multiplier: 2,
