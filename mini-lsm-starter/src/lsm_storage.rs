@@ -640,12 +640,7 @@ impl LsmStorageInner {
         // L1-lmax SSTs: binary search on sorted, non-overlapping sst_ids.
         // At most one SST per level can contain the key, so O(log N) per level.
         for (_, sst_ids) in state.levels.iter() {
-            let idx = sst_ids.partition_point(|id| {
-                state
-                    .sstables
-                    .get(id)
-                    .is_some_and(|s| s.first_key().raw_ref() <= key)
-            });
+            let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
 
             if idx == 0 {
                 continue;
@@ -830,12 +825,7 @@ impl LsmStorageInner {
         // L1-lmax SSTs: binary search on sorted, non-overlapping sst_ids.
         // At most one SST per level can contain the key, so O(log N) per level.
         for (_, sst_ids) in state.levels.iter() {
-            let idx = sst_ids.partition_point(|id| {
-                state
-                    .sstables
-                    .get(id)
-                    .is_some_and(|s| s.first_key().raw_ref() <= key)
-            });
+            let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
 
             if idx == 0 {
                 continue;
