@@ -78,7 +78,7 @@ fn make_options_with_compaction(vlog_enabled: bool, min_value_size: usize) -> Ls
 }
 
 fn flush_all(lsm: &MiniLsm) {
-    // With num_memtable_limit=2, at most 1-2 immutable memtables exist at a time.
+    // Loop runs at most 5 times; force_flush returns Ok(()) on empty list.
     for _ in 0..5 {
         if lsm.force_flush().is_err() {
             break;

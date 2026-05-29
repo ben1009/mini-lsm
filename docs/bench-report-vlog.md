@@ -54,7 +54,7 @@ write_throughput/inline/16kb    time: [1140.9 us 1159.9 us 1164.7 us]
 write_throughput/vlog/16kb      time: [1386.4 us 1404.1 us 1408.5 us]
 write_throughput/inline/64kb    time: [3523.1 us 3561.8 us 3716.4 us]
 write_throughput/vlog/64kb      time: [4551.0 us 4736.9 us 4783.4 us]
-```text
+```
 
 **Analysis**: The write-path `put()` itself is identical (both go to memtable).
 The overhead comes from flush-time vLog writes. At 64KB values, vLog mode is
@@ -69,13 +69,13 @@ Measures `force_full_compaction()` wall-clock time after loading 5000 entries
 ```text
 compaction/inline    time: [97.742 ms 98.0 ms 98.250 ms]
 compaction/vlog      time: [3.0005 ms 3.0305 ms 3.1507 ms]
-```text
+```
 
 Post-compaction disk layout:
 ```text
 [inline] SST=82,186,708 bytes  vLog=0         total=82MB
 [vlog]   SST=145,967 bytes     vLog=82,120,640  total=82MB
-```text
+```
 
 **Analysis**: This is the headline result. Compaction in vLog mode rewrites
 **0.1MB of SST data** (keys + 16-byte pointers) vs **78.4MB** (full values).
@@ -89,7 +89,7 @@ Measures `get()` for random keys after full compaction (clean LSM state).
 ```text
 read_point_get/inline    time: [1.4396 us 1.4596 us 1.4646 us]
 read_point_get/vlog      time: [2.8820 us 2.9629 us 2.9831 us]
-```text
+```
 
 **Analysis**: vLog point-gets require two I/O operations:
 1. Read the SST block to get the `ValuePointer` (~1.5us, same as inline)
@@ -107,7 +107,7 @@ Measures full scan (`scan(Unbounded, Unbounded)`) over all 5000 entries.
 ```text
 read_scan/inline    time: [19.113 ms 19.550 ms 19.659 ms]
 read_scan/vlog      time: [12.923 ms 13.000 ms 13.307 ms]
-```text
+```
 
 **Analysis**: vLog mode scans are **34% faster** because SSTs contain only
 keys + 16-byte pointers instead of full 16KB values. The SST blocks are much
@@ -129,7 +129,7 @@ Measured after single compaction of 5000 entries @ 16KB:
 
 [vlog]   sst_before=0.1MB   sst_after=0.1MB   vlog=78.3MB   live=78.2MB  ratio=1.00x
          compaction rewrites 0.1MB SST data
-```text
+```
 
 **Analysis**: The on-disk ratio is ~1.0x for both modes after a single
 compaction — the data has to live somewhere. The key metric is **compaction
