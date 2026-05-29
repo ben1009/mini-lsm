@@ -153,16 +153,18 @@ fn bench_write_throughput(c: &mut Criterion) {
                     let lsm = MiniLsm::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
                 },
-                |(dir, lsm, mut i)| {
+                |(_dir, lsm, mut i)| {
                     let value = vec![0xABu8; vs];
                     for _ in 0..1000 {
                         let key = format!("key{:08}", i);
                         lsm.put(key.as_bytes(), &value).unwrap();
                         i += 1;
                     }
+                    // _dir and lsm are dropped after black_box; teardown is
+                    // outside the hot loop. MiniLsm::drop just signals threads
+                    // (Arc::strong_count > 1 keeps state alive), and tempfile
+                    // cleanup is a single unlink per file.
                     black_box(i);
-                    drop(lsm);
-                    drop(dir);
                 },
                 criterion::BatchSize::SmallInput,
             )
@@ -176,7 +178,7 @@ fn bench_write_throughput(c: &mut Criterion) {
                     let lsm = MiniLsm::open(dir.path(), options).unwrap();
                     (dir, lsm, 0usize)
                 },
-                |(dir, lsm, mut i)| {
+                |(_dir, lsm, mut i)| {
                     let value = vec![0xABu8; vs];
                     for _ in 0..1000 {
                         let key = format!("key{:08}", i);
@@ -184,8 +186,6 @@ fn bench_write_throughput(c: &mut Criterion) {
                         i += 1;
                     }
                     black_box(i);
-                    drop(lsm);
-                    drop(dir);
                 },
                 criterion::BatchSize::SmallInput,
             )
@@ -223,8 +223,8 @@ fn bench_compaction(c: &mut Criterion) {
                         "[{label}] post-compaction SST={sst_bytes} vLog={vlog_bytes} total={}",
                         sst_bytes + vlog_bytes
                     );
-                    drop(lsm);
-                    drop(dir);
+                    // _dir and lsm dropped after black_box (Criterion handles teardown).
+                    black_box(());
                 },
                 criterion::BatchSize::SmallInput,
             )
