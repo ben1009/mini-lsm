@@ -164,7 +164,7 @@ once at flush time, not rewritten during compaction).
 | Bottleneck | Impact | Potential Fix |
 |------------|--------|---------------|
 | Double I/O for point-gets (SST + vLog) | 2x latency (uncached), 1.3x (cached) | Value cache (implemented); mmap for vLog files |
-| No vLog value caching | Repeated reads hit disk | LRU cache for hot vLog values |
+| vLog value caching (implemented) | Configurable via `max_value_cache_entries` | Default off; set to working set size for hot keys |
 | Scan reads vLog entries one-at-a-time | Sequential but serial | Batch prefetch next N entries |
 
 ### Compaction

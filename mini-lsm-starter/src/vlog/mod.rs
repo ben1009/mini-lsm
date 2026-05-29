@@ -362,8 +362,8 @@ pub struct ValueLog {
     /// Cache of open readers keyed by `file_id`.
     readers: Cache<u32, Arc<ValueLogReader>>,
     /// Cache of vLog values keyed by `(file_id, offset)`.
-    /// Avoids repeated `pread` syscalls for hot keys.
-    value_cache: Cache<(u32, u64), Bytes>,
+    /// Avoids repeated `pread` syscalls for hot keys. `None` when disabled.
+    value_cache: Option<Cache<(u32, u64), Bytes>>,
     /// Tracks which SSTs reference which vLog files.
     pub references: VlogReferences,
     /// Pending vLog files waiting for GC reclaim.
@@ -411,7 +411,11 @@ impl ValueLog {
         }
 
         let readers = Cache::new(options.max_open_vlog_files as u64);
-        let value_cache = Cache::new(options.max_value_cache_entries.max(1));
+        let value_cache = if options.max_value_cache_entries > 0 {
+            Some(Cache::new(options.max_value_cache_entries))
+        } else {
+            None
+        };
 
         Ok(Self {
             path,
@@ -453,8 +457,8 @@ impl ValueLog {
 
     /// Insert a value into the cache. Used by GC after rewriting entries.
     pub fn insert_cache(&self, ptr: ValuePointer, value: Bytes) {
-        if self.options.max_value_cache_entries > 0 {
-            self.value_cache.insert((ptr.file_id, ptr.offset), value);
+        if let Some(ref cache) = self.value_cache {
+            cache.insert((ptr.file_id, ptr.offset), value);
         }
     }
 
@@ -462,11 +466,10 @@ impl ValueLog {
     /// `expected_key`. Returns from the value cache on hit; on miss, reads
     /// from disk and inserts into the cache.
     pub fn read(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
-        let cache_enabled = self.options.max_value_cache_entries > 0;
         let cache_key = (ptr.file_id, ptr.offset);
 
-        if cache_enabled {
-            if let Some(cached) = self.value_cache.get(&cache_key) {
+        if let Some(ref cache) = self.value_cache {
+            if let Some(cached) = cache.get(&cache_key) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(cached);
             }
@@ -484,8 +487,8 @@ impl ValueLog {
         }
         let value = Bytes::from(entry.value);
 
-        if cache_enabled {
-            self.value_cache.insert(cache_key, value.clone());
+        if let Some(ref cache) = self.value_cache {
+            cache.insert(cache_key, value.clone());
         }
         Ok(value)
     }
@@ -528,9 +531,9 @@ impl ValueLog {
         }
         self.readers.invalidate(&file_id);
         // Invalidate all cached values from this file.
-        let _ = self
-            .value_cache
-            .invalidate_entries_if(move |k, _| k.0 == file_id);
+        if let Some(ref cache) = self.value_cache {
+            let _ = cache.invalidate_entries_if(move |k, _| k.0 == file_id);
+        }
         Ok(())
     }
 
