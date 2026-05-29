@@ -202,7 +202,7 @@ fn test_end_to_end_mixed_inline_and_pointer() {
 
     // Write small and large values
     storage.put(b"small", b"tiny").unwrap();
-    storage.put(b"large", &vec![b'y'; 128]).unwrap();
+    storage.put(b"large", &[b'y'; 128]).unwrap();
 
     storage
         .inner
@@ -228,7 +228,7 @@ fn test_scan_with_vlog_values() {
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     storage.put(b"a", b"aaa").unwrap(); // small
-    storage.put(b"b", &vec![b'b'; 64]).unwrap(); // large
+    storage.put(b"b", &[b'b'; 64]).unwrap(); // large
     storage.put(b"c", b"ccc").unwrap(); // small
 
     storage
@@ -261,9 +261,9 @@ fn test_compaction_with_mixed_inline_and_pointer() {
 
     // Write small (inline) and large (pointer) values
     storage.put(b"aaa", b"tiny_aaa").unwrap();
-    storage.put(b"bbb", &vec![b'b'; 128]).unwrap();
+    storage.put(b"bbb", &[b'b'; 128]).unwrap();
     storage.put(b"ccc", b"tiny_ccc").unwrap();
-    storage.put(b"ddd", &vec![b'd'; 128]).unwrap();
+    storage.put(b"ddd", &[b'd'; 128]).unwrap();
 
     // Flush to create SSTs
     storage
@@ -273,7 +273,7 @@ fn test_compaction_with_mixed_inline_and_pointer() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     storage.put(b"eee", b"tiny_eee").unwrap();
-    storage.put(b"fff", &vec![b'f'; 128]).unwrap();
+    storage.put(b"fff", &[b'f'; 128]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -318,9 +318,9 @@ fn test_recovery_with_vlog_records() {
     // Write data and flush
     {
         let storage = MiniLsm::open(dir.path(), options.clone()).unwrap();
-        storage.put(b"key1", &vec![b'a'; 64]).unwrap();
+        storage.put(b"key1", &[b'a'; 64]).unwrap();
         storage.put(b"key2", b"small").unwrap();
-        storage.put(b"key3", &vec![b'c'; 128]).unwrap();
+        storage.put(b"key3", &[b'c'; 128]).unwrap();
         storage
             .inner
             .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -384,8 +384,8 @@ fn test_multiple_flushes_different_vlog_files() {
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // First flush — large values go to vLog file 0
-    storage.put(b"a1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"a2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"a1", &[b'a'; 64]).unwrap();
+    storage.put(b"a2", &[b'b'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -393,8 +393,8 @@ fn test_multiple_flushes_different_vlog_files() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Second flush — large values go to vLog file 1
-    storage.put(b"b1", &vec![b'c'; 64]).unwrap();
-    storage.put(b"b2", &vec![b'd'; 64]).unwrap();
+    storage.put(b"b1", &[b'c'; 64]).unwrap();
+    storage.put(b"b2", &[b'd'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -402,7 +402,7 @@ fn test_multiple_flushes_different_vlog_files() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Third flush
-    storage.put(b"c1", &vec![b'e'; 64]).unwrap();
+    storage.put(b"c1", &[b'e'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -549,8 +549,8 @@ fn test_gc_preserves_live_values() {
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // Write large values
-    storage.put(b"keep", &vec![b'k'; 64]).unwrap();
-    storage.put(b"overwrite", &vec![b'o'; 64]).unwrap();
+    storage.put(b"keep", &[b'k'; 64]).unwrap();
+    storage.put(b"overwrite", &[b'o'; 64]).unwrap();
 
     storage
         .inner
@@ -559,7 +559,7 @@ fn test_gc_preserves_live_values() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Overwrite "overwrite" with a new value
-    storage.put(b"overwrite", &vec![b'n'; 64]).unwrap();
+    storage.put(b"overwrite", &[b'n'; 64]).unwrap();
 
     storage
         .inner
@@ -592,8 +592,8 @@ fn test_gc_below_threshold() {
     }
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
-    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
 
     storage
         .inner
@@ -602,7 +602,7 @@ fn test_gc_below_threshold() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Overwrite key1
-    storage.put(b"key1", &vec![b'c'; 64]).unwrap();
+    storage.put(b"key1", &[b'c'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -632,8 +632,8 @@ fn test_trigger_gc_api() {
     }
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
-    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
 
     storage
         .inner
@@ -664,8 +664,8 @@ fn test_gc_multiple_files() {
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // First flush — large values go to vLog file 0
-    storage.put(b"a1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"a2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"a1", &[b'a'; 64]).unwrap();
+    storage.put(b"a2", &[b'b'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -673,8 +673,8 @@ fn test_gc_multiple_files() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Second flush — large values go to vLog file 1
-    storage.put(b"b1", &vec![b'c'; 64]).unwrap();
-    storage.put(b"b2", &vec![b'd'; 64]).unwrap();
+    storage.put(b"b1", &[b'c'; 64]).unwrap();
+    storage.put(b"b2", &[b'd'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -682,10 +682,10 @@ fn test_gc_multiple_files() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Overwrite all keys
-    storage.put(b"a1", &vec![b'x'; 64]).unwrap();
-    storage.put(b"a2", &vec![b'x'; 64]).unwrap();
-    storage.put(b"b1", &vec![b'x'; 64]).unwrap();
-    storage.put(b"b2", &vec![b'x'; 64]).unwrap();
+    storage.put(b"a1", &[b'x'; 64]).unwrap();
+    storage.put(b"a2", &[b'x'; 64]).unwrap();
+    storage.put(b"b1", &[b'x'; 64]).unwrap();
+    storage.put(b"b2", &[b'x'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -714,8 +714,8 @@ fn test_gc_analyze_file() {
     let options = options_with_vlog_enabled(256, 1 << 20);
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
-    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
 
     storage
         .inner
@@ -817,8 +817,8 @@ fn test_crash_recovery_after_partial_flush() {
     // Write data with WAL enabled
     {
         let storage = MiniLsm::open(dir.path(), options.clone()).unwrap();
-        storage.put(b"key1", &vec![b'a'; 128]).unwrap();
-        storage.put(b"key2", &vec![b'b'; 128]).unwrap();
+        storage.put(b"key1", &[b'a'; 128]).unwrap();
+        storage.put(b"key2", &[b'b'; 128]).unwrap();
         storage.put(b"key3", b"small").unwrap(); // inline
 
         // Force flush to create SST + vLog entries
@@ -829,7 +829,7 @@ fn test_crash_recovery_after_partial_flush() {
         storage.inner.force_flush_next_imm_memtable().unwrap();
 
         // Write more data after flush (only in WAL + memtable)
-        storage.put(b"key4", &vec![b'd'; 128]).unwrap();
+        storage.put(b"key4", &[b'd'; 128]).unwrap();
         storage.put(b"key5", b"small_after").unwrap();
 
         // Simulate crash by dropping without clean close
@@ -876,7 +876,7 @@ fn test_orphan_vlog_cleanup_on_startup() {
     // Write data and flush to create real vLog files
     {
         let storage = MiniLsm::open(dir.path(), options.clone()).unwrap();
-        storage.put(b"key1", &vec![b'a'; 64]).unwrap();
+        storage.put(b"key1", &[b'a'; 64]).unwrap();
         storage
             .inner
             .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -908,7 +908,7 @@ fn test_orphan_vlog_cleanup_on_startup() {
         );
 
         // Engine should work normally — new writes should succeed
-        storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+        storage.put(b"key2", &[b'b'; 64]).unwrap();
         assert_eq!(
             storage.get(b"key2").unwrap(),
             Some(Bytes::from(vec![b'b'; 64]))
@@ -925,9 +925,9 @@ fn test_range_scan_deduplication() {
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // Write large values
-    storage.put(b"aaa", &vec![b'x'; 64]).unwrap();
-    storage.put(b"bbb", &vec![b'y'; 64]).unwrap();
-    storage.put(b"ccc", &vec![b'z'; 64]).unwrap();
+    storage.put(b"aaa", &[b'x'; 64]).unwrap();
+    storage.put(b"bbb", &[b'y'; 64]).unwrap();
+    storage.put(b"ccc", &[b'z'; 64]).unwrap();
 
     // First flush — values go to vLog
     storage
@@ -937,7 +937,7 @@ fn test_range_scan_deduplication() {
     storage.inner.force_flush_next_imm_memtable().unwrap();
 
     // Overwrite "bbb" with a new value
-    storage.put(b"bbb", &vec![b'w'; 64]).unwrap();
+    storage.put(b"bbb", &[b'w'; 64]).unwrap();
 
     // Second flush
     storage
@@ -984,8 +984,8 @@ fn test_mixed_inline_pointer_after_enable() {
     storage.put(b"inline2", b"tiny_b").unwrap();
 
     // Write large values (above min_value_size → vLog pointer)
-    storage.put(b"vlog1", &vec![b'x'; 64]).unwrap();
-    storage.put(b"vlog2", &vec![b'y'; 64]).unwrap();
+    storage.put(b"vlog1", &[b'x'; 64]).unwrap();
+    storage.put(b"vlog2", &[b'y'; 64]).unwrap();
 
     // Flush first batch
     storage
@@ -996,7 +996,7 @@ fn test_mixed_inline_pointer_after_enable() {
 
     // Write more mixed values
     storage.put(b"inline3", b"tiny_c").unwrap();
-    storage.put(b"vlog3", &vec![b'z'; 64]).unwrap();
+    storage.put(b"vlog3", &[b'z'; 64]).unwrap();
 
     // Flush second batch
     storage
@@ -1085,7 +1085,7 @@ fn test_gc_batch_cas() {
     // Overwrite half the keys
     for i in 0..5 {
         let key = format!("key_{:04}", i);
-        storage.put(key.as_bytes(), &vec![b'z'; 64]).unwrap();
+        storage.put(key.as_bytes(), &[b'z'; 64]).unwrap();
     }
     storage
         .inner
@@ -1132,8 +1132,8 @@ fn test_vlog_stats_api() {
     assert_eq!(stats.gc_files_processed, 0);
 
     // Write and flush to create vLog files
-    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -1151,8 +1151,8 @@ fn test_vlog_stats_api() {
     );
 
     // Overwrite keys to create stale entries, flush, then compact
-    storage.put(b"key1", &vec![b'c'; 64]).unwrap();
-    storage.put(b"key2", &vec![b'd'; 64]).unwrap();
+    storage.put(b"key1", &[b'c'; 64]).unwrap();
+    storage.put(b"key2", &[b'd'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -1203,8 +1203,8 @@ fn test_value_cache_hit_miss() {
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
     // Write and flush to create vLog entries
-    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
-    storage.put(b"key2", &vec![b'b'; 64]).unwrap();
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
+    storage.put(b"key2", &[b'b'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())
@@ -1266,7 +1266,7 @@ fn test_value_cache_disabled_by_default() {
     };
     let storage = MiniLsm::open(dir.path(), options).unwrap();
 
-    storage.put(b"key1", &vec![b'a'; 64]).unwrap();
+    storage.put(b"key1", &[b'a'; 64]).unwrap();
     storage
         .inner
         .force_freeze_memtable(&storage.inner.state_lock.lock())

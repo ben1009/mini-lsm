@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 
-use crate::lsm_storage::LsmStorageInner;
+use crate::lsm_storage::{CasEntry, LsmStorageInner};
 use crate::vlog::builder::ValueLogWriter;
 use crate::vlog::{KvKind, ValueLog, ValuePointer};
 
@@ -163,8 +163,7 @@ impl<'a> GarbageCollector<'a> {
             }
 
             // Phase 2: Batch CAS all keys under a single lock acquisition
-            let mut batch: Vec<(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)> =
-                Vec::with_capacity(rewrites.len());
+            let mut batch: Vec<CasEntry> = Vec::with_capacity(rewrites.len());
             for (key, _value, old_ptr, new_ptr) in &rewrites {
                 let mut old_buf = Vec::with_capacity(1 + ValuePointer::encoded_size());
                 old_buf.push(KvKind::ValuePointer as u8);
@@ -186,10 +185,8 @@ impl<'a> GarbageCollector<'a> {
 
             // Cache successfully rewritten entries so subsequent reads avoid disk.
             for (succeeded, (_key, value, _old_ptr, new_ptr)) in cas_results.iter().zip(&rewrites) {
-                if *succeeded {
-                    if let Some(val) = value {
-                        self.vlog.insert_cache(*new_ptr, val.clone());
-                    }
+                if *succeeded && let Some(val) = value {
+                    self.vlog.insert_cache(*new_ptr, val.clone());
                 }
             }
 

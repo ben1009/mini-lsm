@@ -31,6 +31,9 @@ use crate::vlog::{KvKind, ValueLog, ValuePointer, ValueSeparationOptions};
 // TODO: try this one https://github.com/cloudflare/pingora/tree/main/tinyufo with bech later
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
+/// A CAS entry: (key, old_value, old_kind, new_value, new_kind).
+pub type CasEntry = (Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind);
+
 /// Represents the state of the storage engine.
 #[derive(Clone)]
 pub struct LsmStorageState {
@@ -580,13 +583,13 @@ impl LsmStorageInner {
         let vlog_enabled = self.vlog.is_some();
 
         if vlog_enabled {
-            // Use get_raw to get kind-prefixed value, then resolve
+            // Use get_raw to get kind-prefixed value, then resolve (zero-copy for inline)
             if let Some(raw) = state.memtable.get_raw(key) {
-                return self.resolve_vlog_value(key, &raw);
+                return self.resolve_vlog_value_bytes(key, raw);
             }
             for m in state.imm_memtables.iter() {
                 if let Some(raw) = m.get_raw(key) {
-                    return self.resolve_vlog_value(key, &raw);
+                    return self.resolve_vlog_value_bytes(key, raw);
                 }
             }
         } else {
@@ -606,72 +609,64 @@ impl LsmStorageInner {
             }
         }
 
-        // L0 SSTs, from latest to earliest.
-        let mut sstables_l0 = vec![];
-        state.l0_sstables.iter().for_each(|id| {
+        // L0 SSTs, from latest to earliest. Single-pass: check range + bloom
+        // and create iterator immediately, avoiding intermediate Vec allocation.
+        let key_hash = farmhash::hash32(key);
+        for id in state.l0_sstables.iter() {
             if let Some(s) = state.sstables.get(id) {
                 if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    return;
+                    continue;
                 }
-                if let Some(b) = &s.bloom {
-                    let key_hash = farmhash::hash32(key);
-                    if !b.may_contain(key_hash) {
-                        return;
+                if let Some(b) = &s.bloom
+                    && !b.may_contain(key_hash)
+                {
+                    continue;
+                }
+                let mut s_it =
+                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
+                if let Some(ref vlog) = self.vlog {
+                    s_it.set_vlog(vlog.clone());
+                }
+                if s_it.is_valid() && s_it.key().raw_ref() == key {
+                    let val = s_it.value();
+                    if val.is_empty() {
+                        return Ok(None);
                     }
+                    return Ok(Some(Bytes::copy_from_slice(val)));
                 }
-
-                sstables_l0.push(s.clone());
-            }
-        });
-
-        for s in sstables_l0.iter() {
-            let mut s_it =
-                SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-            if let Some(ref vlog) = self.vlog {
-                s_it.set_vlog(vlog.clone());
-            }
-            if s_it.is_valid() && s_it.key().raw_ref() == key {
-                let val = s_it.value();
-                if val.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(Bytes::copy_from_slice(val)));
             }
         }
 
-        // L1-lmax SSTs, from latest to earliest.
+        // L1-lmax SSTs: binary search on sorted, non-overlapping sst_ids.
+        // At most one SST per level can contain the key, so O(log N) per level.
         for (_, sst_ids) in state.levels.iter() {
-            let mut sstables = vec![];
-            sst_ids.iter().for_each(|id| {
-                if let Some(s) = state.sstables.get(id) {
-                    if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                        return;
-                    }
-                    if let Some(b) = &s.bloom {
-                        let key_hash = farmhash::hash32(key);
-                        if !b.may_contain(key_hash) {
-                            return;
-                        }
-                    }
+            let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
 
-                    sstables.push(s.clone());
+            if idx == 0 {
+                continue;
+            }
+            let candidate_idx = idx - 1;
+            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx]) {
+                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
+                    continue;
                 }
-            });
-
-            let s_it = if let Some(ref vlog) = self.vlog {
-                SstConcatIterator::create_and_seek_to_key_with_vlog(
-                    sstables,
-                    KeySlice::from_slice(key),
-                    vlog.clone(),
-                )?
-            } else {
-                SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(key))?
-            };
-            if s_it.is_valid() && s_it.key().raw_ref() == key {
-                if s_it.value().is_empty() {
-                    return Ok(None);
+                if let Some(b) = &s.bloom
+                    && !b.may_contain(key_hash)
+                {
+                    continue;
                 }
-                return Ok(Some(Bytes::copy_from_slice(s_it.value())));
+                let mut s_it =
+                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
+                if let Some(ref vlog) = self.vlog {
+                    s_it.set_vlog(vlog.clone());
+                }
+                if s_it.is_valid() && s_it.key().raw_ref() == key {
+                    let val = s_it.value();
+                    if val.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Bytes::copy_from_slice(val)));
+                }
             }
         }
 
@@ -705,6 +700,37 @@ impl LsmStorageInner {
                     Ok(None)
                 } else {
                     Ok(Some(Bytes::copy_from_slice(&prefixed[1..])))
+                }
+            }
+        }
+    }
+
+    /// Resolve a kind-prefixed `Bytes` value from the memtable using zero-copy slicing.
+    /// For inline values, returns `prefixed.slice(1..)` (cheap refcount bump) instead of copying.
+    fn resolve_vlog_value_bytes(&self, key: &[u8], prefixed: Bytes) -> Result<Option<Bytes>> {
+        if prefixed.is_empty() {
+            return Ok(None);
+        }
+        match KvKind::from_u8(prefixed[0]) {
+            Some(KvKind::ValuePointer) => {
+                let ptr = ValuePointer::try_decode(&prefixed[1..]).ok_or_else(|| {
+                    anyhow!(
+                        "invalid ValuePointer in memtable: len={}, bytes={:?}",
+                        prefixed.len(),
+                        &prefixed[..prefixed.len().min(20)]
+                    )
+                })?;
+                let vlog = self.vlog.as_ref().unwrap();
+                let bytes = vlog.read(&ptr, key)?;
+                Ok(Some(bytes))
+            }
+            _ => {
+                // Inline value — strip the kind prefix with zero-copy slice
+                if prefixed.len() == 1 {
+                    // Tombstone
+                    Ok(None)
+                } else {
+                    Ok(Some(prefixed.slice(1..)))
                 }
             }
         }
@@ -771,65 +797,58 @@ impl LsmStorageInner {
             }
         }
 
-        // L0 SSTs
-        let mut sstables_l0 = vec![];
-        state.l0_sstables.iter().for_each(|id| {
+        // L0 SSTs, from latest to earliest. Single-pass: check range + bloom
+        // and create iterator immediately, avoiding intermediate Vec allocation.
+        let key_hash = farmhash::hash32(key);
+        for id in state.l0_sstables.iter() {
             if let Some(s) = state.sstables.get(id) {
                 if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                    return;
+                    continue;
                 }
-                if let Some(b) = &s.bloom {
-                    let key_hash = farmhash::hash32(key);
-                    if !b.may_contain(key_hash) {
-                        return;
-                    }
+                if let Some(b) = &s.bloom
+                    && !b.may_contain(key_hash)
+                {
+                    continue;
                 }
-                sstables_l0.push(s.clone());
-            }
-        });
-
-        for s in sstables_l0.iter() {
-            let mut s_it =
-                SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
-            if let Some(ref vlog) = self.vlog {
-                s_it.set_vlog(vlog.clone());
-            }
-            if s_it.is_valid() && s_it.key().raw_ref() == key {
-                let raw = s_it.raw_value();
-                return Ok(Self::parse_value_kind(raw));
+                let mut s_it =
+                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
+                if let Some(ref vlog) = self.vlog {
+                    s_it.set_vlog(vlog.clone());
+                }
+                if s_it.is_valid() && s_it.key().raw_ref() == key {
+                    let raw = s_it.raw_value();
+                    return Ok(Self::parse_value_kind(raw));
+                }
             }
         }
 
-        // L1-lmax SSTs
+        // L1-lmax SSTs: binary search on sorted, non-overlapping sst_ids.
+        // At most one SST per level can contain the key, so O(log N) per level.
         for (_, sst_ids) in state.levels.iter() {
-            let mut sstables = vec![];
-            sst_ids.iter().for_each(|id| {
-                if let Some(s) = state.sstables.get(id) {
-                    if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
-                        return;
-                    }
-                    if let Some(b) = &s.bloom {
-                        let key_hash = farmhash::hash32(key);
-                        if !b.may_contain(key_hash) {
-                            return;
-                        }
-                    }
-                    sstables.push(s.clone());
-                }
-            });
+            let idx = sst_ids.partition_point(|id| state.sstables[id].first_key().raw_ref() <= key);
 
-            let s_it = if let Some(ref vlog) = self.vlog {
-                SstConcatIterator::create_and_seek_to_key_with_vlog(
-                    sstables,
-                    KeySlice::from_slice(key),
-                    vlog.clone(),
-                )?
-            } else {
-                SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(key))?
-            };
-            if s_it.is_valid() && s_it.key().raw_ref() == key {
-                let raw = s_it.raw_value();
-                return Ok(Self::parse_value_kind(raw));
+            if idx == 0 {
+                continue;
+            }
+            let candidate_idx = idx - 1;
+            if let Some(s) = state.sstables.get(&sst_ids[candidate_idx]) {
+                if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
+                    continue;
+                }
+                if let Some(b) = &s.bloom
+                    && !b.may_contain(key_hash)
+                {
+                    continue;
+                }
+                let mut s_it =
+                    SsTableIterator::create_and_seek_to_key(s.clone(), KeySlice::from_slice(key))?;
+                if let Some(ref vlog) = self.vlog {
+                    s_it.set_vlog(vlog.clone());
+                }
+                if s_it.is_valid() && s_it.key().raw_ref() == key {
+                    let raw = s_it.raw_value();
+                    return Ok(Self::parse_value_kind(raw));
+                }
             }
         }
 
@@ -901,7 +920,7 @@ impl LsmStorageInner {
     /// duplicate keys (vLog entries are unique per key).
     pub(crate) fn compare_and_set_batch_with_kind(
         &self,
-        entries: &[(Vec<u8>, Vec<u8>, KvKind, Vec<u8>, KvKind)],
+        entries: &[CasEntry],
     ) -> Result<Vec<bool>> {
         let _lock = self.state_lock.lock();
 
