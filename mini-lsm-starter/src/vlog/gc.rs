@@ -134,7 +134,9 @@ impl<'a> GarbageCollector<'a> {
         let compact_res = (|| -> Result<GcResult> {
             let mut writer = ValueLogWriter::create(new_path.clone(), new_file_id)?;
 
-            let mut rewrites: Vec<(Vec<u8>, Bytes, ValuePointer, ValuePointer)> = Vec::new();
+            let cache_enabled = self.vlog.options.max_value_cache_entries > 0;
+            let mut rewrites: Vec<(Vec<u8>, Option<Bytes>, ValuePointer, ValuePointer)> =
+                Vec::new();
 
             for live_ref in &analysis.live_entries {
                 let (key, value) = self.vlog.read_entry(&live_ref.ptr)?;
@@ -144,7 +146,12 @@ impl<'a> GarbageCollector<'a> {
                     offset: writer.offset() - bytes_written as u64,
                     size: bytes_written as u32,
                 };
-                rewrites.push((key, Bytes::from(value), live_ref.ptr, new_ptr));
+                let cached_value = if cache_enabled {
+                    Some(Bytes::from(value))
+                } else {
+                    None
+                };
+                rewrites.push((key, cached_value, live_ref.ptr, new_ptr));
             }
 
             // Fsync the new vLog before binding pointers into the LSM tree
@@ -180,7 +187,9 @@ impl<'a> GarbageCollector<'a> {
             // Cache successfully rewritten entries so subsequent reads avoid disk.
             for (succeeded, (_key, value, _old_ptr, new_ptr)) in cas_results.iter().zip(&rewrites) {
                 if *succeeded {
-                    self.vlog.insert_cache(*new_ptr, value.clone());
+                    if let Some(val) = value {
+                        self.vlog.insert_cache(*new_ptr, val.clone());
+                    }
                 }
             }
 
