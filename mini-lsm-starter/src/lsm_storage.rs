@@ -1093,7 +1093,10 @@ impl LsmStorageInner {
         // so this is a snapshot, no need to hold the lock for the whole process
         let memtable_to_flush = {
             let guard = self.state.read();
-            guard.imm_memtables.last().unwrap().clone()
+            match guard.imm_memtables.last() {
+                Some(mt) => mt.clone(),
+                None => return Ok(()),
+            }
         };
 
         let sst_id = memtable_to_flush.id();
