@@ -451,41 +451,43 @@ impl ValueLog {
             .map_err(|e| anyhow!("failed to open vlog reader {}: {}", file_id, e))
     }
 
+    /// Insert a value into the cache. Used by GC after rewriting entries.
+    pub fn insert_cache(&self, ptr: ValuePointer, value: Bytes) {
+        if self.options.max_value_cache_entries > 0 {
+            self.value_cache.insert((ptr.file_id, ptr.offset), value);
+        }
+    }
+
     /// Read the value at `ptr`, verifying that the stored key matches
     /// `expected_key`. Returns from the value cache on hit; on miss, reads
     /// from disk and inserts into the cache.
     pub fn read(&self, ptr: &ValuePointer, expected_key: &[u8]) -> Result<Bytes> {
-        if self.options.max_value_cache_entries > 0 {
-            let cache_key = (ptr.file_id, ptr.offset);
+        let cache_enabled = self.options.max_value_cache_entries > 0;
+        let cache_key = (ptr.file_id, ptr.offset);
+
+        if cache_enabled {
             if let Some(cached) = self.value_cache.get(&cache_key) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(cached);
             }
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            let reader = self.get_reader(ptr.file_id)?;
-            let entry = reader.read_entry(ptr.offset, ptr.size)?;
-            if entry.key != expected_key {
-                return Err(anyhow!(
-                    "vlog key mismatch: expected {:?}, got {:?}",
-                    expected_key,
-                    entry.key
-                ));
-            }
-            let value = Bytes::from(entry.value);
-            self.value_cache.insert(cache_key, value.clone());
-            Ok(value)
-        } else {
-            let reader = self.get_reader(ptr.file_id)?;
-            let entry = reader.read_entry(ptr.offset, ptr.size)?;
-            if entry.key != expected_key {
-                return Err(anyhow!(
-                    "vlog key mismatch: expected {:?}, got {:?}",
-                    expected_key,
-                    entry.key
-                ));
-            }
-            Ok(Bytes::from(entry.value))
         }
+
+        let reader = self.get_reader(ptr.file_id)?;
+        let entry = reader.read_entry(ptr.offset, ptr.size)?;
+        if entry.key != expected_key {
+            return Err(anyhow!(
+                "vlog key mismatch: expected {:?}, got {:?}",
+                expected_key,
+                entry.key
+            ));
+        }
+        let value = Bytes::from(entry.value);
+
+        if cache_enabled {
+            self.value_cache.insert(cache_key, value.clone());
+        }
+        Ok(value)
     }
 
     /// Read a full vLog entry (key, value) at the given pointer.
