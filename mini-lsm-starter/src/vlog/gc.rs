@@ -134,7 +134,7 @@ impl<'a> GarbageCollector<'a> {
         let compact_res = (|| -> Result<GcResult> {
             let mut writer = ValueLogWriter::create(new_path.clone(), new_file_id)?;
 
-            let cache_enabled = self.vlog.options.max_value_cache_entries > 0;
+            let cache_enabled = self.vlog.value_cache.is_some();
             let mut rewrites: Vec<(Vec<u8>, Option<Bytes>, ValuePointer, ValuePointer)> =
                 Vec::new();
 

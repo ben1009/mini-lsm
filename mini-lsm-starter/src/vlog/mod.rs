@@ -120,8 +120,9 @@ pub struct ValueSeparationOptions {
     pub gc_threshold_ratio: f64,
     /// Maximum number of vLog files to keep open
     pub max_open_vlog_files: usize,
-    /// Maximum number of entries in the value cache. 0 disables caching.
-    pub max_value_cache_entries: u64,
+    /// Maximum byte capacity for the value cache. 0 disables caching.
+    /// Each cached entry's weight is its value byte length.
+    pub value_cache_capacity_bytes: u64,
 }
 
 impl Default for ValueSeparationOptions {
@@ -133,7 +134,7 @@ impl Default for ValueSeparationOptions {
             max_vlog_file_size: 64 << 20,
             gc_threshold_ratio: 0.5,
             max_open_vlog_files: 64,
-            max_value_cache_entries: 0,
+            value_cache_capacity_bytes: 0,
         }
     }
 }
@@ -411,8 +412,13 @@ impl ValueLog {
         }
 
         let readers = Cache::new(options.max_open_vlog_files as u64);
-        let value_cache = if options.max_value_cache_entries > 0 {
-            Some(Cache::new(options.max_value_cache_entries))
+        let value_cache = if options.value_cache_capacity_bytes > 0 {
+            Some(
+                Cache::builder()
+                    .max_capacity(options.value_cache_capacity_bytes)
+                    .weigher(|_k: &(u32, u64), v: &Bytes| v.len() as u32)
+                    .build(),
+            )
         } else {
             None
         };
@@ -1075,7 +1081,7 @@ mod tests {
             max_vlog_file_size: 1 << 20,
             gc_threshold_ratio: 0.5,
             max_open_vlog_files: 4,
-            max_value_cache_entries: 0,
+            value_cache_capacity_bytes: 0,
         }
     }
 

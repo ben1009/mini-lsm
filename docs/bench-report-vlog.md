@@ -98,13 +98,13 @@ read_point_get/vlog_cached  time: [2.7395 us 2.7572 us 2.8277 us]  (99.2% hit ra
 1. Read the SST block to get the `ValuePointer` (~2us, same as inline)
 2. Read the vLog file at the pointer offset (~2us additional)
 
-With the value cache (10K entries, `max_value_cache_entries`), repeated reads
+With the value cache (256MB, `value_cache_capacity_bytes`), repeated reads
 to the same keys are served from memory — 99.2% hit rate reduces latency from
 4.2us to 2.8us (34% improvement). The remaining 29% overhead vs inline is the
 SST lookup + cache hash probe.
 
 Mitigations:
-- **Value cache** (new): LRU cache keyed by `(file_id, offset)`, configurable via `max_value_cache_entries`
+- **Value cache** (new): LRU cache keyed by `(file_id, offset)`, configurable via `value_cache_capacity_bytes`
 - vLog reader cache (moka) avoids re-opening files
 - Sequential vLog layout benefits from OS readahead
 
@@ -164,7 +164,7 @@ once at flush time, not rewritten during compaction).
 | Bottleneck | Impact | Potential Fix |
 |------------|--------|---------------|
 | Double I/O for point-gets (SST + vLog) | 2x latency (uncached), 1.3x (cached) | Value cache (implemented); mmap for vLog files |
-| vLog value caching (implemented) | Configurable via `max_value_cache_entries` | Default off; set to working set size for hot keys |
+| vLog value caching (implemented) | Configurable via `value_cache_capacity_bytes` | Default off; set to memory budget for hot keys |
 | Scan reads vLog entries one-at-a-time | Sequential but serial | Batch prefetch next N entries |
 
 ### Compaction

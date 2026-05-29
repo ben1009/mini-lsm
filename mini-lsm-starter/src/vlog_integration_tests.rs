@@ -1196,7 +1196,7 @@ fn test_value_cache_hit_miss() {
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
             min_value_size: 16,
-            max_value_cache_entries: 1000,
+            value_cache_capacity_bytes: 1024 * 1024, // 1MB
             ..Default::default()
         }),
     };

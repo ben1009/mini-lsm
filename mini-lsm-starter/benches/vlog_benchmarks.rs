@@ -107,7 +107,7 @@ fn dir_size(path: &Path, extension: &str) -> u64 {
         .sum()
 }
 
-fn make_options_with_cache(min_value_size: usize, cache_entries: u64) -> LsmStorageOptions {
+fn make_options_with_cache(min_value_size: usize, cache_bytes: u64) -> LsmStorageOptions {
     LsmStorageOptions {
         block_size: 4096,
         target_sst_size: 2 << 20,
@@ -123,7 +123,7 @@ fn make_options_with_cache(min_value_size: usize, cache_entries: u64) -> LsmStor
         value_separation: Some(ValueSeparationOptions {
             enabled: true,
             min_value_size,
-            max_value_cache_entries: cache_entries,
+            value_cache_capacity_bytes: cache_bytes,
             ..Default::default()
         }),
     }
@@ -290,7 +290,7 @@ fn bench_read_point_get(c: &mut Criterion) {
     // vlog with value cache (10K entries)
     {
         let dir = tempfile::tempdir().unwrap();
-        let options = make_options_with_cache(16, 10_000);
+        let options = make_options_with_cache(16, 256 << 20); // 256MB cache
         let lsm = MiniLsm::open(dir.path(), options).unwrap();
         load_data(&lsm, num_entries, value_size);
         lsm.force_full_compaction().unwrap();
