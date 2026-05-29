@@ -101,7 +101,7 @@ fn dir_size(path: &Path, extension: &str) -> u64 {
     };
     entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == extension))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == extension))
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum()

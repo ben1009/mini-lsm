@@ -678,11 +678,10 @@ impl ValueLog {
             if let Some(name_str) = name.to_str()
                 && let Some(stem) = name_str.strip_suffix(".vlog")
                 && stem.parse::<u32>().is_ok()
+                && let Ok(meta) = entry.metadata()
             {
-                if let Ok(meta) = entry.metadata() {
-                    vlog_file_count += 1;
-                    vlog_total_bytes += meta.len();
-                }
+                vlog_file_count += 1;
+                vlog_total_bytes += meta.len();
             }
         }
         Ok(ValueLogStats {

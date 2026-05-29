@@ -162,10 +162,11 @@ impl MemTable {
         }
         for entry in self.map.iter() {
             let val = entry.value();
-            if val.len() > 1 && val[0] == KvKind::ValuePointer as u8 {
-                if let Some(ptr) = ValuePointer::try_decode(&val[1..]) {
-                    ids.insert(ptr.file_id);
-                }
+            if val.len() > 1
+                && val[0] == KvKind::ValuePointer as u8
+                && let Some(ptr) = ValuePointer::try_decode(&val[1..])
+            {
+                ids.insert(ptr.file_id);
             }
         }
         ids
