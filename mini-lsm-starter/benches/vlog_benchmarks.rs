@@ -161,11 +161,8 @@ fn bench_write_throughput(c: &mut Criterion) {
                         lsm.put(key.as_bytes(), &value).unwrap();
                         i += 1;
                     }
-                    // _dir and lsm are dropped after black_box; teardown is
-                    // outside the hot loop. MiniLsm::drop just signals threads
-                    // (Arc::strong_count > 1 keeps state alive), and tempfile
-                    // cleanup is a single unlink per file.
                     black_box(i);
+                    lsm.close().unwrap();
                 },
                 criterion::BatchSize::SmallInput,
             )
@@ -187,6 +184,7 @@ fn bench_write_throughput(c: &mut Criterion) {
                         i += 1;
                     }
                     black_box(i);
+                    lsm.close().unwrap();
                 },
                 criterion::BatchSize::SmallInput,
             )
@@ -224,8 +222,8 @@ fn bench_compaction(c: &mut Criterion) {
                         "[{label}] post-compaction SST={sst_bytes} vLog={vlog_bytes} total={}",
                         sst_bytes + vlog_bytes
                     );
-                    // _dir and lsm dropped after black_box (Criterion handles teardown).
                     black_box(());
+                    lsm.close().unwrap();
                 },
                 criterion::BatchSize::SmallInput,
             )
