@@ -25,14 +25,14 @@ Run: `cargo bench --package mini-lsm-starter --bench vlog_benchmarks`
 
 | Metric | Inline | vLog | Delta | Notes |
 |--------|--------|------|-------|-------|
-| Compaction time | 101ms | 3.4ms | **30x faster** | 5000 entries @ 16KB |
+| Compaction time | 98ms | 3.0ms | **33x faster** | 5000 entries @ 16KB |
 | Compaction SST rewrite | 78.4MB | 0.1MB | **780x less** | Keys+ptrs vs full values |
-| Full scan | 20.9ms | 16.2ms | **22% faster** | Smaller SSTs = less I/O |
-| Point-get | 1.5us | 3.4us | **2.3x slower** | Extra vLog seek |
-| Write throughput (1KB) | 979us | 1064us | ~9% slower | Per 1000 entries |
-| Write throughput (4KB) | 1072us | 1216us | ~13% slower | |
-| Write throughput (16KB) | 1151us | 1528us | ~33% slower | |
-| Write throughput (64KB) | 4751us | 5708us | ~20% slower | |
+| Full scan | 19.6ms | 13.0ms | **34% faster** | Smaller SSTs = less I/O |
+| Point-get | 1.5us | 3.0us | **2x slower** | Extra vLog seek |
+| Write throughput (1KB) | 950us | 1000us | ~5% slower | Per 1000 entries |
+| Write throughput (4KB) | 1000us | 1183us | ~18% slower | |
+| Write throughput (16KB) | 1160us | 1404us | ~21% slower | |
+| Write throughput (64KB) | 3562us | 4737us | ~33% slower | |
 | On-disk ratio (post-compact) | 1.00x | 1.00x | Same | Single round |
 
 ---
@@ -46,20 +46,20 @@ Measures wall-clock time for 1000 `put()` calls. vLog mode adds overhead because
 `put()` path itself, but the memtable fills faster triggering more flushes).
 
 ```
-write_throughput/inline/1kb     time: [967.05 us 979.45 us 982.56 us]
-write_throughput/vlog/1kb       time: [1025.7 us 1064.1 us 1073.7 us]
-write_throughput/inline/4kb     time: [1049.0 us 1072.1 us 1077.9 us]
-write_throughput/vlog/4kb       time: [1210.8 us 1216.1 us 1237.4 us]
-write_throughput/inline/16kb    time: [1148.8 us 1151.4 us 1161.5 us]
-write_throughput/vlog/16kb      time: [1511.8 us 1527.6 us 1590.8 us]
-write_throughput/inline/64kb    time: [4651.1 us 4751.0 us 4776.0 us]
-write_throughput/vlog/64kb      time: [5631.5 us 5707.7 us 5726.7 us]
+write_throughput/inline/1kb     time: [933.82 us 949.64 us 953.59 us]
+write_throughput/vlog/1kb       time: [999.13 us 999.82 us 1002.6 us]
+write_throughput/inline/4kb     time: [972.96 us 1000.0 us 1006.8 us]
+write_throughput/vlog/4kb       time: [1140.6 us 1183.1 us 1193.8 us]
+write_throughput/inline/16kb    time: [1140.9 us 1159.9 us 1164.7 us]
+write_throughput/vlog/16kb      time: [1386.4 us 1404.1 us 1408.5 us]
+write_throughput/inline/64kb    time: [3523.1 us 3561.8 us 3716.4 us]
+write_throughput/vlog/64kb      time: [4551.0 us 4736.9 us 4783.4 us]
 ```
 
 **Analysis**: The write-path `put()` itself is identical (both go to memtable).
 The overhead comes from flush-time vLog writes. At 64KB values, vLog mode is
-~20% slower per 1000 entries. This is amortized — the per-entry overhead is
-~1us, which is negligible compared to the 64KB value write.
+~33% slower per 1000 entries. This is amortized — the per-entry overhead is
+~1.2us, which is negligible compared to the 64KB value write.
 
 ### 2. Compaction Time
 
@@ -67,8 +67,8 @@ Measures `force_full_compaction()` wall-clock time after loading 5000 entries
 (16KB each, ~78MB live data) into L0 SSTs.
 
 ```
-compaction/inline    time: [97.742 ms 101.16 ms 102.01 ms]
-compaction/vlog      time: [3.3102 ms 3.3789 ms 3.3960 ms]
+compaction/inline    time: [97.742 ms 98.0 ms 98.250 ms]
+compaction/vlog      time: [3.0005 ms 3.0305 ms 3.1507 ms]
 ```
 
 Post-compaction disk layout:
@@ -87,13 +87,13 @@ GC'd separately. This is the core write-amplification reduction.
 Measures `get()` for random keys after full compaction (clean LSM state).
 
 ```
-read_point_get/inline    time: [1.4810 us 1.4973 us 1.5014 us]
-read_point_get/vlog      time: [3.2952 us 3.3843 us 3.4066 us]
+read_point_get/inline    time: [1.4396 us 1.4596 us 1.4646 us]
+read_point_get/vlog      time: [2.8820 us 2.9629 us 2.9831 us]
 ```
 
 **Analysis**: vLog point-gets require two I/O operations:
 1. Read the SST block to get the `ValuePointer` (~1.5us, same as inline)
-2. Read the vLog file at the pointer offset (~1.9us additional)
+2. Read the vLog file at the pointer offset (~1.5us additional)
 
 The extra seek is the cost of separation. Mitigations:
 - vLog reader cache (moka) avoids re-opening files
@@ -105,11 +105,11 @@ The extra seek is the cost of separation. Mitigations:
 Measures full scan (`scan(Unbounded, Unbounded)`) over all 5000 entries.
 
 ```
-read_scan/inline    time: [20.837 ms 20.850 ms 20.853 ms]
-read_scan/vlog      time: [16.001 ms 16.180 ms 16.898 ms]
+read_scan/inline    time: [19.113 ms 19.550 ms 19.659 ms]
+read_scan/vlog      time: [12.923 ms 13.000 ms 13.307 ms]
 ```
 
-**Analysis**: vLog mode scans are **22% faster** because SSTs contain only
+**Analysis**: vLog mode scans are **34% faster** because SSTs contain only
 keys + 16-byte pointers instead of full 16KB values. The SST blocks are much
 smaller (keys are ~12 bytes each, so ~28 bytes per entry vs ~16KB), meaning:
 - Fewer SST blocks to read from disk
@@ -155,7 +155,7 @@ once at flush time, not rewritten during compaction).
 
 | Bottleneck | Impact | Potential Fix |
 |------------|--------|---------------|
-| Double I/O for point-gets (SST + vLog) | 2.3x latency | Prefetch vLog entries on SST read; value cache |
+| Double I/O for point-gets (SST + vLog) | 2x latency | Prefetch vLog entries on SST read; value cache |
 | No vLog value caching | Repeated reads hit disk | LRU cache for hot vLog values |
 | Scan reads vLog entries one-at-a-time | Sequential but serial | Batch prefetch next N entries |
 
@@ -183,9 +183,9 @@ once at flush time, not rewritten during compaction).
 | RFC Claim | Actual | Match? |
 |-----------|--------|--------|
 | ~10x write amplification reduction | 780x SST rewrite reduction (16KB values) | Exceeds (RFC used 100B keys, 10KB values) |
-| +1 seek for point-gets | +1.9us (~2.3x total) | Yes |
-| Improved range scans | 22% faster | Yes |
-| No write-path latency impact | ~20% slower at 64KB values | Partial — flush-time overhead, not put-path |
+| +1 seek for point-gets | +1.5us (~2x total) | Yes |
+| Improved range scans | 34% faster | Yes |
+| No write-path latency impact | ~33% slower at 64KB values | Partial — flush-time overhead, not put-path |
 | Compaction I/O ~10x improvement | 780x at 16KB values | Exceeds (value-size dependent) |
 
 The RFC's 10x estimate used 10KB values with 100-byte keys. With 16KB values
