@@ -611,13 +611,14 @@ impl LsmStorageInner {
 
         // L0 SSTs, from latest to earliest. Single-pass: check range + bloom
         // and create iterator immediately, avoiding intermediate Vec allocation.
+        let key_hash = farmhash::hash32(key);
         for id in state.l0_sstables.iter() {
             if let Some(s) = state.sstables.get(id) {
                 if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
                     continue;
                 }
                 if let Some(b) = &s.bloom
-                    && !b.may_contain(farmhash::hash32(key))
+                    && !b.may_contain(key_hash)
                 {
                     continue;
                 }
@@ -655,7 +656,7 @@ impl LsmStorageInner {
                     continue;
                 }
                 if let Some(b) = &s.bloom
-                    && !b.may_contain(farmhash::hash32(key))
+                    && !b.may_contain(key_hash)
                 {
                     continue;
                 }
@@ -803,13 +804,14 @@ impl LsmStorageInner {
 
         // L0 SSTs, from latest to earliest. Single-pass: check range + bloom
         // and create iterator immediately, avoiding intermediate Vec allocation.
+        let key_hash = farmhash::hash32(key);
         for id in state.l0_sstables.iter() {
             if let Some(s) = state.sstables.get(id) {
                 if key < s.first_key().raw_ref() || key > s.last_key().raw_ref() {
                     continue;
                 }
                 if let Some(b) = &s.bloom
-                    && !b.may_contain(farmhash::hash32(key))
+                    && !b.may_contain(key_hash)
                 {
                     continue;
                 }
@@ -844,7 +846,7 @@ impl LsmStorageInner {
                     continue;
                 }
                 if let Some(b) = &s.bloom
-                    && !b.may_contain(farmhash::hash32(key))
+                    && !b.may_contain(key_hash)
                 {
                     continue;
                 }
