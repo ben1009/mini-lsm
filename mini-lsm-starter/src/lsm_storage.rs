@@ -643,7 +643,7 @@ impl LsmStorageInner {
                 state
                     .sstables
                     .get(id)
-                    .is_none_or(|s| s.first_key().as_key_slice() <= KeySlice::from_slice(key))
+                    .is_some_and(|s| s.first_key().raw_ref() <= key)
             });
 
             if idx == 0 {
@@ -832,7 +832,7 @@ impl LsmStorageInner {
                 state
                     .sstables
                     .get(id)
-                    .is_none_or(|s| s.first_key().as_key_slice() <= KeySlice::from_slice(key))
+                    .is_some_and(|s| s.first_key().raw_ref() <= key)
             });
 
             if idx == 0 {
