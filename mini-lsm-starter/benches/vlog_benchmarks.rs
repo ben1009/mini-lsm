@@ -107,6 +107,28 @@ fn dir_size(path: &Path, extension: &str) -> u64 {
         .sum()
 }
 
+fn make_options_with_cache(min_value_size: usize, cache_entries: u64) -> LsmStorageOptions {
+    LsmStorageOptions {
+        block_size: 4096,
+        target_sst_size: 2 << 20,
+        num_memtable_limit: 2,
+        compaction_options: CompactionOptions::Leveled(LeveledCompactionOptions {
+            level0_file_num_compaction_trigger: 1000,
+            max_levels: 3,
+            base_level_size_mb: 1,
+            level_size_multiplier: 2,
+        }),
+        enable_wal: false,
+        serializable: false,
+        value_separation: Some(ValueSeparationOptions {
+            enabled: true,
+            min_value_size,
+            max_value_cache_entries: cache_entries,
+            ..Default::default()
+        }),
+    }
+}
+
 fn setup_instance(
     vlog_enabled: bool,
     min_value_size: usize,
@@ -260,6 +282,43 @@ fn bench_read_point_get(c: &mut Criterion) {
                 i += 1;
             })
         });
+
+        lsm.close().unwrap();
+        drop(dir);
+    }
+
+    // vlog with value cache (10K entries)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let options = make_options_with_cache(16, 10_000);
+        let lsm = MiniLsm::open(dir.path(), options).unwrap();
+        load_data(&lsm, num_entries, value_size);
+        lsm.force_full_compaction().unwrap();
+
+        let keys: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("key{:08}", i).into_bytes())
+            .collect();
+
+        group.bench_function("vlog_cached", |b| {
+            let mut i = 0usize;
+            b.iter(|| {
+                let result = lsm.get(&keys[i % keys.len()]).unwrap();
+                black_box(result);
+                i += 1;
+            })
+        });
+
+        let stats = lsm.vlog_stats().unwrap();
+        eprintln!(
+            "[vlog_cached] cache_hits={} cache_misses={} hit_rate={:.1}%",
+            stats.cache_hits,
+            stats.cache_misses,
+            if stats.cache_hits + stats.cache_misses > 0 {
+                stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses) as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
 
         lsm.close().unwrap();
         drop(dir);

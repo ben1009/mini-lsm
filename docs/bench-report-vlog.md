@@ -23,17 +23,19 @@ Run: `cargo bench --package mini-lsm-starter --bench vlog_benchmarks`
 
 ## Results Summary
 
-| Metric | Inline | vLog | Delta | Notes |
-|--------|--------|------|-------|-------|
-| Compaction time | 98ms | 3.0ms | **33x faster** | 5000 entries @ 16KB |
-| Compaction SST rewrite | 78.4MB | 0.1MB | **780x less** | Keys+ptrs vs full values |
-| Full scan | 19.6ms | 13.0ms | **34% faster** | Smaller SSTs = less I/O |
-| Point-get | 1.5us | 3.0us | **2x slower** | Extra vLog seek |
-| Write throughput (1KB) | 950us | 1000us | ~5% slower | Per 1000 entries |
-| Write throughput (4KB) | 1000us | 1183us | ~18% slower | |
-| Write throughput (16KB) | 1160us | 1404us | ~21% slower | |
-| Write throughput (64KB) | 3562us | 4737us | ~33% slower | |
-| On-disk ratio (post-compact) | 1.00x | 1.00x | Same | Single round |
+| Metric | Inline | vLog | vLog+Cache | Delta (no cache) | Delta (cached) |
+|--------|--------|------|------------|------------------|----------------|
+| Compaction time | 98ms | 3.0ms | — | **33x faster** | — |
+| Compaction SST rewrite | 78.4MB | 0.1MB | — | **780x less** | — |
+| Full scan | 19.6ms | 13.0ms | — | **34% faster** | — |
+| Point-get | 2.14us | 4.21us | **2.76us** | 2x slower | **29% slower** |
+| Write throughput (1KB) | 950us | 1000us | — | ~5% slower | — |
+| Write throughput (4KB) | 1000us | 1183us | — | ~18% slower | — |
+| Write throughput (16KB) | 1160us | 1404us | — | ~21% slower | — |
+| Write throughput (64KB) | 3562us | 4737us | — | ~33% slower | — |
+| On-disk ratio (post-compact) | 1.00x | 1.00x | — | Same | — |
+
+Value cache (10K entries): 99.2% hit rate, reduces vLog point-get latency by 34%.
 
 ---
 
@@ -87,18 +89,24 @@ GC'd separately. This is the core write-amplification reduction.
 Measures `get()` for random keys after full compaction (clean LSM state).
 
 ```text
-read_point_get/inline    time: [1.4396 us 1.4596 us 1.4646 us]
-read_point_get/vlog      time: [2.8820 us 2.9629 us 2.9831 us]
+read_point_get/inline       time: [2.1229 us 2.1350 us 2.1381 us]
+read_point_get/vlog         time: [4.2050 us 4.2070 us 4.2075 us]
+read_point_get/vlog_cached  time: [2.7395 us 2.7572 us 2.8277 us]  (99.2% hit rate)
 ```
 
 **Analysis**: vLog point-gets require two I/O operations:
-1. Read the SST block to get the `ValuePointer` (~1.5us, same as inline)
-2. Read the vLog file at the pointer offset (~1.5us additional)
+1. Read the SST block to get the `ValuePointer` (~2us, same as inline)
+2. Read the vLog file at the pointer offset (~2us additional)
 
-The extra seek is the cost of separation. Mitigations:
+With the value cache (10K entries, `max_value_cache_entries`), repeated reads
+to the same keys are served from memory — 99.2% hit rate reduces latency from
+4.2us to 2.8us (34% improvement). The remaining 29% overhead vs inline is the
+SST lookup + cache hash probe.
+
+Mitigations:
+- **Value cache** (new): LRU cache keyed by `(file_id, offset)`, configurable via `max_value_cache_entries`
 - vLog reader cache (moka) avoids re-opening files
 - Sequential vLog layout benefits from OS readahead
-- Point-get latency is dominated by the LSM tree lookup, not the vLog read
 
 ### 4. Full Scan Throughput
 
@@ -155,8 +163,8 @@ once at flush time, not rewritten during compaction).
 
 | Bottleneck | Impact | Potential Fix |
 |------------|--------|---------------|
-| Double I/O for point-gets (SST + vLog) | 2x latency | Prefetch vLog entries on SST read; value cache |
-| No vLog value caching | Repeated reads hit disk | LRU cache for hot vLog values |
+| Double I/O for point-gets (SST + vLog) | 2x latency (uncached), 1.3x (cached) | Value cache (implemented); mmap for vLog files |
+| vLog value caching (implemented) | Configurable via `max_value_cache_entries` | Default off; set to working set size for hot keys |
 | Scan reads vLog entries one-at-a-time | Sequential but serial | Batch prefetch next N entries |
 
 ### Compaction
